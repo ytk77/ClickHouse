@@ -793,14 +793,16 @@ QueryPipeline InterpreterInsertQuery::buildInsertPipeline(ASTInsertQuery & query
 
     // when insert is initiated from FileLog or similar storages
     // they are allowed to expose its virtuals columns to the dependent views
-    auto insert_dependencies = InsertDependenciesBuilder::create(
-        table,
-        query_ptr,
-        query_sample_block,
-        async_insert,
-        /*skip_destination_table*/ no_destination,
-        /*max_insert_threads*/ 1,
-        context);
+    auto insert_dependencies = forced_insert_dependencies
+        ? forced_insert_dependencies
+        : InsertDependenciesBuilder::create(
+            table,
+            query_ptr,
+            query_sample_block,
+            async_insert,
+            /*skip_destination_table*/ no_destination,
+            /*max_insert_threads*/ 1,
+            context);
 
     auto chains = insert_dependencies->createChainWithDependenciesForAllStreams();
     chassert(chains.size() == 1);
