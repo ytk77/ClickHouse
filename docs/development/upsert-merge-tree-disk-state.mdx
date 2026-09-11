@@ -1,0 +1,67 @@
+---
+description: 'Implementation contract and remaining gates for the UpsertMergeTree v8 disk state.'
+sidebarTitle: 'UpsertMergeTree disk state'
+slug: /development/upsert-merge-tree-disk-state
+title: 'UpsertMergeTree v8 disk-state protocol'
+doc_type: 'guide'
+---
+
+# `UpsertMergeTree` v8 disk state {#upsert-disk-state}
+
+This is an implementation-stage protocol, not a production-readiness declaration. The complete target remains the [continuous-ingestion design](/development/upsert-merge-tree-continuous-ingestion). Existing `parts_sync_v1` tables retain their original state store and limits. New tables identify their protocol as `disk_state_v2`; older binaries must reject that manifest. No in-place conversion of existing tables is performed.
+
+## Commit authority {#disk-state-commit-authority}
+
+One local `RocksDB` database in `upsert_state_v2` holds the table's durable decisions. Its synchronous `WriteBatch`, including its `WAL`, is the sole terminal commit authority. There is no independently committed partition log. The storage database's atomic manifest installation, memtable flush and compaction manage its checkpoint and log lifecycle.
+
+The table incarnation and protocol are persisted inside both the authenticated table manifest and the state database. `ATTACH` requires both and never creates a replacement state database. Recovery uses absolute-consistency `WAL` replay and propagates errors; it does not skip damaged records or fall back to an older application checkpoint.
+
+1. Write and synchronize the immutable temporary part, checksums, lineage, and parent directory.
+2. Under the table parts lock, read only the batch's incumbent keys; build winner changes, visibility masks, part authorization, token result and next partition sequence.
+3. Apply one synchronous database write batch. Its durable completion authorizes the temporary payload even if the process stops before rename.
+4. Pin the resulting database snapshot, rename the part, synchronize the directory, then publish the native part and visibility snapshot under the same parts lock.
+5. Acknowledge only after publication. An ambiguous state write or failure after authorization fences writes until restart and recovery.
+
+## Keys and values {#disk-state-encoding}
+
+All integer fields are unsigned little-endian. Length-delimited strings use a four-byte length. The prefix contains a one-byte namespace followed, where specified, by a length-delimited SQL partition identity. Encoded unique keys retain the existing full key equality and are not replaced by hashes.
+
+| Key | Value |
+| --- | --- |
+| `identity` | Protocol plus table incarnation |
+| `part_count` | Eight-byte authorized part count |
+| `C`, partition | Eight-byte last committed partition sequence |
+| `W`, partition, encoded key | Physical part identity plus length-delimited `IndexValue`, including the original resolved winner tuple |
+| `A`, final part name | Versioned `PartCommit`, authenticating the immutable payload |
+| `M`, printable part identity | Checksummed serialized `DeleteBitmap` |
+| `T`, partition, token, unit | Payload hash, original accepted-row count (including zero), and eight-byte expiration time |
+| `O`, printable operation identity | Original commit sequence |
+| `R`, retired part name | Original authorization, permitting physical removal once native reader pins are released |
+| `E`, big-endian expiration time, token key | Ordered retry expiration entry |
+| `retry_bytes` | Accounted retry-state bytes |
+
+Namespace boundaries and length delimiters prevent ambiguous keys even when user strings contain zero bytes or separators. Per-record decoder and row-offset bounds remain; they do not impose a partition's total key capacity. Counter overflow is an explicit exception.
+
+## Working set and snapshots {#disk-state-working-set}
+
+There is one state database per table, with a block cache, bounded write buffers, a bounded open-file cache, and shared background maintenance threads. There is no per-partition open log or resident winner map. A write batch contains only affected keys and masks; it does not clone the partition's historical index.
+
+Readers pin a database snapshot together with their native parts. A mask lookup reads that exact sequence, including after newer updates or database flushes. Snapshot ownership keeps the database alive until readers release it. Attach iterates part authorizations without constructing a second full in-memory authorization map and verifies the immutable payloads before native loading.
+
+## Automatic maintenance {#disk-state-automatic-maintenance}
+
+The disk-state protocol schedules a dedicated table maintenance task, with ordinary native merges still disabled. It selects bounded same-partition units for small-part consolidation or rewriting parts whose dead-row fraction is at least one quarter. It reads sources through native sequential readers, materializes internal column wrappers before concatenation, and writes an immutable native part carrying the original resolved row lineage.
+
+At commit, each currently live source identity must map to the same output identity. A source row superseded during the build is marked dead in the output. Missing, invented or duplicated identities are exceptions. Winner positions change without changing their original version, write sequence or ordinal. The atomic database batch replaces source authorizations with output authorization and retirement records; a fully dead input can produce no output.
+
+Native part retirement and the new visibility snapshot are published under the same parts lock. Native reference counting protects existing readers. Physical deletion precedes forgetting the retirement record. After process restart, prior reader pins no longer exist, and the durable retirement record authorizes completing interrupted deletion before native loading. Recovery validates the active payloads and masks before reclamation; it also removes uncommitted engine preparations after rolling forward all authorized payloads. The active catalog no longer requires deleted historical payloads to recover.
+
+Tokens retain their result for 86,400 seconds according to the server clock. A one-GiB accounted retry budget rejects new token state rather than expiring valid tokens early. The background task removes expired entries in bounded batches and protects a newer reuse of the same token from an older expiration entry. Operation bindings are retained for active parts and removed atomically with their retirement; merged rows already contain resolved original lineage. No-op writes do not allocate permanent operation bindings.
+
+These initial resource budgets are implementation defaults, not configurable SQL settings: 64-MiB index block cache, three 16-MiB write buffers, 128-MiB pending database batch, one-GiB free-disk maintenance reserve, and bounded maintenance input units. Foreground mask updates process one affected source at a time. Budgets limit current work or retained retry promises, not total partition or live-key counts.
+
+## Remaining production gates {#disk-state-remaining-gates}
+
+This implementation still uses native eager part metadata and synchronously creates one part per accepted request unit. Maintenance uses a bounded in-memory mapping; it does not yet split oversized sources or spill that mapping to disk. Large sources beyond its operation budget are skipped. Some source verification and index relocation run under the commit lock. These are explicit limitations, not evidence that all continuous-ingestion workloads are production-ready.
+
+The full v8 release still requires grouped payload segments and drain, configurable workload and maintenance budgets, fair resource admission under overload, paging of native part metadata, large-source splitting/spill, bounded snapshot-age policy, and the full fault/concurrency/soak gates in the design. Backup, replication and in-place migration remain gated. Removing a count limit does not remove these requirements.

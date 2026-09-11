@@ -165,6 +165,14 @@ StorageMaterializedView::StorageMaterializedView(
     auto select = SelectQueryDescription::getSelectQueryFromASTForMatView(query.select->clone(), query.refresh_strategy != nullptr, mv_db_context);
     if (select.select_table_id)
     {
+        if (!query.refresh_strategy)
+        {
+            const auto source = DatabaseCatalog::instance().tryGetTable(select.select_table_id, local_context);
+            if (source && source->getName() == "UpsertMergeTree")
+                throw Exception(ErrorCodes::QUERY_IS_NOT_SUPPORTED_IN_MATERIALIZED_VIEW,
+                    "Incremental materialized views over UpsertMergeTree require a retraction protocol and are not supported");
+        }
+
         auto select_table_dependent_views = DatabaseCatalog::instance().getDependentViews(select.select_table_id);
 
         auto max_materialized_views_count_for_table = getContext()->getServerSettings()[ServerSetting::max_materialized_views_count_for_table];

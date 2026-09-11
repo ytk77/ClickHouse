@@ -162,6 +162,8 @@ MergeTreeReadTask::Readers MergeTreeReadTask::createReaders(
     const std::vector<MarkRanges> & patches_ranges)
 {
     Readers new_readers;
+    auto reader_settings = extras.reader_settings;
+    reader_settings.upsert_mask = read_info->upsert_mask;
 
     auto create_reader = [&](const NamesAndTypesList & columns_to_read, bool is_prewhere)
     {
@@ -175,7 +177,7 @@ MergeTreeReadTask::Readers MergeTreeReadTask::createReaders(
             extras.uncompressed_cache,
             extras.mark_cache,
             is_prewhere ? nullptr : read_info->deserialization_prefixes_cache.get(),
-            extras.reader_settings,
+            reader_settings,
             extras.value_size_map,
             extras.profile_callback);
     };

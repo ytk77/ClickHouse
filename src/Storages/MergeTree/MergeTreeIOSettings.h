@@ -21,6 +21,7 @@ using MMappedFileCachePtr = std::shared_ptr<MMappedFileCache>;
 struct SelectQueryInfo;
 
 class PackedFilesWriter;
+class DeleteBitmap;
 
 enum class CompactPartsReadMethod : uint8_t
 {
@@ -32,6 +33,8 @@ struct MergeTreeReaderSettings
 {
     /// Common read settings.
     ReadSettings read_settings;
+    /// Immutable mask captured with the active parts; independent of `apply_deleted_mask`.
+    std::shared_ptr<const DeleteBitmap> upsert_mask;
     /// If save_marks_in_cache is false, then, if marks are not in cache,
     ///  we will load them but won't save in the cache, to avoid evicting other data.
     bool save_marks_in_cache = false;

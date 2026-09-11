@@ -27,6 +27,12 @@
 namespace DB
 {
 
+namespace Upsert
+{
+class StateStore;
+struct Token;
+}
+
 class PreparedSetsCache;
 using PreparedSetsCachePtr = std::shared_ptr<PreparedSetsCache>;
 
@@ -59,13 +65,13 @@ public:
 
     std::string getName() const override { return merging_params.getModeName() + "MergeTree"; }
 
-    bool supportsParallelInsert() const override { return true; }
+    bool supportsParallelInsert() const override { return !merging_params.upsert; }
 
-    bool supportsStreaming() const override { return true; }
+    bool supportsStreaming() const override { return !merging_params.upsert; }
 
     CursorPromotersMap buildPromoters() override;
 
-    bool supportsTransactions() const override { return support_transaction; }
+    bool supportsTransactions() const override { return !merging_params.upsert && support_transaction; }
 
     void read(
         QueryPlan & query_plan,
@@ -126,6 +132,8 @@ public:
 
     MergeTreeDeduplicationLog * getDeduplicationLog() { return deduplication_log.get(); }
 
+    void insertUpsertBlock(BlockWithPartition & block, const StorageMetadataPtr & metadata, ContextPtr context, Upsert::Token token);
+
 private:
 
     /// Mutex and condvar for synchronous mutations wait
@@ -137,6 +145,9 @@ private:
     MergeTreeCleanupThread cleanup_thread;
 
     std::unique_ptr<MergeTreeDeduplicationLog> deduplication_log;
+    std::unique_ptr<Upsert::StateStore> upsert_store;
+    BackgroundSchedulePoolTaskHolder upsert_maintenance_task;
+    void runUpsertMaintenance();
 
     /// For block numbers.
     SimpleIncrement increment;

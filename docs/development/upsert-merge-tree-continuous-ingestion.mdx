@@ -1,0 +1,206 @@
+---
+description: 'Proposed lifecycle and capacity design for continuous production ingestion with UpsertMergeTree.'
+sidebarTitle: 'UpsertMergeTree continuous ingestion'
+slug: /development/upsert-merge-tree-continuous-ingestion
+title: 'UpsertMergeTree 持續寫入改良設計'
+doc_type: 'guide'
+---
+
+# `UpsertMergeTree` 持續寫入改良設計 {#upsert-continuous-ingestion}
+
+狀態：**v8 核心實作與驗證進行中，完整 production gates 尚未通過。** 新表的磁碟索引、原子合併／退休與重試窗口實作契約見 [磁碟狀態協議](/development/upsert-merge-tree-disk-state)。本文件保留完整設計目標，包括尚未完成的原生 metadata 分頁與 journal 聚合；不能將以下所有設計視為已上線功能。
+
+基準文件為 `/root/agent-work/db/CH_enhancement/deisgn_and_test/upsertMergeTree/unique_merge_tree_design_v7.html`，特別是第 5 節的 durable commit／checkpoint、第 9 節的 drain、第 10 節的 merge forwarding。既有 `parts_sync_v1` 表保留舊協議及原有限制；新的 `disk_state_v2` 表不採用 `512` partitions 或 `262144` live keys 的容量上限。舊 VM 表格不會自動遷移。
+
+## 決策與可達成的目標 {#decision-and-feasibility}
+
+建議保留欄式 `MergeTree` 架構，完成自動、可恢復、受資源預算控制的合併與回收。對應的產品目標是：**使用者不需定期執行 `OPTIMIZE FINAL`；在已驗證的持續負載、保留量與硬體容量內，parts、日誌及舊版本不隨累積寫入次數無限成長。**
+
+| 路徑 | 是否需要 parts 合併／回收 | 長期行為 | 決策 |
+| --- | --- | --- | --- |
+| 保持不可變 parts，只移除 `4096` 常數 | 沒有維護 | 目錄、索引、檔案及舊資料持續累積，最終轉為記憶體、磁碟或讀取成本問題 | 不採用 |
+| 不建立 `MergeTree` parts，改用可變頁面與磁碟 `B+tree` | 不需要 parts 合併；仍需要日誌截斷、版本清理及頁面重用 | 固定可見資料量可重用空間；新增唯一資料仍需更多磁碟 | 若「完全不用 parts」是硬需求，作為另一個儲存引擎立項 |
+| 保留 parts，由引擎批次落盤、自動合併及安全回收 | 需要，由引擎管理 | 在可持續負載內控制歷史負債；過載時有界等待、限流 | **本提案建議路徑** |
+
+`MergeTree` 的 parts 是不可變資料單位，正常生命週期依靠合併與移除失效 parts；批次寫入減少初始 parts，但不消除其生命週期成本。[ClickHouse 官方 parts 說明](https://clickhouse.com/docs/concepts/core-concepts/parts)
+
+將多個 parts 的檔案裝進一個容器，只減少檔案數；若邏輯 parts 與舊索引仍全部保留，並沒有消除這個問題。把合併移到前景寫入則仍然是合併，且會增加寫入尾端延遲。
+
+## 容量必須區分新增資料與重複更新 {#capacity-contract}
+
+### 不設固定 partition 數量與每 partition 筆數上限 {#no-partition-or-row-count-caps}
+
+以下為必須實現的設計契約，不是將原常數提高到另一個數字，也不是要求使用者在 `CREATE TABLE` 設定更大的上限：
+
+| 容量項目 | v8 契約 |
+| --- | --- |
+| 每張表的 SQL partitions 總數 | 不設引擎固定計數上限；以可分頁的磁碟 catalog 保存與列舉 |
+| 每個 SQL partition 的可見列／不同唯一鍵數 | 不設引擎固定計數上限；索引與資料可跨多頁、多檔、多個 parts 成長 |
+| 每個 SQL partition 的完整 key-state bytes | 不以固定 `64 MiB` 或其他常數限制全部持久化索引；限制的是常駐 cache／overlay 的工作集 |
+| 全表持久化 parts／partition registry entries | 不保留以歷史累積數量決定容量的 `4096`／`512` 門檻，也不得以單一 registry 檔案大小隱性重建相同上限 |
+
+因此不存在「最大 partitions × 每 partition 最大 keys」這種表格總容量公式。增加月份可建立新的 partition；單一月份可跨越原先 `262144` 個 keys，無須改 partition expression 或修改程式常數。
+
+仍有實際磁碟、CPU、I/O、記憶體、可用節點與資料格式表示範圍的限制。「不設固定計數上限」不是數學上的無限容量，也不是取消錯誤偵測。單一 part 的 row-offset／bitmap 限制、單一 frame／page 的大小界線，透過產生更多有界儲存單位處理，不能轉成整個 partition 的列數上限。識別碼或序號溢位仍須明確拒絕，不能繞回而破壞 identity。
+
+固定的唯一鍵集合反覆更新時，目標是讓舊版本、日誌與 parts 數量進入有界穩態。若唯一交易數量持續增加且永久保留，任何儲存架構都需要持續增加磁碟／節點，或訂定資料保留與歸檔政策；不可能以固定資源永久接收無限資料。
+
+令 `P` 為目前活動 parts 數量。一次將 `k` 個來源替換為 `m` 個輸出的合併，淨減少 `k-m` 個活動 parts。觀察期間應滿足：新產生的小 parts 速率低於可消化的淨合併速率，並讓失效物件實際釋放的速度跟得上退休速度。單 part 重寫可回收大量失效列，卻未必降低活動 parts 數量，兩個負債必須分開計量。
+
+長期合理的活動 parts 數量會隨保留的有效資料量、分區數與目標 part 大小增加；不能承諾任何資料量都只保留固定幾個 parts。容量估算必須包含：有效資料、索引、尚未合併的更新、合併輸出暫存、日誌與 checkpoint、舊查詢／備份／副本所釘住的資料，以及突發負載緩衝。
+
+過載、磁碟故障或無法解除的長時間引用發生時，安全行為是有界等待後拒絕尚未承諾的新請求。不能承諾所有情況下都永不拒絕寫入，更不能提前回覆成功以掩蓋過載。
+
+### Partition catalog 與原生 metadata 必須可按需載入 {#paged-partition-catalog}
+
+以可擴展的磁碟 catalog 保存 partition identity、索引 root、parts manifest root、log／checkpoint 世代與必要統計。catalog 的 page／segment 可分裂或輪替；單一 root 只引用可驗證的分頁結構，而不內嵌全表 partition 名單。列舉、備份與系統表查詢以分頁／串流方式遍歷。
+
+partition 與 part descriptors、索引頁、log handles、可見性狀態採有界 cache。只為目前查詢、提交或維護中的工作配置 resident context；不為每個歷史 partition 永久配置一條 thread、一組常駐完整索引或一直開啟的檔案。eviction 前先完成必要的持久化／交接；仍被查詢或提交 pin 的物件不能被強制移除。
+
+這需要檢查並調整原生 `MergeTree` 的 part metadata 載入、snapshot、列舉及 admission 路徑。只把 `StateStore` 的 registry 改成磁碟結構，卻繼續在另一層將全部 parts／partitions 複製到常駐容器，不算完成。snapshot pin 應指向不可變的 catalog／manifest 世代，允許隨查詢逐頁解析；不能為了惰性讀取而混用查詢開始後不同世代的 parts 與 masks。多 partition 寫入仍維持既定的提交單元語義，不因此承諾跨分區交易。
+
+復原先驗證所選 recovery root，再逐工作集／分頁驗證必要狀態。尚未恢復或校驗完成的 partition 不可對讀寫開放，也不能當作空 partition；發現必要資料損毀須回報錯誤。全表掃描或全量校驗的 I/O 時間仍可能隨資料量增加，不承諾任意資料量皆固定時間完成啟動與首筆查詢。
+
+必須稽核 `max_parts_in_total`、`parts_to_throw_insert` 等繼承自原生路徑的計數門檻，以及 registry／manifest 的單檔大小限制。production 路徑不得直接套用固定總量門檻，形成隱性的 partition 數量或每 partition 資料容量上限；同時也不能只停用檢查而保留全量常駐 metadata。以 metadata bytes、可用空間、維護負債及可執行的併發工作量管理資源。
+
+`max_partitions_per_insert_block` 類的單次請求 fan-out 保護與表格可保存多少 partitions 是不同概念。寫入路徑應能以有界調度／溢寫逐批處理許多目的 partitions；若請求超出操作預算，可明確拒絕該操作，但不能因表上已存在超過固定數量的 partitions 就永久拒絕成長。調度分批必須保留原 token／unit identity 及已公布的部分提交語義，不能因資源壓力改變重試結果。
+
+## 寫入路徑：請求數與 part 數脫鉤 {#write-path}
+
+```text
+INSERT（保留原始 token、unit 與 row identity）
+    → 容量預留與版本判定
+    → 可恢復的 payload segments + terminal commit log
+    → durable commit 後公布可見狀態並回覆
+    → 按大小／延遲預算批次 drain
+    → immutable columnar parts + 磁碟唯一鍵索引
+    → 自動合併／舊版本重寫 → 安全回收
+```
+
+小請求先進入有界記憶體狀態與持久化 journal，而不各自建立完整欄式 part。讀取必須在同一捕捉的 snapshot 中同時看到 journal 與 parts 的正確版本；已確認的寫入不能因為尚未 drain 而不可見。大量批次可直接走 part 路徑，但也要先取得 parts、暫存空間及維護預算。
+
+此處不能只是將「每請求一個 part」改成「每請求一個 segment 檔案」。建議 payload 使用可輪替的追加式 segments、逐 frame 校驗與明確的 committed range；terminal log 才是啟用資料的唯一權威。未封存 segment 的已承諾區間不可修改；完整封存後才使用整檔雜湊。這是 **新的持久化格式工作**，不能直接套用目前對不可變完整檔案的 hash／inventory 驗證。
+
+初期可先完成 v7.1 的不可變 segment 正確性，再以嚴格的檔案數與 bytes 預算限制它；在 production gate 前完成 segment 聚合、輪替及回收。不得將 segment 爆量問題留給營運人員。
+
+維持 payload／目錄持久化先於 terminal commit 的順序。`group_commit` 可以共享同步成本，但必須保留每個原始重試單元及其結果，不能因重新分塊破壞 idempotency。只有資料和決策已達到宣告的持久性、且可見狀態已公布後才回覆成功。現行 `async_insert` 相容性仍未完成；此提案不是要求直接打開該設定。
+
+## 唯一鍵索引：容量不綁定完整常駐記憶體 {#disk-backed-key-index}
+
+目前 `StateStore::decide` 複製分區狀態，且以 `MAX_LIVE_KEYS` 和 key-state bytes 控制它的成本。生產路徑改為磁碟索引、可配置且有上限的快取、小型寫入 overlay，以及可 pin 的索引世代。移除 `MAX_LIVE_KEYS` 與「完整 partition key state 必須放入固定 bytes」的 admission 條件；單次寫入不應複製整個 partition 的所有 winner entries。
+
+索引記錄完整 key encoding、winner tuple、穩定 row identity 及可驗證的物理位置。可採用分層磁碟索引，但其合併／回收也要納入維護預算；這不是免維護的替代品。索引不能與 terminal log 成為兩個互不協調的提交權威：durable checkpoint 保存相同 cut 的索引 root，其後的已承諾 log suffix 重建 overlay；只允許使用驗證完成的索引世代。
+
+較新的應用版本勝出；相同版本沿用原寫入 commit 順序及 block ordinal。drain／merge 必須保留原始 winner tuple，不能把維護作業的 commit 序號當成業務更新的版本。
+
+內部索引 bucket 與 SQL `PARTITION BY` 分離。它們不直接增加表格 partitions 或每批資料生成的 parts。即使第一階段固定 bucket 數，每個 bucket 也必須可跨多個磁碟頁／索引檔案持續成長，不能再設每 bucket 固定 keys 上限，將被取消的限制移到另一層。索引頁分裂、檔案輪替與 compaction 均保留原 key equality 及 winner 語義。
+
+索引 bucket 數與 key encoding 寫入 manifest；第一階段凍結 routing 定義，線上重新分桶另行定義並驗證，不能只改 hash 模數。固定 routing 並不要求固定 bucket 儲存容量，也不代表自動跨節點擴容。
+
+## 合併與回收：維持即時唯一性 {#merge-and-reclamation}
+
+不能直接打開普通 `MergeTree` 合併開關。合併過程中仍可能有新的 upsert 隱藏來源列，輸出若沿用舊快照會使舊版本復活。
+
+1. 選取同一 SQL partition 的不重疊來源 parts，pin 其 row identity 與可見性快照；先預留輸出、位置映射和 log 空間。
+2. 在提交鎖外建立輸出，保存原始 lineage；建立精確、可溢寫磁碟的 `(source UUID, offset) → output offset` 映射。
+3. 提交時驗證來源仍有效，將期間新增的隱藏決策映射到輸出。winner 位置只在目前仍指向同一來源 row identity 時轉移；不能覆蓋較新的交易。
+4. 持久化完整 `MERGE` 決策後，原子公布新 parts、mask、索引世代與來源退休狀態。新讀者不能看見半套狀態；已 pin 的舊讀者維持自己的快照。
+5. 只有查詢、索引／checkpoint builder、目前及保留的 recovery roots、所需 log suffix、備份與副本等引用全部解除，才真正刪除來源檔案。
+
+輸出為多個 parts 或全部列皆失效時，需要明確、可恢復的決策格式。合併輸出大小仍受 row-offset encoding、bitmap 最壞情況大小、索引格式與暫存容量限制，不能透過製造單一無限大的 part 迴避數量問題。
+
+排程同時處理大量小 parts、失效列比例高的 parts 及滯留時間過長的垃圾。大型 part 可能因超過一般大小合併門檻而不再與鄰居合併，因此需要有界的單 part 活列重寫／輸出分割，不能只等待普通 size-tier 合併碰巧回收舊版本。
+
+v7.1 基準仍可能在提交鎖中執行昂貴的最後驗證或同步。應先以有界 merge 單元建立正確性，再驗證鎖等待與尾端延遲；本提案不假設大規模索引位置更新能自動變成常數時間。
+
+## Checkpoint、日誌與重試 token 的生命週期 {#checkpoint-log-token-lifecycle}
+
+只回收 parts 不夠，現行固定 log 與 token 上限也會耗盡。
+
+checkpoint 捕捉同一 `cut_csn` 的索引 root、活動 parts、精確 journal live-row selections、visibility masks、原始 row binding 和仍在有效重試窗口中的 tokens。建立期間的後續提交保留在 suffix。只有新的 recovery root 已完整同步，並經 durable `CURRENT` 切換，才能移除不再被任何保留 root／suffix 需要的舊 log 與物件。
+
+重啟以選定 checkpoint 加有界 suffix 復原，而不是重播從建表開始的全部歷史。必要檔案缺失或校驗失敗須停止附掛；不得靜默退回可能缺少已承諾寫入的舊 root。
+
+重試窗口必須明確承諾最短保存時間，同時有 bytes 預算。窗口內保存原結果；容量壓力不能靜默提前刪除 token。超出窗口不承諾永久 exactly-once；客戶端需要穩定的事件版本與重新對帳策略。持續寫入的低版本 no-op 也必須受 token／log 輪替管理。
+
+## 資源治理：從累積次數上限改為目前負債預算 {#resource-governance}
+
+移除 `4096` 的生命週期計數方式，不能等同於完全移除保護。改為分別計量活動 parts、退休但被引用的 parts、準備中的輸出、payload segments、索引快取、commit queue、log suffix 及可回收垃圾。parts／partitions 的數量仍是觀測與選擇維護工作的指標，但不作為全表或單 partition 可保存多少有效資料的固定容量配額。
+
+低水位接受寫入；維護負債、cache／overlay 或空間使用接近軟預算時增加已預留的維護份額、減少產生小 parts 的 flush、施加有界背壓；可用資源達硬預算或同步失敗則拒絕尚未承諾的工作。flush 也有最長延遲與最大 bytes 預算，不能無限累積記憶體來掩蓋 parts 壓力。
+
+區分有效資料自然成長所需的基礎 parts 與可消化的小 parts／失效列負債。許多 partition 各只有一個健康 part 時，跨分區合併不可能減少它們；不能錯誤地要求背景合併把它們壓回某個固定全表 part 數。應以按需 metadata 管理承接成長；若查詢 fan-out、磁碟或 I/O 超過部署能力，回報真正的資源不足與擴容需求。
+
+維護使用獨立預算與可證明能排程的 worker 資源，避免前景佔滿後合併永遠得不到執行機會。保留足夠磁碟供至少一個有界維護作業完成。測試曾出現全域 thread pool 設得過小導致平行檔案同步排程停滯；提高 thread 上限只是部署修正，正式排程設計仍須避免持鎖等待同一耗盡 pool 的子工作。
+
+長查詢、備份與副本落後可能阻止回收。必須監控 pin 的數量、年齡與 bytes；超過已公布的查詢期限時先取消查詢，等它安全釋放 pin 後才回收。不能一到期限就刪掉它仍在讀的檔案。無法釋放的備份／副本依賴必須暴露為容量壓力並限流。
+
+以下都是**提案設定名稱，現在不能用於 `CREATE TABLE`**；數值需由壓測與 SLO 決定：
+
+| 提案設定 | 控制範圍 |
+| --- | --- |
+| `upsert_index_cache_bytes` | 索引快取，而非全部 live keys 的固定計數 |
+| `upsert_metadata_cache_bytes` | resident partition／part descriptors 與 catalog 頁面，不限制磁碟 catalog 的 entry 總數 |
+| `upsert_journal_memory_bytes` / `upsert_journal_disk_bytes` | 尚未 drain 的可見資料與 payload 容量 |
+| `upsert_flush_target_bytes` / `upsert_flush_max_delay_ms` | 批次落盤大小與延遲 |
+| `upsert_compaction_debt_bytes` / `upsert_compaction_max_lag_seconds` | 尚待消化的維護工作 bytes 與年齡，不限制有效資料總量或 partition 數 |
+| `upsert_maintenance_reserve_bytes` | 維護所需磁碟保留量 |
+| `upsert_checkpoint_max_tail_bytes` | checkpoint 觸發與復原 suffix 預算 |
+| `upsert_retry_window_seconds` / `upsert_retry_state_bytes` | 可承諾的重試窗口與容量 |
+| `upsert_max_snapshot_age_seconds` | 查詢快照期限政策 |
+| `upsert_pending_commit_bytes` | 有界等待佇列 |
+
+不提供 `upsert_max_partitions` 或 `upsert_max_rows_per_partition` 之類的表格容量參數；它們不應成為使用者擴充資料前必須調整的門檻。所有會影響 durability、key equality、partition routing 或 token 承諾的設定需持久化，並定義修改限制。設定 hard budget 低於現有占用量不得觸發破壞性清理。format decoder 的防損毀上限仍保留，與營運可配置容量分開。
+
+## 交易表的 partition 與保留策略 {#game-transaction-partitioning}
+
+既有 `game_transaction` 副本的 512-way hash partition 是為了目前每分區 key 上限而採取的安排。v8 不要求 512-way hash，也不限制 SQL partitions 為 512 個；使用者依 `PARTITION BY` 定義的值建立分區。磁碟索引成熟後，不應繼續以 SQL partition 承擔所有記憶體分桶責任。
+
+對原始 identity `(ID, WEBSITE_TYPE, USER_ID, CREATE_TIME)`，可評估回到 `PARTITION BY toYYYYMM(CREATE_TIME)`，在每個月內使用內部索引 buckets。相同 identity 必然具有相同的 `CREATE_TIME`，因此仍位於同一月份；若業務其實希望只以 `ID` 去重，則這個 identity／分區方案需要重新定義，不能默默跨月份宣稱唯一。
+
+月份是候選方案而非已驗證的最佳值。需以每月資料量、保留期限、晚到更新範圍與實際查詢比較日／月粒度；不要直接把 512 hash buckets 再乘上所有月份。每批資料跨越多少 SQL partitions，會直接影響 parts 生成與合併機會。[ClickHouse 官方 partition 說明](https://clickhouse.com/docs/concepts/best-practices/partitioning-keys)
+
+永久保留且持續新增的交易仍需容量擴充與穩定 key routing 的分片策略。若使用保留／歸檔政策，必須一併定義過期月份的晚到資料處置，避免已刪除資料因重送被重新建立。目前 `TTL`、partition 操作、複寫與共享儲存仍被 gate；本提案不把原生其他引擎支援的功能視為 `UpsertMergeTree` 已可用。
+
+## 實作順序與生產驗收 {#implementation-and-production-gates}
+
+| 階段 | 工作 | 開啟下一階段前的證據 |
+| --- | --- | --- |
+| 1 | durable checkpoint／root 切換、token 保留窗口、精確 merge forwarding、安全回收 | 在目前有界資料模型中跨多輪合併與重啟仍維持唯一性、持久性與舊快照 |
+| 2 | 磁碟索引與有界 cache，移除整分區 state 複製；可分頁 partition／part catalog、原生 metadata 按需載入與可輪替 registry | 分別跨越原 partition 數量、每 partition key 數及 registry 大小界線，無固定計數拒絕；工作集記憶體受預算管理，按世代與 suffix 正確復原 |
+| 3 | journal／payload segment 聚合、批次 drain、group commit，保留原 retry-unit identity | 小請求不再等比例製造完整 parts／檔案；drain 期間併發 upsert 無重複與遺失 |
+| 4 | 維護排程、背壓、pin 治理、壓力與容量監控 | 穩態、突發與維護暫停後恢復；過載可預測，不需人工 `OPTIMIZE FINAL` |
+| 5 | 可恢復備份／還原、升級與回滾、部署所需的複寫／故障切換、保留／歸檔協議 | 依正式部署需求通過故障演練，才允許該部署模式上線 |
+
+測試矩陣必須包含：固定 live-key 集合反覆更新；持續新增唯一鍵；混合 workload；熱鍵與傾斜 partition；較新／較舊／同版本；重試與超時；長查詢釘住來源；merge／drain 的晚到隱藏與 row identity ABA；checkpoint 建立期間更新；在同步、rename、root 切換及 GC 各邊界注入失敗；磁碟滿與維護 worker 飢餓；回收後重新啟動及備份還原。
+
+本次容量契約另有以下 release gates；測試驗證可擴展性，不宣稱已測到無限容量：
+
+- partition 數量跨越 `512`，再於明確硬體／資料量預算下驗證數千以上 partitions；建立、逐分區查詢、遍歷及重啟不得依固定 partition 計數失敗。
+- 單 partition 超過 `262144` 個不同 keys，並包含完整持久化 key state 超過 `64 MiB` 的案例；新版本更新與低版本重送仍保持正確 winner，不能要求重新 hash 到更多 SQL partitions。
+- catalog entries／bytes 跨越舊 registry 檔案界線、索引跨頁／跨檔成長、partition 總列數跨越單 part 編碼界線；大型表示邊界先以格式與模型驗證，再以可負擔的整合資料集驗證，禁止整數截斷／錯誤包覆。
+- 活躍工作集固定、歷史 partitions 逐步增加時，量測 metadata／索引常駐量、FD、threads 與首查成本，確認 cache eviction 與惰性復原，不以持久化物件總數強制建立等量 resident contexts。
+- 許多健康小 partition 無法跨區合併的案例，不得因無法達成固定全表 part 數而永久停止成長；相對地，真正的磁碟不足、pin 壓力與維護 backlog 須產生可歸因的資源錯誤。
+- 固定 routing 的單一內部 bucket 大幅成長；持續 hash 傾斜不能碰到隱藏的 bucket key-count 配額。調度跨大量 partitions 的輸入及重試，確認 token／unit identity 不受工作集切批影響。
+
+先以 model／property tests 和故障測試確認 correctness，再做長時間負載測試。建議持續負載至少覆蓋多輪 checkpoint、segment 輪替與合併回收，可將 72 小時作為初始 soak 計畫，但經過指定時間本身不是通過條件。真正條件是固定 live data 的 metadata、parts、log 與垃圾量無持續上升趨勢，突發 backlog 可回到預算內，且吞吐與 p95／p99、復原時間符合明確的業務 SLO。
+
+每次測量記錄有效資料量、key 寬度、update 比例、耐久性、查詢混合、CPU／磁碟／記憶體、I/O 寫入放大、維護負債與 pin bytes。SLO 與保留期限目前尚未取得；不能據既有 50M 單次匯入或短期 SELECT 測量設定 production 容量承諾。
+
+## 現有資料的遷移與可用性邊界 {#migration-and-availability}
+
+目前資料使用 `parts_sync_v1` manifest。新增 checkpoint、可回收歷史與可追加 segment 後，舊 binary 不一定能理解其授權與依賴。需新 protocol version 及顯式的遷移工具；不能先刪除舊歷史，再期望舊 binary 可回滾。
+
+初期採新的隔離目標表，以固定來源快照加穩定版本／offset 的增量重播驗證，再做受控切換。切換前可保留舊表作驗證及回滾來源，但不宣稱跨兩個表／兩個引擎有原子雙寫。此次不執行遷移、不更動 VM 表格。
+
+單機 durability 不等於節點故障後仍可用；若正式表格要求自動故障切換，複寫必須保存相同邏輯 commit 決策並納入 checkpoint／GC retention，不能僅複製 parts 檔案。這仍是獨立驗收門檻。
+
+## 若完全禁止 parts 合併 {#alternative-without-parts}
+
+可另建以可變頁面、磁碟 `B+tree`／hash 索引、`WAL`、buffer pool 及 free-page allocator 為核心的引擎。新增資料填入頁面，更新透過可恢復頁面修改／新版本及位置索引完成，不再每次建立不可變欄式 part。
+
+它仍需要處理 page split、變長欄位空間、torn write、checkpoint、`WAL` 截斷、舊版本清理、讀取 snapshot 及空間重用。若連這些回收也禁止，固定 key 反覆更新仍可能耗盡容量。有限時間舊快照與固定 live data 是可重用空間的條件，不是省略維護的理由。
+
+這條路可以符合「沒有 parts 背景合併」，但不符合「完全沒有任何儲存維護」。它也不能直接沿用 `MergeTree` 的壓縮欄檔、稀疏索引與掃描路徑；交易分析的掃描／壓縮成本需重新驗證。除非需求明確優先於欄式分析與既有相容性，建議採用上述自動維護的 `UpsertMergeTree` 路徑。
+
+正常營運不依賴定期全表 `OPTIMIZE FINAL`；官方也建議一般情況由受資源限制的增量背景合併處理，而非強制全量重寫。[ClickHouse 官方建議](https://clickhouse.com/docs/concepts/best-practices/avoid-optimize-final)

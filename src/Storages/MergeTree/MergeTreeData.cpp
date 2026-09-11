@@ -362,6 +362,7 @@ namespace ServerSetting
 namespace FailPoints
 {
     extern const char create_empty_part_inject_stale_dir[];
+    extern const char upsert_pause_after_read_snapshot[];
 }
 
 namespace ErrorCodes
@@ -931,7 +932,7 @@ ConditionSelectivityEstimatorPtr MergeTreeData::getConditionSelectivityEstimator
 
 bool MergeTreeData::supportsFinal() const
 {
-    return merging_params.mode == MergingParams::Collapsing
+    return merging_params.upsert || merging_params.mode == MergingParams::Collapsing
         || merging_params.mode == MergingParams::Summing
         || merging_params.mode == MergingParams::Aggregating
         || merging_params.mode == MergingParams::Replacing
@@ -2094,6 +2095,9 @@ std::optional<UInt64> MergeTreeData::totalRowsByPartitionPredicateImpl(
 
 String MergeTreeData::MergingParams::getModeName() const
 {
+    if (upsert)
+        return "Upsert";
+
     switch (mode)
     {
         case Ordinary:      return "";
@@ -4821,6 +4825,9 @@ void checkVersionColumnTypesConversion(const IDataType * old_type, const IDataTy
 
 void MergeTreeData::checkAlterIsPossible(const AlterCommands & commands, ContextPtr local_context) const
 {
+    if (merging_params.upsert && !commands.empty())
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "ALTER is not supported for UpsertMergeTree until schema migration is implemented");
+
     /// Reject schema-changing ALTER while a streaming query holds a subscription on this storage.
     if (subscription_manager.hasSome())
     {
@@ -11108,6 +11115,8 @@ bool MergeTreeData::scheduleDataProcessingJob(BackgroundJobsAssignee & /*assigne
 
 bool MergeTreeData::scheduleDataMovingJob(BackgroundJobsAssignee & assignee)
 {
+    if (merging_params.upsert)
+        return false;
     if ((*getSettings())[MergeTreeSetting::table_readonly])
         return false;
 
@@ -11964,6 +11973,9 @@ SerializationInfoByName MergeTreeData::getSerializationHints() const
 
 bool MergeTreeData::supportsTrivialCountOptimization(const StorageSnapshotPtr & storage_snapshot, ContextPtr query_context) const
 {
+    if (merging_params.upsert)
+        return false;
+
     const auto & settings = query_context->getSettingsRef();
 
     auto supports_trivial_count = [&]()
@@ -12068,10 +12080,25 @@ MergeTreeData::createStorageSnapshot(const StorageMetadataPtr & metadata_snapsho
     auto snapshot_data = std::make_unique<SnapshotData>();
     snapshot_data->storage = shared_from_this();
 
-    auto [query_ranges, query_parts] = getPossiblySharedVisibleDataPartsRanges(query_context);
-    snapshot_data->parts = query_ranges;
-
-    auto parts_info = getPartsSnapshotInfo(*query_parts);
+    PartsSnapshotInfo parts_info;
+    if (merging_params.upsert)
+    {
+        auto lock = readLockParts();
+        if (upsert_fenced || !upsert_state)
+            throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree is fenced pending recovery");
+        if (query_context->getCurrentTransaction())
+            throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree does not support explicit transactions");
+        auto parts = getDataPartsVectorForInternalUsage({DataPartState::Active}, lock);
+        snapshot_data->parts = std::make_shared<const RangesInDataParts>(parts);
+        snapshot_data->upsert_snapshot = upsert_state;
+        parts_info = getPartsSnapshotInfo(parts);
+    }
+    else
+    {
+        auto [query_ranges, query_parts] = getPossiblySharedVisibleDataPartsRanges(query_context);
+        snapshot_data->parts = query_ranges;
+        parts_info = getPartsSnapshotInfo(*query_parts);
+    }
 
     bool apply_mutations_on_fly = query_context->getSettingsRef()[Setting::apply_mutations_on_fly];
     bool apply_patch_parts = query_context->getSettingsRef()[Setting::apply_patch_parts];
@@ -12089,6 +12116,8 @@ MergeTreeData::createStorageSnapshot(const StorageMetadataPtr & metadata_snapsho
     };
 
     snapshot_data->mutations_snapshot = getMutationsSnapshot(params);
+    if (merging_params.upsert)
+        FailPointInjection::pauseFailPoint(FailPoints::upsert_pause_after_read_snapshot);
     return std::make_shared<StorageSnapshot>(*this, metadata_snapshot, std::move(snapshot_data));
 }
 

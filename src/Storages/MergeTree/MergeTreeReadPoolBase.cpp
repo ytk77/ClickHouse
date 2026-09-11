@@ -231,6 +231,16 @@ MergeTreeReadPoolBase::buildReadTaskInfo(const RangesInDataPart & part_with_rang
     /// The single part handle stored on the task: an owned part wrapped in the reader abstraction.
     auto data_part_info = std::make_shared<LoadedMergeTreeDataPartInfoForReader>(data_part, read_task_info.alter_conversions);
     read_task_info.data_part_info = data_part_info;
+    const auto * snapshot_data = dynamic_cast<const MergeTreeData::SnapshotData *>(storage_snapshot->data.get());
+    if (storage_snapshot->storage.getName() == "UpsertMergeTree" && (!snapshot_data || !snapshot_data->upsert_snapshot))
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree reader requires a pinned visibility snapshot");
+    if (snapshot_data && snapshot_data->upsert_snapshot)
+    {
+        auto mask = snapshot_data->upsert_snapshot->getMask(data_part->getDeleteBitmapCacheIdentity());
+        if (!mask)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree snapshot lacks the mask for part {}", data_part->name);
+        read_task_info.upsert_mask = std::move(mask);
+    }
     const auto & part_info = *data_part_info;
     bool has_lightweight_delete = data_part->hasLightweightDelete() || read_task_info.alter_conversions->hasLightweightDelete();
 

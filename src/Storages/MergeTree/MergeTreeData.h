@@ -1,4 +1,5 @@
 #pragma once
+#include <Storages/MergeTree/UniqueKey/UpsertSnapshot.h>
 
 #include <mutex>
 #include <tuple>
@@ -460,6 +461,10 @@ public:
 
         Mode mode{};
 
+        /// `UpsertMergeTree` uses ordinary physical merging with a separate commit protocol.
+        bool upsert = false;
+        String upsert_version_column;
+
         /// For Collapsing and VersionedCollapsing mode.
         String sign_column;
 
@@ -491,6 +496,8 @@ public:
         bool hasSameMergeSemantics(const MergingParams & rhs) const
         {
             return mode == rhs.mode
+                && upsert == rhs.upsert
+                && upsert_version_column == rhs.upsert_version_column
                 && sign_column == rhs.sign_column
                 && is_deleted_column == rhs.is_deleted_column
                 && columns_to_sum == rhs.columns_to_sum
@@ -687,12 +694,17 @@ public:
         RangesInDataPartsPtr parts;
 
         MutationsSnapshotPtr mutations_snapshot;
+        Upsert::SnapshotPtr upsert_snapshot;
     };
 
     StorageSnapshotPtr getStorageSnapshot(const StorageMetadataPtr & metadata_snapshot, ContextPtr query_context) const override;
 
     /// The same as above but does not hold vector of data parts.
     StorageSnapshotPtr getStorageSnapshotWithoutData(const StorageMetadataPtr & metadata_snapshot, ContextPtr query_context) const override;
+
+    /// Preallocate native part publication before the durable authorization callback.
+    void commitUpsertPart(MutableDataPartPtr & part, Upsert::SnapshotPtr snapshot,
+        const std::function<void()> & persist, DataPartsLock & lock);
 
     /// Load the set of data parts from disk. Call once - immediately after the object is created.
     void loadDataParts(bool skip_sanity_checks, std::optional<std::unordered_set<std::string>> expected_parts);
@@ -1554,6 +1566,10 @@ private:
 
 protected:
     void loadPartAndFixMetadataImpl(MergeTreeData::MutableDataPartPtr part, ContextPtr local_context) const;
+
+    /// Both fields are protected by the parts mutex, including journal-only publication.
+    Upsert::SnapshotPtr upsert_state;
+    bool upsert_fenced = false;
 
     void unregisterFromMergeSelection(const MergeTreeSettingsPtr & settings);
 

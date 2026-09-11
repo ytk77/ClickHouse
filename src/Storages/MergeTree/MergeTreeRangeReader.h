@@ -17,6 +17,7 @@ using ColumnUInt8 = ColumnVector<UInt8>;
 using ColumnUInt64 = ColumnVector<UInt64>;
 
 class IMergeTreeReader;
+class DeleteBitmap;
 class MergeTreeIndexGranularity;
 struct PrewhereInfo;
 using PrewhereInfoPtr = std::shared_ptr<PrewhereInfo>;
@@ -308,6 +309,7 @@ public:
         friend class MergeTreeRangeReader;
         friend class MergeTreeReadersChain;
         friend class MergeTreePatchReaderMerge;
+        friend struct UpsertReadMaskTestPeer;
 
         using NumRows = std::vector<size_t>;
 
@@ -451,6 +453,7 @@ public:
     };
 
     ReadResult startReadingChain(size_t max_rows, MarkRanges & ranges);
+    static void applyUpsertMask(ReadResult & result, const DeleteBitmap & bitmap, bool can_read_incomplete_granules);
     Columns continueReadingChain(ReadResult & result, size_t & num_rows);
 
     const Block & getSampleBlock() const { return result_sample_block; }

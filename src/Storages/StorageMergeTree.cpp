@@ -1,4 +1,7 @@
 #include <Storages/StorageMergeTree.h>
+#include <Storages/MergeTree/UniqueKey/UpsertTableManifest.h>
+#include <Storages/MergeTree/UniqueKey/UpsertStateStore.h>
+#include <Storages/MergeTree/UniqueKey/UpsertSink.h>
 
 #include <optional>
 #include <ranges>
@@ -218,7 +221,36 @@ StorageMergeTree::StorageMergeTree(
 {
     initializeDirectoriesAndFormatVersion(relative_data_path_, LoadingStrictnessLevel::ATTACH <= mode, date_column_name);
 
+    if (merging_params.upsert)
+    {
+        upsert_state = std::make_shared<const Upsert::SnapshotState>();
+        const auto disks = getDisks();
+        if (disks.size() != 1 || disks.front()->getDataSourceDescription().type != DataSourceType::Local)
+            throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree currently requires exactly one local disk");
+        bool use_disk_state = false;
+        const auto incarnation = Upsert::initializeTableManifest(
+            fs::path(disks.front()->getPath()) / relative_data_path_, disks.front()->getName(),
+            metadata_, merging_params.upsert_version_column, LoadingStrictnessLevel::ATTACH <= mode, use_disk_state);
+
+        upsert_store = std::make_unique<Upsert::StateStore>(fs::path(disks.front()->getPath()) / relative_data_path_,
+            incarnation, LoadingStrictnessLevel::ATTACH <= mode, use_disk_state);
+        upsert_state = upsert_store->snapshot();
+    }
+
     loadDataParts(LoadingStrictnessLevel::FORCE_RESTORE <= mode, std::nullopt);
+
+    if (merging_params.upsert)
+    {
+        const auto parts = getDataPartsVectorForInternalUsage({DataPartState::Active});
+        if (parts.size() != upsert_store->authorizedPartCount())
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree native loading did not preserve the authorized part set");
+        for (const auto & part : parts)
+        {
+            auto id = upsert_store->authorizedPart(part->name);
+            if (!id || Upsert::objectName(*id) != part->getDeleteBitmapCacheIdentity())
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree loaded part identity mismatch");
+        }
+    }
 
     if (mode < LoadingStrictnessLevel::ATTACH && !getDataPartsForInternalUsage().empty() && !isTableReadonly())
         throw Exception(ErrorCodes::INCORRECT_DATA,
@@ -237,6 +269,16 @@ StorageMergeTree::StorageMergeTree(
 
 void StorageMergeTree::startup()
 {
+    if (merging_params.upsert)
+    {
+        if (upsert_store->usesDiskState() && !isTableReadonly())
+        {
+            upsert_maintenance_task = getContext()->getSchedulePool().createTask(
+                getStorageID(), "UpsertMergeTree::maintenance", [this] { runUpsertMaintenance(); });
+            upsert_maintenance_task->activateAndSchedule();
+        }
+        return;
+    }
     /// Do not schedule any background jobs if the table is read-only.
     if (isTableReadonly())
         return;
@@ -284,6 +326,9 @@ void StorageMergeTree::flushAndPrepareForShutdown()
 
     if (flush_called.exchange(true))
         return;
+
+    if (upsert_maintenance_task)
+        upsert_maintenance_task->deactivate();
 
     merger_mutator.merges_blocker.cancelForever();
     parts_mover.moves_blocker.cancelForever();
@@ -345,6 +390,12 @@ void StorageMergeTree::read(
     size_t max_block_size,
     size_t num_streams)
 {
+    if (merging_params.upsert)
+        for (const auto & name : column_names)
+            if (name == "_part" || name.starts_with("_part_") || name == "_block_number" || name == "_block_offset")
+                throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
+                    "Physical part and block virtual columns are not supported for UpsertMergeTree: {}", name);
+
     const auto & settings = local_context->getSettingsRef();
     /// reading step for parallel replicas with the analyzer is built in Planner, so don't do it here
     if (local_context->canUseParallelReplicasOnInitiator() && settings[Setting::parallel_replicas_for_non_replicated_merge_tree]
@@ -412,11 +463,15 @@ CursorPromotersMap StorageMergeTree::buildPromoters()
 
 std::optional<UInt64> StorageMergeTree::totalRows(ContextPtr) const
 {
+    if (merging_params.upsert)
+        return std::nullopt;
     return getTotalActiveSizeInRows();
 }
 
 std::optional<UInt64> StorageMergeTree::totalRowsByPartitionPredicate(const ActionsDAG & filter_actions_dag, ContextPtr local_context) const
 {
+    if (merging_params.upsert)
+        return std::nullopt;
     auto parts = getVisibleDataPartsVector(local_context);
     return totalRowsByPartitionPredicateImpl(filter_actions_dag, local_context, RangesInDataParts(parts));
 }
@@ -436,8 +491,16 @@ std::optional<UInt64> StorageMergeTree::totalBytesUncompressed(const Settings &)
 }
 
 SinkToStoragePtr
-StorageMergeTree::write(const ASTPtr & /*query*/, const StorageMetadataPtr & metadata_snapshot, ContextPtr local_context, bool /*async_insert*/)
+StorageMergeTree::write(const ASTPtr & /*query*/, const StorageMetadataPtr & metadata_snapshot, ContextPtr local_context, bool async_insert)
 {
+    if (merging_params.upsert)
+    {
+        assertNotReadonly();
+        if (async_insert || local_context->getCurrentTransaction())
+            throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree requires synchronous inserts outside explicit transactions");
+        return std::make_shared<Upsert::Sink>(*this, metadata_snapshot, local_context);
+    }
+
     assertNotReadonly();
 
     const auto & settings = local_context->getSettingsRef();
@@ -2645,6 +2708,9 @@ void StorageMergeTree::renameAndCommitEmptyParts(MutableDataPartsVector & new_pa
 
 void StorageMergeTree::truncate(const ASTPtr &, const StorageMetadataPtr &, ContextPtr query_context, TableExclusiveLockHolder &)
 {
+    if (merging_params.upsert)
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "TRUNCATE is not supported for UpsertMergeTree");
+
     assertNotReadonly();
 
     {
@@ -3609,6 +3675,8 @@ MutationCounters StorageMergeTree::getMutationCounters() const
 
 void StorageMergeTree::startBackgroundMovesIfNeeded()
 {
+    if (merging_params.upsert)
+        return;
     if (areBackgroundMovesNeeded())
         background_moves_assignee.start();
 }

@@ -7,6 +7,7 @@
 #include <Storages/StorageMergeTree.h>
 #include <Storages/StorageReplicatedMergeTree.h>
 #include <Storages/TableZnodeInfo.h>
+#include <Storages/MergeTree/UniqueKey/UpsertMergeTreeMetadata.h>
 
 #include <Compression/CompressionFactory.h>
 #include <Core/ServerSettings.h>
@@ -437,6 +438,10 @@ static StoragePtr create(const StorageFactory::Arguments & args)
 
     MergeTreeData::MergingParams merging_params;
     merging_params.mode = MergeTreeData::MergingParams::Ordinary;
+    merging_params.upsert = args.engine_name == "UpsertMergeTree";
+
+    if (merging_params.upsert && !is_extended_storage_def)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "UpsertMergeTree requires an extended storage definition with UNIQUE KEY and ORDER BY");
 
     if (name_part == "Collapsing")
         merging_params.mode = MergeTreeData::MergingParams::Collapsing;
@@ -452,7 +457,7 @@ static StoragePtr create(const StorageFactory::Arguments & args)
         merging_params.mode = MergeTreeData::MergingParams::Graphite;
     else if (name_part == "VersionedCollapsing")
         merging_params.mode = MergeTreeData::MergingParams::VersionedCollapsing;
-    else if (!name_part.empty())
+    else if (!name_part.empty() && !merging_params.upsert)
         throw Exception(ErrorCodes::UNKNOWN_STORAGE, "Unknown storage {}",
             args.engine_name + verbose_help_message);
 
@@ -476,6 +481,9 @@ static StoragePtr create(const StorageFactory::Arguments & args)
         needed_params += desc;
         needed_params += "]";
     };
+
+    if (merging_params.upsert)
+        add_optional_param("UInt64 version column");
 
     if (replicated)
     {
@@ -587,6 +595,13 @@ static StoragePtr create(const StorageFactory::Arguments & args)
 
     /// This merging param maybe used as part of sorting key
     std::optional<String> merging_param_key_arg;
+
+    if (merging_params.upsert && arg_cnt)
+    {
+        if (!tryGetIdentifierNameInto(engine_args.front(), merging_params.upsert_version_column))
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "UpsertMergeTree version must be a stored UInt64 column identifier");
+        --arg_cnt;
+    }
 
     if (merging_params.mode == MergeTreeData::MergingParams::Collapsing)
     {
@@ -923,7 +938,7 @@ static StoragePtr create(const StorageFactory::Arguments & args)
 
         /// UNIQUE KEY tables must reside on local-only storage policies.
         /// CREATE only; ATTACH must still load existing tables.
-        if (metadata.hasUniqueKey() && args.mode <= LoadingStrictnessLevel::CREATE)
+        if (metadata.hasUniqueKey() && (merging_params.upsert || args.mode <= LoadingStrictnessLevel::CREATE))
         {
             StoragePolicyPtr resolved_storage_policy = (*storage_settings)[MergeTreeSetting::disk].changed
                 ? context->getStoragePolicyFromDisk((*storage_settings)[MergeTreeSetting::disk])
@@ -1164,6 +1179,23 @@ static StoragePtr create(const StorageFactory::Arguments & args)
             create_query_zk_retries_info);
     }
 
+    if (merging_params.upsert)
+    {
+        validateUpsertMergeTreeMetadata(metadata, merging_params.upsert_version_column, *storage_settings);
+        for (const String name : {"assign_part_uuids", "fsync_after_insert", "fsync_part_directory"})
+        {
+            auto & changes = args.storage_def->settings->changes;
+            auto it = std::ranges::find_if(changes, [&](const auto & change)
+            {
+                return change.name == name;
+            });
+            if (it == changes.end())
+                changes.push_back(SettingChange{name, UInt64{1}});
+            else
+                it->value = UInt64{1};
+        }
+    }
+
     return std::make_shared<StorageMergeTree>(
         args.table_id,
         args.relative_data_path,
@@ -1189,6 +1221,11 @@ void registerStorageMergeTree(StorageFactory & factory)
         .supports_unique_key = true,
         .has_builtin_setting_fn = MergeTreeSettings::hasBuiltin,
     };
+
+    auto upsert_features = features;
+    upsert_features.supports_projections = false;
+    upsert_features.supports_ttl = false;
+    factory.registerStorage("UpsertMergeTree", create, upsert_features);
 
     factory.registerStorage("MergeTree", create, features, Documentation{
         .description = String(R"DOCS_MD(

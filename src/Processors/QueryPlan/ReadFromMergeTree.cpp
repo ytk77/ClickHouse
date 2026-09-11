@@ -4158,6 +4158,7 @@ void ReadFromMergeTree::initializePipeline(QueryPipelineBuilder & pipeline, [[ma
         {
             stripped_snapshot_data->storage = snapshot_data->storage;
             stripped_snapshot_data->mutations_snapshot = snapshot_data->mutations_snapshot;
+            stripped_snapshot_data->upsert_snapshot = snapshot_data->upsert_snapshot;
         }
 
         /// The snapshot object may be shared with other query plan steps.

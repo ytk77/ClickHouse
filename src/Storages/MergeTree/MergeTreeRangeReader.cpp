@@ -11,6 +11,7 @@
 #include <Interpreters/castColumn.h>
 #include <Storages/MergeTree/IMergeTreeReader.h>
 #include <Storages/MergeTree/MergeTreeRangeReader.h>
+#include <Storages/MergeTree/UniqueKey/DeleteBitmap.h>
 #include <Storages/MergeTree/MergeTreeReaderIndex.h>
 #include <Storages/MergeTree/MergeTreeVirtualColumns.h>
 #include <base/range.h>
@@ -1180,7 +1181,11 @@ MergeTreeRangeReader::ReadResult MergeTreeRangeReader::startReadingChain(size_t 
                 ++result.debug_num_ranges_processed;
             }
 
-            if (merge_tree_reader->canSkipMark(currentMark(), stream.stream.currentTaskLastMark()))
+            const auto & upsert_mask = merge_tree_reader->getMergeTreeReaderSettings().upsert_mask;
+            const auto pending_rows = stream.numPendingRowsInCurrentGranule();
+            const auto offset = stream.currentPartOffset();
+            if ((upsert_mask && pending_rows && upsert_mask->rangeCardinality(offset, offset + pending_rows) == pending_rows)
+                || merge_tree_reader->canSkipMark(currentMark(), stream.stream.currentTaskLastMark()))
             {
                 result.addGranule(0, {0, 0} /* unused when granule has no rows to read */);
                 stream.toNextMark();
@@ -1232,8 +1237,22 @@ MergeTreeRangeReader::ReadResult MergeTreeRangeReader::startReadingChain(size_t 
 
     updatePerformanceCounters(result.numReadRows());
 
+    const auto & upsert_mask = merge_tree_reader->getMergeTreeReaderSettings().upsert_mask;
+    std::optional<size_t> upsert_read_bytes;
+    if (upsert_mask && !upsert_mask->empty() && result.num_rows)
+    {
+        upsert_read_bytes = getTotalBytesInColumns(result.columns);
+        applyUpsertMask(result, *upsert_mask, can_read_incomplete_granules);
+    }
+
     if (merge_tree_reader->producesFilterOnly())
     {
+        if (!result.num_rows)
+        {
+            result.columns.clear();
+            result.addNumBytesRead(upsert_read_bytes ? *upsert_read_bytes : 0);
+            return result;
+        }
         chassert(result.columns.size() == 1);
 
         /// Use the filter column provided by the index reader, if available.
@@ -1249,9 +1268,24 @@ MergeTreeRangeReader::ReadResult MergeTreeRangeReader::startReadingChain(size_t 
         }
     }
 
-    result.addNumBytesRead(getTotalBytesInColumns(result.columns));
-
+    result.addNumBytesRead(upsert_read_bytes ? *upsert_read_bytes : getTotalBytesInColumns(result.columns));
     return result;
+}
+
+void MergeTreeRangeReader::applyUpsertMask(ReadResult & result, const DeleteBitmap & bitmap, bool can_read_incomplete_granules)
+{
+    if (bitmap.empty() || !result.num_rows)
+        return;
+    auto mask_column = ColumnUInt8::create(result.total_rows_per_granule, UInt8{1});
+    auto & mask = mask_column->getData();
+    size_t position = 0;
+    for (size_t granule = 0; granule < result.rows_per_granule.size(); ++granule)
+    {
+        const auto start = result.granule_offsets[granule].starting_offset;
+        for (size_t row = 0; row < result.rows_per_granule[granule]; ++row)
+            mask[position++] = !bitmap.contains(start + row);
+    }
+    result.optimize(FilterWithCachedCount(std::move(mask_column)), can_read_incomplete_granules, true);
 }
 
 void MergeTreeRangeReader::fillVirtualColumns(Columns & columns, ReadResult & result)

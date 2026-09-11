@@ -1,0 +1,6 @@
+UpsertMergeTree	1	tenant	tenant, value	(tenant, id)
+0
+0
+UpsertMergeTree
+UpsertMergeTree
+UpsertMergeTree

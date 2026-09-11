@@ -1,0 +1,163 @@
+---
+description: 'Bounded synchronous upserts and persistent formats for the experimental UpsertMergeTree engine.'
+sidebarTitle: 'UpsertMergeTree development'
+slug: /development/upsert-merge-tree
+title: 'UpsertMergeTree development'
+doc_type: 'reference'
+---
+
+# `UpsertMergeTree` development {#upsert-merge-tree-development}
+
+New `UpsertMergeTree` tables use the v8 development-stage [disk-state protocol](/development/upsert-merge-tree-disk-state),
+including a disk-backed winner index and automatic bounded merge and retirement. A successful synchronous
+insert publishes one winner per partition-local unique key; reads do not require `FINAL`.
+Journal grouping, native metadata paging and the complete production gates remain unfinished.
+
+The parts-only persistence and capacity sections below describe the legacy `parts_sync_v1` protocol,
+which remains supported for existing v7 tables. Its fixed capacity limits do not apply to new
+`disk_state_v2` tables. Existing `MergeTree` tables retain their engine identity and ingestion behavior.
+
+## Initial SQL definition {#initial-sql-definition}
+
+```sql
+SET allow_experimental_unique_key = 1;
+
+CREATE TABLE player_state
+(
+    tenant_id UInt64,
+    player_id UInt64,
+    ver UInt64,
+    status String
+)
+ENGINE = UpsertMergeTree(ver)
+PARTITION BY tenant_id
+ORDER BY (tenant_id, player_id)
+UNIQUE KEY (tenant_id, player_id);
+```
+
+The optional engine argument names one stored, non-null `UInt64` version column.
+Omitting it selects the commit-order winner contract. Higher versions win; equal versions use
+later commit order, then the original row position within the input block. Each insert supplies
+a complete replacement row. Use `SET async_insert = 0` for this engine.
+The unique key must contain stored columns with non-null integer, `String`, `FixedString`,
+or nonempty tuple types recursively composed from these types. Key expressions currently
+accept column identifiers; partition and sorting expressions must be deterministic.
+
+The first implementation requires one local disk. It forces `assign_part_uuids`,
+`fsync_after_insert`, and `fsync_part_directory` on, including during attachment.
+The sink also synchronizes all payload files and directories before appending a composite terminal
+record. The record is synchronized before part rename, directory synchronization and visibility publication.
+The table manifest must exist during attachment and must match the schema and disk.
+An existing data directory cannot be imported as a new `UpsertMergeTree` table.
+
+`ALTER`, `TRUNCATE`, mutations, partition operations, projections, sampling definitions,
+streaming, backup, restore, `CHECK TABLE`, background moves, and incremental materialized views are gated.
+The `_upsert_` prefix is reserved; the input-only delete flag is not connected yet.
+General `DELETE WHERE` and partial-column updates are not part of the initial contract.
+
+## Row metadata version 1 {#row-metadata-version-1}
+
+All integer fields are little-endian. The encoded index value is 42 bytes without a version
+and 50 bytes with one. It has no relationship to the `Native` wire format.
+
+| Field | Bytes | Meaning |
+| --- | ---: | --- |
+| Magic | 4 | ASCII `UMRV` |
+| Version | 1 | `1` |
+| Flags | 1 | Bit 0: application version present; bit 1: `SELF` activation binding |
+| Row offset | 4 | Physical row position, strictly below `2^28` |
+| Operation identity | 16 | Two 64-bit limbs; the all-zero identity is invalid |
+| Block ordinal | 8 | Position in the original logical input unit |
+| Write CSN | 8 | Original write sequence; zero only for `SELF` |
+| Application version | 0 or 8 | Present only when flag bit 0 is set |
+
+The table incarnation and partition scope come from the authenticated enclosing manifest.
+`SELF` must resolve through the producing part's activation binding before comparing winners.
+A resolved row retains its original write CSN through later drain, merge, and index rebuild.
+Winner comparison orders `(version, write_csn, block_ordinal)`, or `(write_csn, block_ordinal)`
+without an application version. Comparing different version modes or unresolved rows is an error.
+Legacy four-byte SST values are rejected by this decoder. New parts persist these values in the
+SST index and in the checksummed `upsert_rows.bin` lineage sidecar. Other engines retain their legacy format.
+
+## Terminal-record envelope version 1 {#terminal-record-envelope-version-1}
+
+All integers are little-endian. Total frame length is bounded to 64 MiB before allocation.
+
+| Field | Bytes | Meaning |
+| --- | ---: | --- |
+| Magic | 8 | ASCII `UMTLOG01` |
+| Version | 2 | `1` |
+| Kind | 1 | Operation discriminator |
+| Reserved flags | 1 | Must be zero |
+| Total frame length | 4 | Includes prefix and trailing CRC |
+| Header CRC-32 | 4 | Covers the preceding 16 bytes; validates the length before accepting a torn tail |
+| Table incarnation | 16 | Nonzero table identity |
+| CSN | 8 | Nonzero, strictly increasing within the partition |
+| Previous frame hash | 16 | Two limbs of `SipHash`-128 over the entire preceding frame |
+| Operation identity | 16 | Nonzero operation identity |
+| Partition identifier length | 4 | Between 1 and 1024 bytes |
+| Partition identifier | Variable | Exact identifier bytes |
+| Payload | Variable | Operation-specific contents |
+| CRC-32 | 4 | Covers every preceding byte of the frame |
+
+The numeric kinds are `UPSERT=1`, `DELETE=2`, `NOOP=3`, `PART=4`, `DRAIN=5`,
+`MERGE=6`, `MUTATION=7`, `MATERIALIZED=8`, and `CHECKPOINT=9`.
+Recognizing a kind in the envelope does not enable its execution.
+`PART` and `NOOP` have versioned composite payloads. Other operation payloads and the
+checkpoint-generation protocol are not implemented.
+
+An empty replay boundary has CSN zero and an all-zero preceding hash.
+Recovery validates identity, partition, sequence order, and the hash chain, without searching
+past an invalid frame. Complete frames with bad checksums are errors even in an unsealed suffix.
+Only a truncated final frame may be discarded when the caller explicitly permits an unsealed tail.
+Sequence overflow is an error before append.
+
+## Commit and recovery protocol {#commit-and-recovery-protocol}
+
+`PartitionLog` provides exclusive file ownership, bounded synchronous append, complete-prefix
+recovery and fencing after ambiguous write or sync failures. A durable registry discovers partition
+logs. The table manifest binds the schema, disk and `parts_sync_v1` protocol before part discovery.
+Required missing files are errors, never empty bootstrap state.
+
+A composite `PART` record authenticates the producing UUID, temporary and final part names,
+the complete immutable file inventory, incoming-loser mask, incumbent kills and retry token.
+The input is folded before native sorting while retaining its original row ordinal. Commit publication
+pins the active parts and immutable deletion masks under the same parts mutex. Existing readers
+retain their previous masks. Count, query-condition-cache and implicit projection shortcuts are gated.
+An input unit with no winning rows appends a `NOOP` decision.
+
+Recovery precedes native part loading. It validates the log chain, file hashes and row lineage,
+recomputes winner decisions and completes authorized temporary-part renames. Missing payloads,
+changed files and unauthorized final parts fail attachment. Native dense-index repair is disabled
+because it cannot recreate the versioned lineage. Ambiguous commit failures fence reads and writes
+until restart and recovery.
+
+`insert_deduplication_token` identifies each input block within each partition. An identical retry
+retains its original result, even after a newer update. Reusing the token with different evaluated
+input fails. Retries must preserve block boundaries and input values. Atomicity is per partition
+and input block; a query containing several units can partially commit.
+
+## Resource bounds and remaining gates {#resource-bounds-and-remaining-gates}
+
+This development stage retains every authorized part and terminal record. Background merges,
+cleanup, moves, journal publication, drain, group commit, checkpoint rotation and index rebuilding
+are disabled. Admission fails at the following bounds; no automatic reclamation is available:
+
+| Resource | Bound |
+| --- | ---: |
+| Retained parts per table | 4,096 |
+| Partitions per table | 512 |
+| Live keys per partition | 262,144 |
+| Encoded live-key bytes per partition | 64 MiB |
+| Retained retry tokens per partition | 4,096 |
+| Log file | 256 MiB |
+| Input block | 1,048,576 rows and 32 MiB |
+| Token text | 1,024 bytes |
+
+The coordinator copies bounded in-memory key state and masks during preparation. The table-wide
+limits permit larger hash-partitioned imports while retaining the per-partition key and byte limits.
+These admission limits do not reserve memory; provision server memory for the retained key state
+and concurrent preparation before large imports. It is intended
+for correctness validation, with no production throughput or full v7.1 acceptance claim. The current
+manifest protocol is incompatible with the earlier ingestion-disabled scaffold; validation deployment
+uses a fresh data directory and preserves the previous release.

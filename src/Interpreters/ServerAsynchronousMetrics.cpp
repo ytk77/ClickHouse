@@ -460,7 +460,8 @@ void ServerAsynchronousMetrics::updateImpl(TimePoint update_time, TimePoint curr
 
                     size_t bytes = table_merge_tree->totalBytes(getContext()).value();
                     size_t bytes_uncompressed = table_merge_tree->totalBytesUncompressed(getContext()->getSettingsRef()).value();
-                    size_t rows = table_merge_tree->totalRows(getContext()).value();
+                    /// Storage metrics count physical rows, including rows hidden by `UpsertMergeTree` masks.
+                    size_t rows = table_merge_tree->getTotalActiveSizeInRows();
                     size_t parts = table_merge_tree->getActivePartsCount();
 
                     total_number_of_bytes += bytes;

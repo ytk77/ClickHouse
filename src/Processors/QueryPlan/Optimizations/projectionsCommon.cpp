@@ -60,7 +60,7 @@ bool canUseProjectionForReadingStep(ReadFromMergeTree * reading)
     /// read+delete work, which makes count() delete-bitmap-aware.
     {
         const auto metadata = reading->getStorageMetadata();
-        if (metadata->hasUniqueKey() && metadata->hasProjections())
+        if (reading->getMergeTreeData().merging_params.upsert || (metadata->hasUniqueKey() && metadata->hasProjections()))
             return false;
     }
 

@@ -20,6 +20,7 @@
 #include <Storages/MergeTree/DataPartStorageOnDiskFull.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MergeTree/MergeTreeDataWriter.h>
+#include <Storages/MergeTree/UniqueKey/UpsertPartData.h>
 #include <Storages/MergeTree/MergeTreeIndexGranularity.h>
 #include <Storages/MergeTree/MergeTreeMarksLoader.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
@@ -762,6 +763,8 @@ MergeTreeTemporaryPartPtr MergeTreeDataWriter::writeTempPartImpl(
         temp_prefix += temp_postfix + "_";
 
     std::string part_dir = temp_prefix + part_name;
+    if (data.merging_params.upsert)
+        part_dir = "tmp_upsert_" + Upsert::objectName(Upsert::newObjectID());
     temp_part->temporary_directory_lock = data.getTemporaryPartDirectoryHolder(part_dir);
 
     auto indices = collectSkipIndicesToMaterialize(
@@ -1035,7 +1038,12 @@ MergeTreeTemporaryPartPtr MergeTreeDataWriter::writeTempPartImpl(
     Block permuted_columns_cache;
     out->writeWithPermutation(block, perm_ptr, &permuted_columns_cache);
 
-    if (metadata_snapshot->hasUniqueKey())
+    if (data.merging_params.upsert)
+        Upsert::writePartIndex(
+            *data_part_storage, block, *metadata_snapshot, data.merging_params.upsert_version_column,
+            {UUIDHelpers::getHighBytes(new_data_part->uuid), UUIDHelpers::getLowBytes(new_data_part->uuid)},
+            perm_ptr, context->getSettingsRef()[Setting::unique_key_max_encoded_size], context, gathered_data.checksums);
+    else if (metadata_snapshot->hasUniqueKey())
         UniqueKeyDenseIndexOps::writeDenseIndexOnInsert(
             *data_part_storage,
             metadata_snapshot,

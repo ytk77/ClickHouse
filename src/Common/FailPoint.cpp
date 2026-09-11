@@ -32,6 +32,12 @@ static struct InitFiu
 /// - PAUSEABLE: the failpoint will be blocked every time when pauseFailPoint is called, until disableFailPoint is called.
 
 #define APPLY_FOR_FAILPOINTS(ONCE, REGULAR, PAUSEABLE_ONCE, PAUSEABLE) \
+    ONCE(upsert_log_throw_after_append) \
+    ONCE(upsert_log_throw_after_sync) \
+    ONCE(upsert_throw_after_rename) \
+    ONCE(upsert_throw_before_publish) \
+    PAUSEABLE_ONCE(upsert_pause_after_read_snapshot) \
+    PAUSEABLE_ONCE(upsert_pause_before_merge_commit) \
     ONCE(replicated_merge_tree_commit_zk_fail_after_op) \
     ONCE(overwrite_cache_throw_during_publish) \
     ONCE(overwrite_cache_throw_during_index_build) \
