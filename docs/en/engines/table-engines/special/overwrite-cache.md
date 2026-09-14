@@ -61,6 +61,13 @@ A writer never waits for readers. A query that captured an older generation keep
 
 The atomicity boundary is one input block received by the table-engine sink. A SQL `INSERT` can be divided into multiple input blocks by its pipeline; earlier blocks remain committed if a later block is rejected. Buffering a complete statement would make publication size unbounded and is intentionally not part of this in-memory engine's contract.
 
+Insert admission, publication ordering, writer-lock acquisition, persistence queue capacity, and synchronous durability waits observe query cancellation. Cancelling a block before the persistence queue accepts it rolls back its staged changes and releases its place in publication order. Cancellation after acceptance can return before the write becomes durable; the accepted block remains published and queued. As with any cancelled multi-block statement, cancellation does not undo earlier committed blocks.
+
+The persistence queue accounts for segment columns, deleted keys, and commit bookkeeping. An oversized commit can proceed only when the queue is empty. A manifest checkpoint requires sufficient new records and bytes since the previous checkpoint or table load; retained deletion records do not count as new work. Necessary deletion records remain in replay order, preventing deleted rows from returning after a restart. A rewritten manifest is synchronized once before replacement.
+
+The `OverwriteCacheInsertAdmissionWaits`, `OverwriteCachePublicationWaits`, `OverwriteCacheWriterLockWaits`, `OverwriteCachePersistenceQueueWaits`, and `OverwriteCachePersistenceDurableWaits` profile events identify where operations encountered backpressure. They count waits, rather than elapsed time.
+
+
 ## Memory representation {#memory-representation}
 
 Committed payloads are stored in immutable native column segments. A segment preserves compact column representations such as `LowCardinality` dictionaries. Rows retain only a segment reference and row offset; serialized primary and lookup keys used while preparing an insert are not retained in the row payload.

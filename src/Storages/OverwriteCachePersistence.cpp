@@ -1,4 +1,6 @@
 #include <Storages/OverwriteCachePersistence.h>
+#include <Storages/OverwriteCacheWait.h>
+#include <Common/FailPoint.h>
 
 #include <Columns/IColumn.h>
 #include <Compression/CompressedReadBuffer.h>
@@ -23,6 +25,11 @@ namespace fs = std::filesystem;
 
 namespace DB
 {
+
+namespace FailPoints
+{
+    extern const char overwrite_cache_pause_before_persist[];
+}
 
 namespace ErrorCodes
 {
@@ -251,7 +258,10 @@ void OverwriteCachePersistence::load(const std::function<void(LoadedRecord &&)> 
     std::lock_guard state_lock(state_mutex);
     live_segments = std::move(loaded_segments);
     live_segment_ids = std::move(loaded_segment_ids);
-    records_since_checkpoint = records.size();
+    /// Existing records are a baseline, not new work since this instance last checkpointed.
+    records_since_checkpoint = 0;
+    bytes_since_checkpoint = 0;
+    checkpoint_bytes = disk->getFileSize(manifest_path);
 }
 
 std::vector<OverwriteCachePersistence::Record>
@@ -373,6 +383,21 @@ void OverwriteCachePersistence::start()
     writer_thread.emplace([this] { writerThread(); });
 }
 
+UInt64 OverwriteCachePersistence::Commit::allocatedBytes() const
+{
+    UInt64 bytes = sizeof(Commit) + added.capacity() * sizeof(AddedSegment)
+        + removed.capacity() * sizeof(UInt64) + deleted_keys.capacity() * sizeof(String);
+    for (const auto & segment : added)
+    {
+        bytes += segment.columns.capacity() * sizeof(ColumnPtr);
+        for (const auto & column : segment.columns)
+            bytes += column->allocatedBytes();
+    }
+    for (const auto & key : deleted_keys)
+        bytes += key.capacity();
+    return bytes;
+}
+
 UInt64 OverwriteCachePersistence::enqueue(Commit && commit)
 {
     if (!isEnabled())
@@ -380,10 +405,7 @@ UInt64 OverwriteCachePersistence::enqueue(Commit && commit)
     if (commit.added.empty() && commit.removed.empty() && commit.deleted_keys.empty())
         return 0;
 
-    UInt64 bytes = 0;
-    for (const auto & segment : commit.added)
-        for (const auto & column : segment.columns)
-            bytes += column->allocatedBytes();
+    const UInt64 bytes = commit.allocatedBytes();
 
     std::unique_lock lock(mutex);
     if (writer_exception)
@@ -391,18 +413,22 @@ UInt64 OverwriteCachePersistence::enqueue(Commit && commit)
     if (!started)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Persistence of storage `OverwriteCache` is not started");
 
-    /// Waiting here keeps the queue from becoming a second copy of the table. The writer lock is held, so
-    /// this is the one place where a slow disk slows publication down even in `Async` mode.
-    queue_changed.wait(lock, [&]() TSA_NO_THREAD_SAFETY_ANALYSIS
-    { return stopped || writer_exception || queued_bytes < max_queued_bytes; });
+    /// Include the incoming commit, including deletion keys. A single oversized commit may proceed
+    /// only with an empty queue, otherwise a block larger than the limit could never make progress.
+    waitForOverwriteCache(queue_changed, lock, [&]() TSA_NO_THREAD_SAFETY_ANALYSIS
+    {
+        return stopped || writer_exception || queued_bytes == 0
+            || (bytes <= max_queued_bytes && queued_bytes <= max_queued_bytes - bytes);
+    }, ProfileEvents::OverwriteCachePersistenceQueueWaits);
     if (writer_exception)
         std::rethrow_exception(writer_exception);
     if (stopped)
-        return 0;
+        throw Exception(ErrorCodes::ABORTED, "Persistence of storage `OverwriteCache` is stopped");
 
-    const UInt64 sequence = next_sequence++;
-    queued_bytes += bytes;
+    const UInt64 sequence = next_sequence;
     queue.emplace_back(sequence, std::move(commit));
+    ++next_sequence;
+    queued_bytes += bytes;
     queue_changed.notify_all();
     return sequence;
 }
@@ -413,8 +439,8 @@ void OverwriteCachePersistence::waitDurable(UInt64 sequence)
         return;
 
     std::unique_lock lock(mutex);
-    durable_changed.wait(lock, [&]() TSA_NO_THREAD_SAFETY_ANALYSIS
-    { return stopped || writer_exception || durable_sequence >= sequence; });
+    waitForOverwriteCache(durable_changed, lock, [&]() TSA_NO_THREAD_SAFETY_ANALYSIS
+    { return stopped || writer_exception || durable_sequence >= sequence; }, ProfileEvents::OverwriteCachePersistenceDurableWaits);
     if (writer_exception)
         std::rethrow_exception(writer_exception);
     /// The caller asked for a durability guarantee, so a shutdown that races the wait is an error rather
@@ -450,13 +476,12 @@ void OverwriteCachePersistence::writerThread()
             sequence = queue.front().first;
             commit = std::move(queue.front().second);
             queue.pop_front();
-            for (const auto & segment : commit.added)
-                for (const auto & column : segment.columns)
-                    bytes += column->allocatedBytes();
+            bytes = commit.allocatedBytes();
         }
 
         try
         {
+            FailPointInjection::pauseFailPoint(FailPoints::overwrite_cache_pause_before_persist);
             writeCommit(commit);
         }
         catch (...)
@@ -493,7 +518,9 @@ void OverwriteCachePersistence::writeCommit(const Commit & commit)
 
     {
         std::lock_guard state_lock(state_mutex);
-        appendManifestRecord(record);
+        bytes_since_checkpoint += appendManifestRecord(record);
+        manifest_buffer->next();
+        manifest_buffer->sync();
 
         for (const auto & segment : record.added)
         {
@@ -543,7 +570,7 @@ void OverwriteCachePersistence::writeSegmentFile(const AddedSegment & segment)
     disk->replaceFile(tmp_path, fs::path(table_path) / file_name);
 }
 
-void OverwriteCachePersistence::appendManifestRecord(const Record & record)
+UInt64 OverwriteCachePersistence::appendManifestRecord(const Record & record)
 {
     WriteBufferFromOwnString payload_buffer;
     writeBinaryLittleEndian(record.generation, payload_buffer);
@@ -568,8 +595,7 @@ void OverwriteCachePersistence::appendManifestRecord(const Record & record)
     writeBinaryLittleEndian(static_cast<UInt64>(payload.size()), *manifest_buffer);
     writePODBinary(checksum, *manifest_buffer);
     manifest_buffer->write(payload.data(), payload.size());
-    manifest_buffer->next();
-    manifest_buffer->sync();
+    return sizeof(UInt64) + sizeof(checksum) + payload.size();
 }
 
 void OverwriteCachePersistence::removeSegmentFiles(const std::vector<UInt64> & segment_ids)
@@ -595,10 +621,11 @@ void OverwriteCachePersistence::removeSegmentFiles(const std::vector<UInt64> & s
 
 bool OverwriteCachePersistence::needsCheckpoint() const
 {
-    /// The bookkeeping is worth collapsing once the log holds far more records than the segments it
-    /// describes, which is what a steadily churning cache produces.
+    /// Retained tombstones are not new work. Both record and byte growth must justify another pass,
+    /// so a large irreducible log cannot be rewritten repeatedly by a stream of tiny commits.
     return records_since_checkpoint > checkpoint_min_records
-        && records_since_checkpoint > 2 * live_segments.size();
+        && records_since_checkpoint > 2 * live_segments.size()
+        && bytes_since_checkpoint >= checkpoint_bytes;
 }
 
 void OverwriteCachePersistence::checkpointManifest()
@@ -634,7 +661,9 @@ void OverwriteCachePersistence::checkpointManifest()
 
     writeManifest(compacted);
 
-    records_since_checkpoint = compacted.size();
+    records_since_checkpoint = 0;
+    bytes_since_checkpoint = 0;
+    checkpoint_bytes = disk->getFileSize(fs::path(getPath()) / manifest_file_name);
     LOG_INFO(
         log,
         "Collapsed the `OverwriteCache` log from {} to {} records, describing {} segments, and dropped {} deletions that no "
@@ -658,6 +687,9 @@ void OverwriteCachePersistence::writeManifest(const std::vector<Record> & record
         writeStringBinary(fingerprint, *manifest_buffer);
         for (const auto & record : records)
             appendManifestRecord(record);
+        /// The temporary file is not visible until replacement; one durability barrier covers it all.
+        manifest_buffer->next();
+        manifest_buffer->sync();
         manifest_buffer->finalize();
         manifest_buffer.reset();
     }
@@ -683,6 +715,8 @@ void OverwriteCachePersistence::truncate()
         live_segments.clear();
         live_segment_ids.clear();
         records_since_checkpoint = 0;
+        bytes_since_checkpoint = 0;
+        checkpoint_bytes = 0;
     }
     next_segment_id.store(1, std::memory_order_relaxed);
 

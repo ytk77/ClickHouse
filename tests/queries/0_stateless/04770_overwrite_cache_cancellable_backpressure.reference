@@ -1,0 +1,4 @@
+admission, publication and queue cancellation completed while persistence was paused
+cancelled deletion rolled back
+later publication and replay preserved exactly the accepted rows
+durable wait cancellation preserved the accepted commit

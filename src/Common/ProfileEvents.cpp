@@ -616,6 +616,11 @@
     M(StorageBufferLayerLockReadersWaitMilliseconds, "Time for waiting for Buffer layer during reading.", ValueType::Milliseconds) \
     M(StorageBufferLayerLockWritersWaitMilliseconds, "Time for waiting free Buffer layer to write to (can be used to tune Buffer layers).", ValueType::Milliseconds) \
     \
+    M(OverwriteCacheInsertAdmissionWaits, "Number of `OverwriteCache` blocks waiting for insert preparation capacity.", ValueType::Number) \
+    M(OverwriteCachePublicationWaits, "Number of `OverwriteCache` blocks waiting for their publication turn.", ValueType::Number) \
+    M(OverwriteCachePersistenceQueueWaits, "Number of `OverwriteCache` commits waiting for persistence queue capacity.", ValueType::Number) \
+    M(OverwriteCachePersistenceDurableWaits, "Number of waits for an `OverwriteCache` commit to become durable.", ValueType::Number) \
+    M(OverwriteCacheWriterLockWaits, "Number of `OverwriteCache` operations waiting for the writer lock.", ValueType::Number) \
     M(OverwriteCacheEqualVersionTies, "Number of rows inserted into an 'OverwriteCache' table that were ignored because a row with the same key already had the same version and tie-break values. A nonzero value means the tie-break columns do not fully determine the winner, so the stored payload depends on insertion order.", ValueType::Number) \
     M(OverwriteCacheBackgroundCompactions, "Number of completed background small-segment compactions in `OverwriteCache` tables.", ValueType::Number) \
     M(OverwriteCacheBackgroundCompactedSegments, "Number of source segments replaced by background small-segment compaction in `OverwriteCache` tables.", ValueType::Number) \

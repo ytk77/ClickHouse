@@ -21,6 +21,7 @@
 #include <condition_variable>
 #include <deque>
 #include <limits>
+#include <list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -986,13 +987,12 @@ private:
     std::vector<std::vector<size_t>> lookup_index_positions;
     std::vector<DataTypes> lookup_index_column_types;
 
-    mutable std::mutex writer_mutex;
+    mutable std::timed_mutex writer_mutex;
     /// Insert callers prepare independently, then enter publication in ticket order. Other operations
     /// still use `writer_mutex` directly because they already hold an exclusive table-level lock.
     mutable std::mutex publication_order_mutex;
     mutable std::condition_variable publication_order_changed;
-    UInt64 next_publication_ticket = 0;
-    UInt64 serving_publication_ticket = 0;
+    std::list<char> publication_tickets;
     mutable std::mutex insert_admission_mutex;
     mutable std::condition_variable insert_admission_changed;
     UInt64 active_insert_preparations = 0;

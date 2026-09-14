@@ -67,6 +67,8 @@ public:
         std::vector<AddedSegment> added;
         std::vector<UInt64> removed;
         std::vector<String> deleted_keys;
+
+        UInt64 allocatedBytes() const;
     };
 
     /// One replayed record. Either a segment block or a batch of deleted keys, never both: a commit is
@@ -101,6 +103,7 @@ public:
     UInt64 allocateSegmentId() { return next_segment_id.fetch_add(1, std::memory_order_relaxed); }
 
     /// Called with the storage's writer lock held, so that the log order is the publication order.
+    /// Must be the last throwing step before publication, inside its rollback boundary.
     /// Returns the sequence number to wait for in `Sync` mode.
     UInt64 enqueue(Commit && commit) TSA_NO_THREAD_SAFETY_ANALYSIS;
 
@@ -158,7 +161,7 @@ private:
     void writerThread() TSA_NO_THREAD_SAFETY_ANALYSIS;
     void writeCommit(const Commit & commit);
     void writeSegmentFile(const AddedSegment & segment);
-    void appendManifestRecord(const Record & record) TSA_REQUIRES(state_mutex);
+    UInt64 appendManifestRecord(const Record & record) TSA_REQUIRES(state_mutex);
     void openManifest(bool rewrite) TSA_REQUIRES(state_mutex);
     void closeManifest() TSA_REQUIRES(state_mutex);
     void createDirectories();
@@ -194,6 +197,9 @@ private:
     std::unordered_set<UInt64> live_segment_ids TSA_GUARDED_BY(state_mutex);
     /// Records written since the last checkpoint, to decide when the bookkeeping is worth collapsing.
     size_t records_since_checkpoint TSA_GUARDED_BY(state_mutex) = 0;
+    /// Require new bytes to pay for rewriting the retained log, including indispensable tombstones.
+    UInt64 bytes_since_checkpoint TSA_GUARDED_BY(state_mutex) = 0;
+    UInt64 checkpoint_bytes TSA_GUARDED_BY(state_mutex) = 0;
 
     mutable std::mutex mutex;
     std::condition_variable queue_changed;

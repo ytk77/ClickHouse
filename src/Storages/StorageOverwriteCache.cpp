@@ -1,4 +1,5 @@
 #include <Storages/StorageOverwriteCache.h>
+#include <Storages/OverwriteCacheWait.h>
 
 #include <Backups/BackupEntriesCollector.h>
 #include <Backups/BackupEntryFromImmutableFile.h>
@@ -1016,7 +1017,7 @@ StorageOverwriteCache::SmallSegmentCompactionResult StorageOverwriteCache::compa
 
     FailPointInjection::pauseFailPoint(FailPoints::overwrite_cache_pause_before_small_segment_compaction_publish);
 
-    std::unique_lock writer_lock(writer_mutex);
+    auto writer_lock = lockOverwriteCacheWriter(writer_mutex);
     for (size_t row = 0; row < source_rows.size(); ++row)
     {
         const EntryId entry_id = source_entry_ids[row];
@@ -1054,6 +1055,26 @@ StorageOverwriteCache::SmallSegmentCompactionResult StorageOverwriteCache::compa
     merged_segment->entry_ids = source_entry_ids;
     merged_segment->live_rows.store(source_rows.size(), std::memory_order_relaxed);
 
+    std::vector<std::shared_ptr<RowSegment>> retired_segments;
+    retired_segments.reserve(source_segments.size());
+    row_segments.emplace_back(merged_segment);
+    bool committed = false;
+    SCOPE_EXIT({
+        if (!committed)
+            row_segments.pop_back();
+    });
+
+    if (persistence->isEnabled())
+    {
+        OverwriteCachePersistence::Commit commit;
+        commit.generation = new_generation;
+        commit.added.push_back({merged_segment->persistent_id, merged_segment->columns, merged_segment->entry_ids.size()});
+        commit.removed.reserve(source_segments.size());
+        for (const auto & retired_segment : source_segments)
+            commit.removed.push_back(retired_segment->persistent_id);
+        persistence->enqueue(std::move(commit));
+    }
+
     for (size_t row = 0; row < source_entry_ids.size(); ++row)
     {
         auto & entry = entries.at(source_entry_ids[row]);
@@ -1063,10 +1084,8 @@ StorageOverwriteCache::SmallSegmentCompactionResult StorageOverwriteCache::compa
     }
 
     published_generation.store(new_generation, std::memory_order_release);
-    row_segments.emplace_back(merged_segment);
+    committed = true;
 
-    std::vector<std::shared_ptr<RowSegment>> retired_segments;
-    retired_segments.reserve(source_segments.size());
     UInt64 reclaimed_bytes = 0;
     for (const auto & row : source_rows)
     {
@@ -1078,17 +1097,6 @@ StorageOverwriteCache::SmallSegmentCompactionResult StorageOverwriteCache::compa
     }
     chassert(retired_segments.size() == source_segments.size());
     total_size_bytes.store(bytes_before + merged_segment->allocated_bytes - reclaimed_bytes, std::memory_order_relaxed);
-
-    if (persistence->isEnabled())
-    {
-        OverwriteCachePersistence::Commit commit;
-        commit.generation = new_generation;
-        commit.added.push_back({merged_segment->persistent_id, merged_segment->columns, merged_segment->entry_ids.size()});
-        commit.removed.reserve(retired_segments.size());
-        for (const auto & retired_segment : retired_segments)
-            commit.removed.push_back(retired_segment->persistent_id);
-        persistence->enqueue(std::move(commit));
-    }
 
     std::shared_lock entry_lifetime_lock(entry_lifetime_mutex);
     writer_lock.unlock();
@@ -1647,13 +1655,13 @@ void StorageOverwriteCache::acquireInsertPreparation(UInt64 bytes)
             settings.max_pending_insert_bytes);
 
     std::unique_lock lock(insert_admission_mutex);
-    insert_admission_changed.wait(
-        lock,
+    waitForOverwriteCache(
+        insert_admission_changed, lock,
         [&]
         {
             return active_insert_preparations < settings.max_concurrent_insert_preparations
                 && pending_insert_bytes <= settings.max_pending_insert_bytes - bytes;
-        });
+        }, ProfileEvents::OverwriteCacheInsertAdmissionWaits);
     ++active_insert_preparations;
     pending_insert_bytes += bytes;
 }
@@ -1745,17 +1753,17 @@ void StorageOverwriteCache::insertBlock(const Block & input_block, UInt64 replay
 
     FailPointInjection::pauseFailPoint(FailPoints::overwrite_cache_pause_after_lookup_catalog_snapshot);
 
-    UInt64 publication_ticket = 0;
+    std::list<char>::iterator publication_ticket;
     {
-        std::unique_lock order_lock(publication_order_mutex);
-        publication_ticket = next_publication_ticket++;
-        publication_order_changed.wait(order_lock, [&] { return publication_ticket == serving_publication_ticket; });
+        std::lock_guard order_lock(publication_order_mutex);
+        publication_ticket = publication_tickets.emplace(publication_tickets.end());
     }
     const auto release_publication_turn = [&]
     {
         {
             std::lock_guard order_lock(publication_order_mutex);
-            ++serving_publication_ticket;
+            /// Erasing a cancelled waiter also works out of order, without allocating or leaving a hole.
+            publication_tickets.erase(publication_ticket);
         }
         publication_order_changed.notify_all();
     };
@@ -1765,7 +1773,13 @@ void StorageOverwriteCache::insertBlock(const Block & input_block, UInt64 replay
             release_publication_turn();
     });
 
-    std::unique_lock writer_lock(writer_mutex);
+    {
+        std::unique_lock order_lock(publication_order_mutex);
+        waitForOverwriteCache(publication_order_changed, order_lock,
+            [&] { return publication_ticket == publication_tickets.begin(); }, ProfileEvents::OverwriteCachePublicationWaits);
+    }
+
+    auto writer_lock = lockOverwriteCacheWriter(writer_mutex);
     pruneLookupTombstones();
     if (lookup_positions_snapshot != lookup_index_positions)
     {
@@ -2104,6 +2118,9 @@ void StorageOverwriteCache::insertBlock(const Block & input_block, UInt64 replay
         throw Exception(ErrorCodes::LOGICAL_ERROR, "`OverwriteCache` publication generation space is exhausted");
     const UInt64 new_generation = current_generation + 1;
 
+    UInt64 persistence_sequence = 0;
+    const size_t row_segments_before = row_segments.size();
+
     const size_t old_entry_count = entries.size();
     if (next_entry_id != old_entry_count + 1)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Corrupted `OverwriteCache` entry identifier sequence");
@@ -2231,10 +2248,32 @@ void StorageOverwriteCache::insertBlock(const Block & input_block, UInt64 replay
         });
 
         FailPointInjection::pauseFailPoint(FailPoints::overwrite_cache_pause_before_commit);
+        for (const auto & added_segment : added_segments)
+            row_segments.emplace_back(added_segment);
+        if (!loading && persistence->isEnabled())
+        {
+            OverwriteCachePersistence::Commit commit;
+            commit.generation = new_generation;
+            commit.added.reserve(added_segments.size());
+            for (const auto & added_segment : added_segments)
+                commit.added.push_back({added_segment->persistent_id, added_segment->columns, added_segment->entry_ids.size()});
+            commit.removed.reserve(segment_compactions.size());
+            for (const auto & compaction : segment_compactions)
+            {
+                if ((compaction.selected || compaction.projected_live_rows == 0) && compaction.source->persistent_id)
+                    commit.removed.push_back(compaction.source->persistent_id);
+            }
+            /// Queue acceptance is the final throwing step. Cancellation or writer failure rolls back
+            /// staged versions; after acceptance the generation must be published even if cancelled.
+            persistence_sequence = persistence->enqueue(std::move(commit));
+        }
+        else
+            CurrentThread::checkIfNotCancelled();
     }
     catch (...)
     {
         FailPointInjection::pauseFailPoint(FailPoints::overwrite_cache_pause_before_rollback);
+        row_segments.resize(row_segments_before);
         /// Hash-table buffers and arena pages cannot shrink, so whatever was reserved stays accounted.
         UInt64 retained_bytes = entries_bytes_delta;
         for (const UInt64 bucket_delta : primary_shard_bytes_delta)
@@ -2294,8 +2333,6 @@ void StorageOverwriteCache::insertBlock(const Block & input_block, UInt64 replay
     total_size_rows.fetch_add(new_entries + resurrected_entries, std::memory_order_relaxed);
     for (size_t index = 0; index < lookup_indexes.size(); ++index)
         lookup_indexes[index]->accounted_bytes.fetch_add(lookup_bytes_delta[index], std::memory_order_relaxed);
-    for (const auto & added_segment : added_segments)
-        row_segments.emplace_back(added_segment);
 
     UInt64 reclaim_bytes = 0;
     for (const auto & mutation : mutations)
@@ -2310,32 +2347,12 @@ void StorageOverwriteCache::insertBlock(const Block & input_block, UInt64 replay
         reclaim_bytes += retired_segment->allocated_bytes;
     total_size_bytes.fetch_sub(reclaim_bytes, std::memory_order_relaxed);
 
-    UInt64 persistence_sequence = 0;
-    if (persistence->isEnabled())
+    if (loading && persistence->isEnabled())
     {
-        if (loading)
+        for (const auto & retired_segment : retired_segments)
         {
-            for (const auto & retired_segment : retired_segments)
-            {
-                if (retired_segment->persistent_id)
-                    retired_during_load.push_back(retired_segment->persistent_id);
-            }
-        }
-        else
-        {
-            OverwriteCachePersistence::Commit commit;
-            commit.generation = new_generation;
-            commit.added.reserve(added_segments.size());
-            for (const auto & added_segment : added_segments)
-                commit.added.push_back({added_segment->persistent_id, added_segment->columns, added_segment->entry_ids.size()});
-            commit.removed.reserve(retired_segments.size());
-            for (const auto & retired_segment : retired_segments)
-            {
-                if (retired_segment->persistent_id)
-                    commit.removed.push_back(retired_segment->persistent_id);
-            }
-            /// Enqueue under `writer_mutex`, so persistence records keep publication-generation order.
-            persistence_sequence = persistence->enqueue(std::move(commit));
+            if (retired_segment->persistent_id)
+                retired_during_load.push_back(retired_segment->persistent_id);
         }
     }
 
@@ -2413,7 +2430,7 @@ size_t StorageOverwriteCache::deleteKeys(const std::vector<String> & serialized_
         bool version_installed = false;
     };
 
-    std::unique_lock writer_lock(writer_mutex);
+    auto writer_lock = lockOverwriteCacheWriter(writer_mutex);
     pruneLookupTombstones();
 
     const UInt64 snapshot_generation = published_generation.load(std::memory_order_acquire);
@@ -2571,6 +2588,11 @@ size_t StorageOverwriteCache::deleteKeys(const std::vector<String> & serialized_
         throw Exception(ErrorCodes::LOGICAL_ERROR, "`OverwriteCache` publication generation space is exhausted");
     const UInt64 new_generation = current_generation + 1;
 
+    UInt64 persistence_sequence = 0;
+    const size_t row_segments_before = row_segments.size();
+    std::vector<std::shared_ptr<RowSegment>> retired_segments;
+    retired_segments.reserve(segment_compactions.size());
+
     /// Resolve stable posting coordinates before publication, while each deleted row is still directly
     /// available. Posting slots are append-only for the lifetime of their lookup index.
     std::vector<PendingPostingRemoval> staged_posting_removals;
@@ -2631,10 +2653,34 @@ size_t StorageOverwriteCache::deleteKeys(const std::vector<String> & serialized_
         });
 
         FailPointInjection::pauseFailPoint(FailPoints::overwrite_cache_pause_before_commit);
+        for (const auto & added_segment : added_segments)
+            row_segments.emplace_back(added_segment);
+        if (!loading && persistence->isEnabled())
+        {
+            /// A deletion must remain between the same segment additions during replay.
+            OverwriteCachePersistence::Commit commit;
+            commit.generation = new_generation;
+            commit.deleted_keys = serialized_keys;
+            commit.added.reserve(added_segments.size());
+            for (const auto & added_segment : added_segments)
+                commit.added.push_back({added_segment->persistent_id, added_segment->columns, added_segment->entry_ids.size()});
+            commit.removed.reserve(segment_compactions.size());
+            for (const auto & compaction : segment_compactions)
+            {
+                if ((compaction.selected || compaction.projected_live_rows == 0) && compaction.source->persistent_id)
+                    commit.removed.push_back(compaction.source->persistent_id);
+            }
+            /// Queue acceptance is the final throwing step. Cancellation or writer failure rolls back
+            /// staged versions; after acceptance the generation must be published even if cancelled.
+            persistence_sequence = persistence->enqueue(std::move(commit));
+        }
+        else
+            CurrentThread::checkIfNotCancelled();
     }
     catch (...)
     {
         FailPointInjection::pauseFailPoint(FailPoints::overwrite_cache_pause_before_rollback);
+        row_segments.resize(row_segments_before);
         for (auto & deletion : deletions)
         {
             if (!deletion.version_installed)
@@ -2666,12 +2712,8 @@ size_t StorageOverwriteCache::deleteKeys(const std::vector<String> & serialized_
     published_generation.store(new_generation, std::memory_order_release);
     total_size_bytes.store(prospective_bytes, std::memory_order_relaxed);
     total_size_rows.fetch_sub(deleted_rows, std::memory_order_relaxed);
-    for (const auto & added_segment : added_segments)
-        row_segments.emplace_back(added_segment);
 
     UInt64 reclaim_bytes = 0;
-    std::vector<std::shared_ptr<RowSegment>> retired_segments;
-    retired_segments.reserve(segment_compactions.size());
     for (const auto & deletion : deletions)
     {
         if (deletion.previous->segment->live_rows.fetch_sub(1, std::memory_order_acq_rel) == 1)
@@ -2681,34 +2723,12 @@ size_t StorageOverwriteCache::deleteKeys(const std::vector<String> & serialized_
         reclaim_bytes += retired_segment->allocated_bytes;
     total_size_bytes.fetch_sub(reclaim_bytes, std::memory_order_relaxed);
 
-    UInt64 persistence_sequence = 0;
-    if (persistence->isEnabled())
+    if (loading && persistence->isEnabled())
     {
-        if (loading)
+        for (const auto & retired_segment : retired_segments)
         {
-            for (const auto & retired_segment : retired_segments)
-            {
-                if (retired_segment->persistent_id)
-                    retired_during_load.push_back(retired_segment->persistent_id);
-            }
-        }
-        else
-        {
-            /// A deletion has to be recorded even though it creates no segment: the segment it emptied a
-            /// row of is not superseded by anything, so replaying that segment alone would bring the key back.
-            OverwriteCachePersistence::Commit commit;
-            commit.generation = new_generation;
-            commit.deleted_keys = serialized_keys;
-            commit.added.reserve(added_segments.size());
-            for (const auto & added_segment : added_segments)
-                commit.added.push_back({added_segment->persistent_id, added_segment->columns, added_segment->entry_ids.size()});
-            commit.removed.reserve(retired_segments.size());
-            for (const auto & retired_segment : retired_segments)
-            {
-                if (retired_segment->persistent_id)
-                    commit.removed.push_back(retired_segment->persistent_id);
-            }
-            persistence_sequence = persistence->enqueue(std::move(commit));
+            if (retired_segment->persistent_id)
+                retired_during_load.push_back(retired_segment->persistent_id);
         }
     }
 
@@ -3379,7 +3399,7 @@ void StorageOverwriteCache::alter(const AlterCommands & commands, ContextPtr que
         new_metadata.lookup_indexes = metadata_index_list.children.empty() ? nullptr : metadata_indexes;
         auto prepared_metadata = std::make_shared<const StorageInMemoryMetadata>(new_metadata);
 
-        std::unique_lock writer_lock(writer_mutex);
+        auto writer_lock = lockOverwriteCacheWriter(writer_mutex);
         const UInt64 current_generation = published_generation.load(std::memory_order_acquire);
         if (current_generation == std::numeric_limits<UInt64>::max())
             throw Exception(ErrorCodes::LOGICAL_ERROR, "`OverwriteCache` publication generation space is exhausted");
@@ -3482,7 +3502,7 @@ void StorageOverwriteCache::alter(const AlterCommands & commands, ContextPtr que
         throw Exception(ErrorCodes::FAULT_INJECTED, "Injected failure during `OverwriteCache` lookup-index build");
     });
 
-    std::unique_lock writer_lock(writer_mutex);
+    auto writer_lock = lockOverwriteCacheWriter(writer_mutex);
     const size_t catch_up_entry_count = entries.size();
     ReadGuard catch_up_guard(*this);
     for (EntryId entry_id = 1; entry_id <= catch_up_entry_count; ++entry_id)
