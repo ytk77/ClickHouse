@@ -1,5 +1,6 @@
 #include <Storages/MergeTree/UniqueKey/UpsertLogRecord.h>
 #include <Storages/MergeTree/UniqueKey/UpsertRowMetadata.h>
+#include <Storages/MergeTree/UniqueKey/UpsertPartData.h>
 #include <Common/Exception.h>
 #include <gtest/gtest.h>
 #include <limits>
@@ -205,4 +206,31 @@ TEST(UpsertLogRecord, SequenceExhaustionAndInvalidBoundaries)
     EXPECT_THROW((LogReplayCursor({}, "p")), Exception);
     EXPECT_THROW((LogReplayCursor({1, 2}, "p", 1, {})), Exception);
     EXPECT_THROW((LogReplayCursor({1, 2}, "p", 0, {1, 1})), Exception);
+}
+
+TEST(UpsertPartRows, PrevalidationRejectsInvalidImmutableInput)
+{
+    const ObjectID id{41, 17};
+    PartRows rows{
+        {"b", {1, {.operation_id = id, .block_ordinal = 0, .self_binding = true}}},
+        {"a", {0, {.operation_id = id, .block_ordinal = 1, .self_binding = true}}}};
+    ValidatedPartRows valid(rows, id);
+    EXPECT_EQ(valid.getRows(), rows);
+    EXPECT_EQ(valid.getPart(), id);
+    EXPECT_THROW((ValidatedPartRows(rows, ObjectID{1, 2})), Exception);
+    EXPECT_THROW((ValidatedPartRows({}, id)), Exception);
+    auto bad = rows;
+    bad[1].key = bad[0].key;
+    EXPECT_THROW((ValidatedPartRows(bad, id)), Exception);
+    bad = rows;
+    bad[1].value.row_offset = bad[0].value.row_offset;
+    EXPECT_THROW((ValidatedPartRows(bad, id)), Exception);
+    bad[1].value.row_offset = 2;
+    EXPECT_THROW((ValidatedPartRows(bad, id)), Exception);
+    bad = rows;
+    bad[1].value.row.self_binding = false;
+    EXPECT_THROW((ValidatedPartRows(bad, id)), Exception);
+    bad = rows;
+    bad[1].value.row.write_csn = 1;
+    EXPECT_THROW((ValidatedPartRows(bad, id)), Exception);
 }

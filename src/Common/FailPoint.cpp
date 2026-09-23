@@ -38,6 +38,9 @@ static struct InitFiu
     ONCE(upsert_throw_before_publish) \
     PAUSEABLE_ONCE(upsert_pause_after_read_snapshot) \
     PAUSEABLE_ONCE(upsert_pause_before_merge_commit) \
+    PAUSEABLE_ONCE(upsert_pause_first_preparation) \
+    PAUSEABLE_ONCE(upsert_pause_ready_preparation) \
+    ONCE(upsert_throw_during_preparation) \
     ONCE(replicated_merge_tree_commit_zk_fail_after_op) \
     PAUSEABLE_ONCE(overwrite_cache_pause_before_persist) \
     ONCE(overwrite_cache_throw_during_publish) \

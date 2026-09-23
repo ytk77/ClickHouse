@@ -31,6 +31,7 @@ namespace Upsert
 {
 class StateStore;
 struct Token;
+struct PreparedInsert;
 }
 
 class PreparedSetsCache;
@@ -132,7 +133,9 @@ public:
 
     MergeTreeDeduplicationLog * getDeduplicationLog() { return deduplication_log.get(); }
 
-    void insertUpsertBlock(BlockWithPartition & block, const StorageMetadataPtr & metadata, ContextPtr context, Upsert::Token token);
+    std::unique_ptr<Upsert::PreparedInsert> prepareUpsertBlock(
+        BlockWithPartition & block, const StorageMetadataPtr & metadata, ContextPtr context, Upsert::Token token);
+    void commitUpsertBlock(Upsert::PreparedInsert & prepared);
 
 private:
 

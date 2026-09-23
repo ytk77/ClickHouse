@@ -18,7 +18,7 @@ public:
     UInt64 authorizedPartCount() const;
     void checkAdmission() const;
     bool tokenAlreadyCommitted(const String & partition, const Token & token) const;
-    StateStore::Prepared prepare(const String & partition, PartCommit part, const PartRows & rows);
+    StateStore::Prepared prepare(const String & partition, PartCommit part, const ValidatedPartRows & rows);
     StateStore::Prepared prepareMerge(const String & partition, PartCommit part, const PartRows & rows, const std::vector<String> & sources);
     PartRows loadPartRows(const String & name) const;
     void pruneRetired();

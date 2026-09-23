@@ -5,6 +5,7 @@
 #include <IO/ReadBufferFromString.h>
 #include <IO/WriteBufferFromString.h>
 #include <Common/FailPoint.h>
+#include <Common/CurrentMemoryTracker.h>
 #include "config.h"
 #include <filesystem>
 #include <limits>
@@ -124,6 +125,40 @@ struct Database
             return std::nullopt;
         check(status);
         return value;
+    }
+
+    /// Bound temporary lookup memory independently of the input unit size.
+    template <typename Callback>
+    void forEachWinner(const String & partition, const PartRows & rows, Callback && callback) const
+    {
+        constexpr size_t lookup_batch_size = 1024;
+        const auto key_prefix = prefix('W', partition);
+        for (size_t begin = 0; begin < rows.size(); begin += lookup_batch_size)
+        {
+            const auto count = std::min(lookup_batch_size, rows.size() - begin);
+            std::vector<String> keys;
+            keys.reserve(count);
+            for (size_t i = 0; i < count; ++i)
+                keys.push_back(key_prefix + rows[begin + i].key);
+            std::vector<rocksdb::Slice> slices;
+            slices.reserve(count);
+            for (const auto & key : keys)
+                slices.emplace_back(key);
+            std::vector<rocksdb::PinnableSlice> values(count);
+            std::vector<rocksdb::Status> statuses(count);
+            db->MultiGet(rocksdb::ReadOptions{}, db->DefaultColumnFamily(), count, slices.data(), values.data(), statuses.data());
+            for (size_t i = 0; i < count; ++i)
+            {
+                std::optional<std::string_view> value;
+                if (!statuses[i].IsNotFound())
+                {
+                    check(statuses[i]);
+                    value = std::string_view(values[i].data(), values[i].size());
+                }
+                callback(rows[begin + i], keys[i], value);
+            }
+            CurrentMemoryTracker::check();
+        }
     }
 
     UInt64 integer(const String & key) const
@@ -446,8 +481,11 @@ bool DiskState::tokenAlreadyCommitted(const String & partition, const Token & to
     return true;
 }
 
-StateStore::Prepared DiskState::prepare(const String & partition, PartCommit part, const PartRows & rows)
+StateStore::Prepared DiskState::prepare(const String & partition, PartCommit part, const ValidatedPartRows & validated)
 {
+    if (part.part != validated.getPart())
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree input validation identity mismatch");
+    const auto & rows = validated.getRows();
     if (tokenAlreadyCommitted(partition, part.token))
     {
         StateStore::Prepared replay;
@@ -473,20 +511,14 @@ StateStore::Prepared DiskState::prepare(const String & partition, PartCommit par
         throw Exception(ErrorCodes::LIMIT_EXCEEDED, "UpsertMergeTree commit sequence exhausted");
     result.csn = result.disk->previous_csn + 1;
     auto & batch = result.disk->batch;
-    std::set<String> unique;
-    std::set<UInt32> offsets;
     auto dead = std::make_shared<DeleteBitmap>();
     part.dead.clear();
     part.kills.clear();
-    for (const auto & row : rows)
+    impl->database->forEachWinner(partition, rows, [&](const PartRow & row, const String & key, std::optional<std::string_view> incumbent)
     {
-        if (row.value.row.operation_id != part.part || !row.value.row.self_binding || !unique.insert(row.key).second
-            || row.value.row_offset >= part.rows || !offsets.insert(row.value.row_offset).second)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree input has invalid lineage, offsets or duplicate keys");
         auto candidate = row.value;
         candidate.row = candidate.row.resolve(result.csn);
-        const auto key = prefix('W', partition) + row.key;
-        if (auto incumbent = impl->database->get(key))
+        if (incumbent)
         {
             BinaryReader in{*incumbent};
             auto old_part = in.id();
@@ -496,7 +528,7 @@ StateStore::Prepared DiskState::prepare(const String & partition, PartCommit par
             {
                 part.dead.push_back(candidate.row_offset);
                 dead->add(candidate.row_offset);
-                continue;
+                return;
             }
             part.kills.push_back({old_part, old.row_offset});
         }
@@ -505,7 +537,7 @@ StateStore::Prepared DiskState::prepare(const String & partition, PartCommit par
         winner.string(encodeIndexValue(candidate));
         batch.Put(key, winner.bytes);
         checkBatchBudget(batch);
-    }
+    });
     std::sort(part.dead.begin(), part.dead.end());
     std::sort(part.kills.begin(), part.kills.end());
     for (size_t position = 0; position < part.kills.size();)
@@ -619,10 +651,9 @@ StateStore::Prepared DiskState::prepareMerge(
         const auto info = MergeTreePartInfo::fromPartName(name, MERGE_TREE_DATA_MIN_FORMAT_VERSION_WITH_CUSTOM_PARTITIONING);
         if (info.getPartitionId() != partition)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree merge crosses SQL partitions");
-        for (const auto & row : loadPartRows(name))
+        const auto source_rows = loadPartRows(name);
+        impl->database->forEachWinner(partition, source_rows, [&](const PartRow & row, const String & key, std::optional<std::string_view> value)
         {
-            const auto key = prefix('W', partition) + row.key;
-            auto value = impl->database->get(key);
             if (!value)
                 throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree merge source has no durable winner");
             BinaryReader in{*value};
@@ -648,7 +679,7 @@ StateStore::Prepared DiskState::prepareMerge(
             }
             if (maps_to_output && !mapped_output.insert(row.key).second)
                 throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree merge maps an output identity twice");
-        }
+        });
         batch.Put("R" + name, *authorization);
         batch.Delete("A" + name);
         batch.Delete("M" + objectName(source.part));
@@ -751,7 +782,7 @@ bool DiskState::tokenAlreadyCommitted(const String &, const Token &) const
 {
     std::unreachable();
 }
-StateStore::Prepared DiskState::prepare(const String &, PartCommit, const PartRows &)
+StateStore::Prepared DiskState::prepare(const String &, PartCommit, const ValidatedPartRows &)
 {
     std::unreachable();
 }

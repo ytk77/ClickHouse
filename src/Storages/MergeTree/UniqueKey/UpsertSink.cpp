@@ -4,13 +4,26 @@
 #include <Storages/StorageMergeTree.h>
 #include <Storages/MergeTree/MergeTreeDataWriter.h>
 #include <Interpreters/Context.h>
+#include <Interpreters/ProcessList.h>
 #include <Columns/ColumnsNumber.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <Core/Settings.h>
 #include <Core/UUID.h>
 #include <Common/Exception.h>
 #include <Common/FailPoint.h>
+#include <Common/MemoryTrackerUtils.h>
+#include <Common/CurrentMemoryTracker.h>
+#include <Common/threadPoolCallbackRunner.h>
+#include <Common/setThreadName.h>
+#include <deque>
 #include <filesystem>
+
+namespace CurrentMetrics
+{
+extern const Metric LocalThread;
+extern const Metric LocalThreadActive;
+extern const Metric LocalThreadScheduled;
+}
 
 namespace DB::Setting
 {
@@ -18,6 +31,10 @@ extern const SettingsUInt64 max_partitions_per_insert_block;
 extern const SettingsUInt64 unique_key_max_encoded_size;
 extern const SettingsString insert_deduplication_token;
 extern const SettingsUInt64 input_format_max_block_wait_ms;
+extern const SettingsMaxThreads max_insert_threads;
+extern const SettingsMaxThreads max_threads;
+extern const SettingsUInt64 max_threads_min_free_memory_per_thread;
+extern const SettingsUInt64 max_insert_threads_min_free_memory_per_thread;
 }
 namespace DB::ErrorCodes
 {
@@ -30,15 +47,104 @@ namespace DB::FailPoints
 {
 extern const char upsert_throw_after_rename[];
 extern const char upsert_throw_before_publish[];
+extern const char upsert_pause_first_preparation[];
+extern const char upsert_pause_ready_preparation[];
+extern const char upsert_throw_during_preparation[];
 }
 
 namespace DB::Upsert
 {
+struct PreparedInsert
+{
+    MergeTreeTemporaryPartPtr temporary;
+    String partition;
+    PartCommit authorization;
+    ValidatedPartRows rows;
+};
+
+struct Sink::Impl
+{
+    /// Both ready parts and running preparations count against these bounds.
+    static constexpr size_t max_pending_bytes = 128U << 20;
+    static constexpr size_t max_preparing_parts = 8;
+    struct Pending
+    {
+        size_t bytes;
+        std::future<std::unique_ptr<PreparedInsert>> future;
+    };
+
+    explicit Impl(size_t max_threads_) : max_threads(max_threads_)
+    {
+        if (max_threads > 1)
+            pool = std::make_unique<ThreadPool>(CurrentMetrics::LocalThread, CurrentMetrics::LocalThreadActive,
+                CurrentMetrics::LocalThreadScheduled, max_threads, max_threads, max_threads);
+    }
+
+    ~Impl()
+    {
+        discard();
+    }
+
+    void discard()
+    {
+        /// Workers only prepare temporary payloads. Join before releasing the storage's lifetime guards.
+        for (auto & task : pending)
+            if (task.future.valid())
+                task.future.wait();
+        pending.clear();
+        pending_bytes = 0;
+    }
+
+    const size_t max_threads;
+    std::unique_ptr<ThreadPool> pool;
+    std::deque<Pending> pending;
+    size_t pending_bytes = 0;
+};
+
 Sink::Sink(StorageMergeTree & storage_, StorageMetadataPtr metadata_, ContextPtr context_)
     : SinkToStorage(std::make_shared<const Block>(metadata_->getSampleBlock())), storage(storage_), metadata(std::move(metadata_)), context(std::move(context_))
 {
     if (context->getSettingsRef()[Setting::input_format_max_block_wait_ms])
         throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree does not support streaming inserts");
+}
+
+Sink::~Sink() = default;
+
+void Sink::onStart()
+{
+    const auto & settings = context->getSettingsRef();
+    const auto query_threads = getMaxThreadsForAvailableMemory(
+        std::max<size_t>(1, settings[Setting::max_threads]), settings[Setting::max_threads_min_free_memory_per_thread]);
+    const auto threads = getMaxThreadsForAvailableMemory(
+        std::min({std::max<size_t>(1, settings[Setting::max_insert_threads]), query_threads, Impl::max_preparing_parts}),
+        settings[Setting::max_insert_threads_min_free_memory_per_thread]);
+    impl = std::make_unique<Impl>(threads);
+}
+
+void Sink::finishFront()
+{
+    auto prepared = impl->pending.front().future.get();
+    impl->pending_bytes -= impl->pending.front().bytes;
+    impl->pending.pop_front();
+    if (isCancelled())
+        return;
+    if (auto process = context->getProcessListElement())
+        process->checkTimeLimit();
+    if (prepared)
+        storage.commitUpsertBlock(*prepared);
+}
+
+void Sink::onFinish()
+{
+    while (!impl->pending.empty() && !isCancelled())
+        finishFront();
+    impl->discard();
+}
+
+void Sink::onException(std::exception_ptr)
+{
+    if (impl)
+        impl->discard();
 }
 
 String Sink::getName() const
@@ -85,14 +191,47 @@ void Sink::consume(Chunk & chunk)
         foldBlock(*partition.block, *metadata, storage.merging_params.upsert_version_column, settings[Setting::unique_key_max_encoded_size]);
     }
     for (size_t i = 0; i < partitions.size(); ++i)
-        storage.insertUpsertBlock(partitions[i], metadata, context, std::move(tokens[i]));
+    {
+        if (isCancelled())
+            return;
+        if (auto process = context->getProcessListElement())
+            process->checkTimeLimit();
+        if (!impl->pool)
+        {
+            auto prepared = storage.prepareUpsertBlock(partitions[i], metadata, context, std::move(tokens[i]));
+            if (prepared && !isCancelled())
+            {
+                if (auto process = context->getProcessListElement())
+                    process->checkTimeLimit();
+                storage.commitUpsertBlock(*prepared);
+            }
+            continue;
+        }
+        CurrentMemoryTracker::check();
+        const size_t bytes = partitions[i].block->bytes();
+        while (!impl->pending.empty() && (impl->pending.size() >= impl->max_threads
+            || bytes > Impl::max_pending_bytes - impl->pending_bytes))
+            finishFront();
+        if (isCancelled())
+            return;
+        /// Allocate the queue entry before scheduling so every worker has a tracked future, including on exceptions.
+        impl->pending.push_back({bytes, {}});
+        impl->pending_bytes += bytes;
+        impl->pending.back().future = scheduleFromThreadPoolUnsafe<std::unique_ptr<PreparedInsert>>(
+            [target = &storage, snapshot = metadata, query_context = context,
+                partition = std::move(partitions[i]), token = std::move(tokens[i])]() mutable
+            {
+                return target->prepareUpsertBlock(partition, snapshot, query_context, std::move(token));
+            }, *impl->pool, ThreadName::DEFAULT_THREAD_POOL);
+    }
     ++unit;
 }
 }
 
 namespace DB
 {
-void StorageMergeTree::insertUpsertBlock(BlockWithPartition & block, const StorageMetadataPtr & metadata, ContextPtr query_context, Upsert::Token token)
+std::unique_ptr<Upsert::PreparedInsert> StorageMergeTree::prepareUpsertBlock(
+    BlockWithPartition & block, const StorageMetadataPtr & metadata, ContextPtr query_context, Upsert::Token token)
 {
     const String partition_id = block.partition.getID(metadata->getPartitionKey().sample_block);
     {
@@ -100,9 +239,15 @@ void StorageMergeTree::insertUpsertBlock(BlockWithPartition & block, const Stora
         if (upsert_fenced)
             throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree is fenced pending restart and recovery");
         if (upsert_store->tokenAlreadyCommitted(partition_id, token))
-            return;
+            return nullptr;
         upsert_store->checkAdmission();
     }
+    if (token.unit == 0)
+        FailPointInjection::pauseFailPoint(FailPoints::upsert_pause_first_preparation);
+    fiu_do_on(FailPoints::upsert_throw_during_preparation,
+    {
+        throw Exception(ErrorCodes::FAULT_INJECTED, "Injected UpsertMergeTree part preparation failure");
+    });
     auto temporary = writer.writeTempPart(block, metadata, query_context, false);
     temporary->finalize();
     auto & part = temporary->part;
@@ -110,7 +255,7 @@ void StorageMergeTree::insertUpsertBlock(BlockWithPartition & block, const Stora
         throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree writer returned an empty part");
     part->getDataPartStorage().commitTransaction();
     const auto path = part->getDataPartStorage().getFullPath();
-    const auto rows = Upsert::decodePartRows(Upsert::readBoundedFile(std::filesystem::path(path) / Upsert::ROWS_FILE, Upsert::MAX_RECORD_BYTES));
+    auto rows = Upsert::decodePartRows(Upsert::readBoundedFile(std::filesystem::path(path) / Upsert::ROWS_FILE, Upsert::MAX_RECORD_BYTES));
     Upsert::PartCommit authorization;
     authorization.part = {UUIDHelpers::getHighBytes(part->uuid), UUIDHelpers::getLowBytes(part->uuid)};
     authorization.temporary_name = part->getDataPartStorage().getPartDirectory();
@@ -118,7 +263,18 @@ void StorageMergeTree::insertUpsertBlock(BlockWithPartition & block, const Stora
     authorization.rows = part->rows_count;
     authorization.token = std::move(token);
     Upsert::syncDirectory(std::filesystem::path(path) / "..");
+    Upsert::ValidatedPartRows validated(std::move(rows), authorization.part);
+    CurrentMemoryTracker::check();
+    if (authorization.token.unit != 0)
+        FailPointInjection::pauseFailPoint(FailPoints::upsert_pause_ready_preparation);
+    return std::make_unique<Upsert::PreparedInsert>(
+        std::move(temporary), partition_id, std::move(authorization), std::move(validated));
+}
 
+void StorageMergeTree::commitUpsertBlock(Upsert::PreparedInsert & input)
+{
+    auto & part = input.temporary->part;
+    auto & authorization = input.authorization;
     auto lock = lockParts();
     if (upsert_fenced)
         throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree is fenced pending restart and recovery");
@@ -127,7 +283,7 @@ void StorageMergeTree::insertUpsertBlock(BlockWithPartition & block, const Stora
     Upsert::StateStore::Prepared prepared;
     try
     {
-        prepared = upsert_store->prepare(partition_id, std::move(authorization), rows);
+        prepared = upsert_store->prepare(input.partition, std::move(authorization), input.rows);
     }
     catch (...)
     {

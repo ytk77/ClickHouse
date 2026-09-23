@@ -22,6 +22,29 @@ The table incarnation and protocol are persisted inside both the authenticated t
 4. Pin the resulting database snapshot, rename the part, synchronize the directory, then publish the native part and visibility snapshot under the same parts lock.
 5. Acknowledge only after publication. An ambiguous state write or failure after authorization fences writes until restart and recovery.
 
+## Insert preparation and batching {#disk-state-parallel-preparation}
+
+`max_insert_threads` controls part preparation within one ordered sink. Its effective concurrency also respects `max_threads` and the corresponding minimum-free-memory settings, and is capped at eight in-flight parts per query. The queue counts both running preparations and completed parts awaiting publication, with an additional 128-MiB budget for their input blocks, including internal ordinals. Part metadata, encoded indexes and compression buffers consume additional query-accounted memory within the existing per-unit limits. Setting `max_insert_threads=1` prepares and commits each part synchronously.
+
+The sink assigns token units before dispatch, validates and folds all partitions of an input block, and publishes completed preparations in the original block and partition order. Workers only create temporary durable payloads; they never publish winners. Input completion drains the queue before success. On cancellation or an exception, outstanding preparations are joined and discarded without committing later units. Previously committed units retain the existing partial-insert and retry semantics. The engine continues to reject multiple independent sink chains, so retry identities and equal-version winner order do not depend on worker completion order.
+
+Immutable input lineage, offset and key uniqueness checks run before the commit lock. Foreground winner lookup and maintenance relocation use bounded `RocksDB` `MultiGet` batches of at most 1,024 keys. Winner decisions, masks, synchronous state persistence and publication remain serialized under the table parts lock; multiple SQL partitions do not bypass it. Missing keys are valid for new inputs, while missing maintenance winners and database errors remain exceptions.
+
+For throughput tuning, compare input batches around 16K, 64K and 256K rows and two to four concurrent clients against the same workload. The input block must also fit the 32-MiB limit; wide rows require smaller row batches. Keep key-to-partition routing stable and measure both initial ingestion and sustained overwrites with maintenance enabled. Increasing concurrency can increase memory, temporary disk usage and commit-lock waiting, and need not increase throughput.
+
+For a multi-block `INSERT SELECT`, an initial session configuration is:
+
+```sql
+SET max_threads = 4;
+SET max_insert_threads = 4;
+SET max_block_size = 65536;
+SET max_insert_block_size = 65536;
+SET min_insert_block_size_rows = 65536;
+SET min_insert_block_size_bytes = 0;
+```
+
+Measure this against `max_insert_threads=1` using identical input blocks. A single small input block in one SQL partition only produces one preparation task. The repository's `utils/upsert-benchmark/run.py` compares multi-block requests, independent clients and batch sizes, checking visible results after every phase.
+
 ## Keys and values {#disk-state-encoding}
 
 All integer fields are unsigned little-endian. Length-delimited strings use a four-byte length. The prefix contains a one-byte namespace followed, where specified, by a length-delimited SQL partition identity. Encoded unique keys retain the existing full key equality and are not replaced by hashes.

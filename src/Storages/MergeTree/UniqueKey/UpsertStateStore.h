@@ -88,6 +88,7 @@ public:
     std::optional<ObjectID> authorizedPart(const String & name) const;
     UInt64 authorizedPartCount() const;
     Prepared prepare(const String & partition, PartCommit part, const PartRows & rows);
+    Prepared prepare(const String & partition, PartCommit part, const ValidatedPartRows & rows);
     Prepared prepareMerge(const String & partition, PartCommit part, const PartRows & rows, const std::vector<String> & sources);
     PartRows loadPartRows(const String & name) const;
     void pruneRetired();

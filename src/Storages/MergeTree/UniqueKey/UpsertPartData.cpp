@@ -109,6 +109,26 @@ PartRows decodePartRows(std::string_view bytes)
     return rows;
 }
 
+ValidatedPartRows::ValidatedPartRows(PartRows rows_, ObjectID part_) : rows(std::move(rows_)), part(part_)
+{
+    if (rows.empty() || rows.size() > MAX_UNIT_ROWS || part == ObjectID{})
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "Invalid UpsertMergeTree input row count or identity");
+    std::vector<std::string_view> keys;
+    keys.reserve(rows.size());
+    std::vector<bool> offsets(rows.size(), false);
+    for (const auto & row : rows)
+    {
+        if (row.value.row.operation_id != part || !row.value.row.self_binding || row.value.row.write_csn != 0
+            || row.value.row_offset >= rows.size() || offsets[row.value.row_offset])
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree input has invalid lineage or offsets");
+        offsets[row.value.row_offset] = true;
+        keys.emplace_back(row.key);
+    }
+    std::sort(keys.begin(), keys.end());
+    if (std::adjacent_find(keys.begin(), keys.end()) != keys.end())
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree input has duplicate keys");
+}
+
 void foldBlock(Block & block, const StorageInMemoryMetadata & metadata, const String & version_column, size_t max_key_bytes)
 {
     auto keys = encodeKeys(block, metadata, max_key_bytes);

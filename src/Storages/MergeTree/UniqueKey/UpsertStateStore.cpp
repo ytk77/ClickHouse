@@ -307,8 +307,23 @@ StateStore::Prepared StateStore::decide(const String & partition, PartCommit par
 
 StateStore::Prepared StateStore::prepare(const String & partition, PartCommit part, const PartRows & rows)
 {
+    if (tokenAlreadyCommitted(partition, part.token))
+    {
+        Prepared replay;
+        replay.replayed_token = true;
+        return replay;
+    }
+    ValidatedPartRows validated(rows, part.part);
+    return prepare(partition, std::move(part), validated);
+}
+
+StateStore::Prepared StateStore::prepare(const String & partition, PartCommit part, const ValidatedPartRows & validated)
+{
+    if (part.part != validated.getPart() || part.rows != validated.getRows().size())
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree input validation identity mismatch");
+    const auto & rows = validated.getRows();
     if (disk)
-        return disk->prepare(partition, std::move(part), rows);
+        return disk->prepare(partition, std::move(part), validated);
     auto & entry = getOrCreatePartition(partition);
     if (tokenAlreadyCommitted(partition, part.token))
     {

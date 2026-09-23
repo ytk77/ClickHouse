@@ -28,6 +28,26 @@ struct PartRow
 };
 using PartRows = std::vector<PartRow>;
 
+/// Immutable input validation can run before taking the table parts lock.
+class ValidatedPartRows
+{
+public:
+    ValidatedPartRows(PartRows rows_, ObjectID part_);
+    const PartRows & getRows() const
+    {
+        return rows;
+    }
+    ObjectID getPart() const
+    {
+        return part;
+    }
+
+private:
+    PartRows rows;
+    ObjectID part;
+};
+
+
 ObjectID newObjectID();
 String objectName(ObjectID id);
 String encodePartRows(const PartRows & rows);

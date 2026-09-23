@@ -414,4 +414,47 @@ TEST_F(UpsertDiskStateTest, RecoveryRemovesOnlyUncommittedPreparations)
     auto equal_version = prepare(reopened, {{"key", 10}});
     EXPECT_TRUE(equal_version.produces_part);
 }
+
+TEST_F(UpsertDiskStateTest, BatchedWinnersAndMergeAcrossLookupBoundaries)
+{
+    StateStore store(directory, incarnation, false, true);
+    std::vector<std::pair<String, UInt64>> values;
+    for (size_t i = 0; i < 2053; ++i)
+        values.emplace_back("key" + std::to_string(i), 10);
+    auto first = prepare(store, values);
+    const auto first_name = first.record.final_name;
+    const auto first_id = objectName(first.record.part);
+    commit(store, first);
+    const auto pinned = store.snapshot();
+    for (size_t i = 0; i < values.size(); ++i)
+        values[i].second = i % 2 == 0 ? 11 : 9;
+    std::reverse(values.begin(), values.end());
+    values.emplace_back("new", 1);
+    auto second = prepare(store, values);
+    EXPECT_EQ(second.record.dead.size(), 1026);
+    EXPECT_EQ(second.record.kills.size(), 1027);
+    const auto second_name = second.record.final_name;
+    const auto second_id = objectName(second.record.part);
+    commit(store, second);
+    EXPECT_EQ(pinned->getMask(first_id)->cardinality(), 0);
+    EXPECT_EQ(store.snapshot()->getMask(first_id)->cardinality(), 1027);
+    EXPECT_EQ(store.snapshot()->getMask(second_id)->cardinality(), 1026);
+    PartRows output;
+    for (const auto & name : {first_name, second_name})
+    {
+        const auto part_id = name == first_name ? first_id : second_id;
+        const auto mask = store.snapshot()->getMask(part_id);
+        for (auto row : store.loadPartRows(name))
+            if (!mask->contains(row.value.row_offset))
+                output.push_back(std::move(row));
+    }
+    ASSERT_EQ(output.size(), 2054);
+    auto merged = merge(store, std::move(output), {first_name, second_name});
+    EXPECT_TRUE(merged.record.dead.empty());
+    commit(store, merged);
+    EXPECT_EQ(store.authorizedPartCount(), 1);
+    EXPECT_EQ(store.snapshot()->getMask(objectName(merged.record.part))->cardinality(), 0);
+    EXPECT_EQ(pinned->getMask(first_id)->cardinality(), 0);
+}
+
 #endif
