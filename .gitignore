@@ -4,6 +4,9 @@ ci/local.env
 # scratch / temporary working files
 /tmp/
 
+# generated code graph artifacts
+/graphify-out/
+
 # emacs files
 *~
 *\#
