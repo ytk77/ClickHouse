@@ -32,6 +32,13 @@ This avoids repeated and separately staged barriers for a single immutable part.
 
 ## Insert preparation and batching {#disk-state-parallel-preparation}
 
+The optional engine version column supports stored, non-null `UInt64`, `DateTime` and `DateTime64`
+values. Time versions use epoch order at the column's declared precision. Signed `DateTime64`
+ticks are mapped into the existing eight-byte unsigned version field by flipping the sign bit;
+`UInt64` encodings remain unchanged. Folding, part-index writing and maintenance use the same
+conversion, so negative timestamps and fractional ties retain their order after merge or recovery.
+The table manifest authenticates the type, scale and timezone as part of the schema.
+
 Asynchronous queue admission rejects a direct `UpsertMergeTree` destination and any reachable destination through aliases or cascading materialized views before returning success, including with `wait_for_async_insert=0`. The table-level `async_insert` setting is also rejected. Synchronous inserts through materialized views remain supported. This checks the destination graph at admission; later schema changes can still cause a background flush failure, which the general `wait_for_async_insert=0` contract does not report to the original client.
 
 `max_insert_threads` controls part preparation within one ordered sink. Its effective concurrency also respects `max_threads` and the corresponding minimum-free-memory settings, and is capped at eight in-flight parts per query. The queue counts both running preparations and completed parts awaiting publication, with an additional 128-MiB budget for their input blocks, including internal ordinals. Part metadata, encoded indexes and compression buffers consume additional query-accounted memory within the existing per-unit limits. Setting `max_insert_threads=1` prepares and commits each part synchronously.

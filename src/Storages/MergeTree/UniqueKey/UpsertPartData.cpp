@@ -6,6 +6,7 @@
 #include <Storages/MergeTree/IDataPartStorage.h>
 #include <Storages/MergeTree/MergeTreeDataPartChecksum.h>
 #include <Storages/StorageInMemoryMetadata.h>
+#include <DataTypes/IDataType.h>
 #include <Interpreters/Context.h>
 #include <Core/UUID.h>
 #include <Common/ErrnoException.h>
@@ -34,6 +35,28 @@ namespace DB::Upsert
 {
 namespace
 {
+class VersionColumn
+{
+public:
+    explicit VersionColumn(const ColumnWithTypeAndName & version)
+        : column(*version.column), is_datetime64(WhichDataType(version.type).isDateTime64())
+    {
+    }
+
+    UInt64 get(size_t row) const
+    {
+        /// Preserve signed `DateTime64` ticks and their full scale in the unsigned winner order.
+        /// `UInt64` and `DateTime` retain their original unsigned values.
+        if (is_datetime64)
+            return static_cast<UInt64>(column.getInt(row)) ^ (UInt64{1} << 63);
+        return column.getUInt(row);
+    }
+
+private:
+    const IColumn & column;
+    const bool is_datetime64;
+};
+
 VectorWithMemoryTracking<String> encodeKeys(const Block & block, const StorageInMemoryMetadata & metadata, size_t limit)
 {
     Columns columns;
@@ -186,7 +209,9 @@ size_t foldBlock(Block & block, const StorageInMemoryMetadata & metadata, const 
 {
     auto keys = encodeKeys(block, metadata, max_key_bytes);
     std::map<String, size_t> winners;
-    const auto * versions = version_column.empty() ? nullptr : block.getByName(version_column).column.get();
+    std::optional<VersionColumn> versions;
+    if (!version_column.empty())
+        versions.emplace(block.getByName(version_column));
     const auto & ordinals = *block.getByName(ORDINAL_COLUMN).column;
     for (size_t row = 0; row < block.rows(); ++row)
     {
@@ -194,8 +219,8 @@ size_t foldBlock(Block & block, const StorageInMemoryMetadata & metadata, const 
         if (!inserted)
         {
             const auto old = it->second;
-            if (!versions || versions->getUInt(row) > versions->getUInt(old)
-                || (versions->getUInt(row) == versions->getUInt(old) && ordinals.getUInt(row) > ordinals.getUInt(old)))
+            if (!versions || versions->get(row) > versions->get(old)
+                || (versions->get(row) == versions->get(old) && ordinals.getUInt(row) > ordinals.getUInt(old)))
                 it->second = row;
         }
     }
@@ -245,14 +270,17 @@ void writePartIndex(
 {
     const auto keys = encodeKeys(block, metadata, max_key_bytes);
     const auto & ordinals = *block.getByName(ORDINAL_COLUMN).column;
+    std::optional<VersionColumn> versions;
+    if (!version_column.empty())
+        versions.emplace(block.getByName(version_column));
     PartRows rows;
     rows.reserve(block.rows());
     for (size_t offset = 0; offset < block.rows(); ++offset)
     {
         const auto source = permutation ? (*permutation)[offset] : offset;
         RowMetadata row{.operation_id = operation_id, .block_ordinal = ordinals.getUInt(source), .self_binding = true};
-        if (!version_column.empty())
-            row.version = block.getByName(version_column).column->getUInt(source);
+        if (versions)
+            row.version = versions->get(source);
         if (block.has(LINEAGE_COLUMN))
         {
             const auto value = block.getByName(LINEAGE_COLUMN).column->getDataAt(source);

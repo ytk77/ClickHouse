@@ -55,9 +55,15 @@ void validateUpsertMergeTreeMetadata(
 
     if (!version_column.empty())
     {
+        const auto supported_version_type = [](const IDataType & type)
+        {
+            const WhichDataType which(type);
+            return which.isUInt64() || which.isDateTime() || which.isDateTime64();
+        };
         if (!metadata.columns.hasPhysical(version_column)
-            || !WhichDataType(metadata.columns.getPhysical(version_column).type).isUInt64())
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "UpsertMergeTree version column {} must be a stored non-null UInt64", version_column);
+            || !supported_version_type(*metadata.columns.getPhysical(version_column).type))
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "UpsertMergeTree version column {} must be a stored non-null UInt64, DateTime or DateTime64", version_column);
     }
 
     for (const auto & column : metadata.columns)

@@ -483,7 +483,7 @@ static StoragePtr create(const StorageFactory::Arguments & args)
     };
 
     if (merging_params.upsert)
-        add_optional_param("UInt64 version column");
+        add_optional_param("UInt64, DateTime or DateTime64 version column");
 
     if (replicated)
     {
@@ -599,7 +599,7 @@ static StoragePtr create(const StorageFactory::Arguments & args)
     if (merging_params.upsert && arg_cnt)
     {
         if (!tryGetIdentifierNameInto(engine_args.front(), merging_params.upsert_version_column))
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "UpsertMergeTree version must be a stored UInt64 column identifier");
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "UpsertMergeTree version must be a stored UInt64, DateTime or DateTime64 column identifier");
         --arg_cnt;
     }
 

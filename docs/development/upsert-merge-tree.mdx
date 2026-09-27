@@ -35,10 +35,30 @@ ORDER BY (tenant_id, player_id)
 UNIQUE KEY (tenant_id, player_id);
 ```
 
-The optional engine argument names one stored, non-null `UInt64` version column.
+The optional engine argument names one stored, non-null `UInt64`, `DateTime`, or `DateTime64` version column.
 Omitting it selects the commit-order winner contract. Higher versions win; equal versions use
 later commit order, then the original row position within the input block. Each insert supplies
 a complete replacement row. Use `SET async_insert = 0` for this engine.
+
+Time versions compare the stored instant, independently of the display timezone. `DateTime` has
+second precision; `DateTime64` retains the column's declared precision from zero to nine fractional
+digits, including times before the Unix epoch. Input conversion to the declared column type happens
+before comparison. Updates at the same stored instant use the same commit-order tie breaker.
+Stored `MATERIALIZED` version columns are also supported; `Nullable`, `LowCardinality`, and `ALIAS`
+version columns are not.
+
+```sql
+CREATE TABLE account_state
+(
+    id UInt64,
+    updatetime DateTime64(6, 'UTC'),
+    value String
+)
+ENGINE = UpsertMergeTree(updatetime)
+ORDER BY id
+UNIQUE KEY id;
+```
+
 The unique key must contain stored columns with non-null integer, `String`, `FixedString`,
 or nonempty tuple types recursively composed from these types. Key expressions currently
 accept column identifiers; partition and sorting expressions must be deterministic.
@@ -74,6 +94,12 @@ and 50 bytes with one. It has no relationship to the `Native` wire format.
 The table incarnation and partition scope come from the authenticated enclosing manifest.
 `SELF` must resolve through the producing part's activation binding before comparing winners.
 A resolved row retains its original write CSN through later drain, merge, and index rebuild.
+The eight-byte application version is an order-preserving unsigned value: `UInt64` is unchanged,
+`DateTime` uses zero-extended epoch seconds, and `DateTime64` uses the underlying signed ticks
+converted to `UInt64` with bit 63 flipped. This retains negative-time ordering without rescaling
+or losing fractional precision. The authenticated table schema fixes the version type and scale.
+Existing `UInt64` metadata and table manifests remain unchanged. Older binaries reject tables
+using time version columns during schema validation. The `Native` wire format is unchanged.
 Winner comparison orders `(version, write_csn, block_ordinal)`, or `(write_csn, block_ordinal)`
 without an application version. Comparing different version modes or unresolved rows is an error.
 Legacy four-byte SST values are rejected by this decoder. New parts persist these values in the
