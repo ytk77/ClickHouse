@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare bounded batches, client concurrency and ordered `UpsertMergeTree` preparation."""
+"""Compare automatic input splitting, client concurrency and ordered `UpsertMergeTree` preparation."""
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import json
@@ -36,8 +36,6 @@ def main():
     for batch, clients, _ in cases:
         if args.rows % clients:
             parser.error("Rows must be divisible by every client count")
-        if batch > 1048576 or batch * (25 + args.payload_bytes) > 32 * 1024 * 1024:
-            parser.error("Batch exceeds the row or estimated materialized-byte limit")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     database = "upsert_bench_" + uuid.uuid4().hex
 
@@ -67,7 +65,7 @@ def main():
                         count = args.rows // clients
                         query_id = f"{table}_v{version}_c{client}"
                         sql = f"""INSERT INTO {table}
-                            SELECT number,toUInt64({version}),repeat('x',{args.payload_bytes})
+                            SELECT number,toUInt64({version}),repeat(toString(number%10),{args.payload_bytes})
                             FROM numbers({client * count},{count})
                             SETTINGS max_threads={max(4, threads)},max_insert_threads={threads},
                             max_block_size={batch},max_insert_block_size={batch},
@@ -78,7 +76,7 @@ def main():
                         list(pool.map(insert, range(clients)))
                     seconds = time.perf_counter() - start
                     actual = query(f"SELECT count(),uniqExact(id),min(ver),max(ver),sum(id),"
-                                   f"countIf(value!=repeat('x',{args.payload_bytes})) FROM {table}")
+                                   f"countIf(value!=repeat(toString(id%10),{args.payload_bytes})) FROM {table}")
                     expected = (f"{args.rows}\t{args.rows}\t{version}\t{version}\t"
                                 f"{args.rows * (args.rows - 1) // 2}\t0")
                     if actual != expected:

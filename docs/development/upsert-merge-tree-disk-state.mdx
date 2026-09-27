@@ -22,15 +22,23 @@ The table incarnation and protocol are persisted inside both the authenticated t
 4. Pin the resulting database snapshot, rename the part and synchronize the directory. Finish native part activation and retirement under the parts lock, then atomically replace the published read version through a separate, short publication mutex.
 5. Acknowledge only after publication. An ambiguous state write or failure after authorization fences new reads and writes until restart and recovery. Already acquired read versions remain consistent.
 
+### Grouped payload synchronization {#disk-state-grouped-payload-synchronization}
+
+For `UpsertMergeTree`, temporary-part finalization closes every column, index, sidecar and metadata stream before issuing durability barriers. The native writer defers its intermediate file and directory syncs to the engine's complete-part authentication step. That step hashes the complete inventory, synchronizes its files together through the shared I/O pool, joins every task and propagates failures, then synchronizes directories from children to parents. The parent-directory barrier, synchronous state-database commit and post-rename directory barrier remain in their existing order. Background maintenance uses the same payload path.
+
+This avoids repeated and separately staged barriers for a single immutable part. It does not acknowledge buffered writes, disable the state `WAL`, or permit unsynchronized payloads to be authorized. A payload-sync failure occurs before authorization and leaves the table usable; an ambiguous state-commit failure retains the existing fencing and recovery behavior. Explicit engine file and directory barriers now contribute to `FileSync`, `DirectorySync` and their elapsed-time counters; older builds did not count all of these calls. Parallel elapsed counters sum worker time and must not be interpreted as wall-clock latency.
+
 ## Insert preparation and batching {#disk-state-parallel-preparation}
 
 `max_insert_threads` controls part preparation within one ordered sink. Its effective concurrency also respects `max_threads` and the corresponding minimum-free-memory settings, and is capped at eight in-flight parts per query. The queue counts both running preparations and completed parts awaiting publication, with an additional 128-MiB budget for their input blocks, including internal ordinals. Part metadata, encoded indexes and compression buffers consume additional query-accounted memory within the existing per-unit limits. Setting `max_insert_threads=1` prepares and commits each part synchronously.
 
-The sink assigns token units before dispatch, validates and folds all partitions of an input block, and publishes completed preparations in the original block and partition order. Workers only create temporary durable payloads; they never publish winners. Input completion drains the queue before success. On cancellation or an exception, outstanding preparations are joined and discarded without committing later units. Previously committed units retain the existing partial-insert and retry semantics. The engine continues to reject multiple independent sink chains, so retry identities and equal-version winner order do not depend on worker completion order.
+The sink assigns token units before dispatch, validates and folds all partitions of each bounded input unit, and publishes completed preparations in input-unit and partition order. Workers only create temporary durable payloads; they never publish winners. Input completion drains the queue before success. On cancellation or an exception, outstanding preparations are joined and discarded without committing later units. Previously committed units retain the existing partial-insert and retry semantics. The engine continues to reject multiple independent sink chains, so retry identities and equal-version winner order do not depend on worker completion order.
 
 Immutable input lineage, offset and key uniqueness checks run before the commit lock. Foreground winner lookup and maintenance relocation use bounded `RocksDB` `MultiGet` batches of at most 1,024 keys. Writers remain serialized under the table parts lock; multiple SQL partitions do not bypass it. Readers acquire the published version without that lock. Missing keys are valid for new inputs, while missing maintenance winners and database errors remain exceptions.
 
-For throughput tuning, compare input batches around 16K, 64K and 256K rows and two to four concurrent clients against the same workload. The input block must also fit the 32-MiB limit; wide rows require smaller row batches. Keep key-to-partition routing stable and measure both initial ingestion and sustained overwrites with maintenance enabled. Increasing concurrency can increase memory, temporary disk usage and commit-lock waiting, and need not increase throughput.
+The state database enables whole-key Bloom filters in its memtables and newly written `SST` files to avoid searching data blocks for absent keys. The memtable filter budget is 10% of each 16-MiB write buffer, and the `SST` filter uses ten bits per key within the existing index/filter cache. Possible matches still perform the full lookup; filters do not replace key equality or winner comparison. Existing files without filters remain readable and gain filters when rewritten by normal compaction. No state-format conversion is required. Input payload hashes are calculated only when an explicit `insert_deduplication_token` needs retry comparison; immutable part authentication always runs.
+
+For throughput tuning, compare input batches around 16K, 64K and 256K rows and two to four concurrent clients against the same workload. Oversized input blocks are split automatically as described below. Keep key-to-partition routing stable and measure both initial ingestion and sustained overwrites with maintenance enabled. Increasing concurrency can increase memory, temporary disk usage and commit-lock waiting, and need not increase throughput.
 
 For a multi-block `INSERT SELECT`, an initial session configuration is:
 
@@ -44,6 +52,80 @@ SET min_insert_block_size_bytes = 0;
 ```
 
 Measure this against `max_insert_threads=1` using identical input blocks. A single small input block in one SQL partition only produces one preparation task. The repository's `utils/upsert-benchmark/run.py` compares multi-block requests, independent clients and batch sizes, checking visible results after every phase.
+
+### Automatic input splitting {#disk-state-automatic-input-splitting}
+
+An incoming block may exceed 32 MiB or 1,048,576 rows. The sink processes contiguous slices satisfying both bounds, then applies the existing partition routing and key folding. It measures column data, not compressed transport bytes. Range copies compact dictionaries, and the actual slice size is checked after copying. Small blocks keep their original columns without copying. A single row that cannot fit is rejected with its input position and the byte limit; rows are never truncated or discarded.
+
+The folded lineage size is also checked before preparing any partition of the unit. If its `upsert_rows.bin` would exceed the independent 64-MiB serialization limit, the sink halves the candidate row count and retries the slice before publication. This accounts for the encoded key and the 50- or 58-byte per-row envelope and metadata overhead. For example, 1,048,576 versioned rows with eight-byte keys need 66 MiB plus a 16-byte file envelope, even though two eight-byte input columns occupy only 16 MiB.
+
+Original row ordinals survive slicing, and units commit in input order. Later equal-version duplicates therefore still win across slices. Token unit numbers advance for each accepted slice, shared by its partitions. Identical retries must retain the original input block boundaries, values, order and splitting policy; changing preparation concurrency does not change the slices. Previously accepted blocks that need no splitting retain their original token hashes and numbering. The internal size is deliberately not a runtime tuning setting, because changing boundaries during the retry window would change token identity.
+
+Atomicity is per slice and partition. A later invalid row, cancellation, or write failure can leave earlier slices committed, including slices from the same original input block. Retrying an identical request with its original token reuses committed results within the existing retention window. Splitting bounds incremental preparation work; it does not remove the original incoming block from memory or cap the query's total allocations at 32 MiB.
+
+### Why retain a 32-MiB internal unit {#disk-state-input-unit-budget}
+
+64-MiB and larger client blocks are supported through automatic splitting. The internal target remains 32 MiB for these reasons:
+
+- The preparation queue has a 128-MiB input budget including ordinals. Two units containing 64 MiB of input columns would already exceed it once ordinals are added; larger units can reduce available preparation concurrency.
+- The 64-MiB serialized lineage limit is independent of column size. Increasing the column target does not increase safe row counts or encoded-key capacity.
+- Maintenance currently skips sources above its 32-MiB uncompressed-column budget. Admitting 64-MiB parts without changing maintenance would create additional parts that it cannot reclaim or consolidate.
+- Larger units increase individual preparation and serialized commit work. Fewer parts and sync operations may improve some workloads, but that tradeoff requires end-to-end measurements of throughput, peak memory and commit latency.
+
+32 MiB is a conservative implementation budget, not a measured universal optimum. Raising it to 64 MiB requires coordinated maintenance and queue budgets, a retry-boundary compatibility policy, and workload-specific validation; changing the constant alone is insufficient.
+
+### Local split validation (2026-09-27) {#disk-state-local-split-validation-20260927}
+
+The release binary and standard unit-test target compiled successfully. A scoped runner passed 58 tests across nine suites, including six slice tests covering exact limits, row counts, uneven strings, an indivisible row, dictionary compaction and nested/constant columns. Four stateless regressions passed, including oversized inputs, cross-slice duplicate winners, token conflicts/replay, reattachment and the independent lineage budget. Sixteen integration cases passed through a local server adapter, including delayed preparation, partial durable commit and process restart. The adapter does not establish coverage of the full container integration harness.
+
+The benchmark used 256,000 unique keys, 1,024-byte varying payloads, one client, four preparation threads, two repetitions and background maintenance enabled. Every initial insert and full overwrite verified its visible results. Timings include input generation and synchronous publication. All cases retained the same 32-MiB internal unit target:
+
+| External rows per block | Approximate input MiB | Mean insert rows/s | Mean overwrite rows/s | Query peak memory range, MiB |
+| ---: | ---: | ---: | ---: | ---: |
+| 16,000 | 15.99 | 267,585 | 152,462 | 83.0–103.8 |
+| 32,000 | 31.98 | 272,581 | 179,089 | 131.1–131.1 |
+| 64,000 | 63.96 | 235,806 | 137,580 | 186.9–204.5 |
+| 128,000 | 127.93 | 195,183 | 157,093 | 259.2–297.5 |
+
+This short, compressible-payload workload supports retaining a moderate external batch size. It is not a comparison of 32-MiB versus 64-MiB internal units, a universal optimum, or a long-running overload test. Large-row-count regressions still emitted cumulative unchecked-allocation warnings (2.109 GiB for the new split test and 3.659 GiB for the existing lineage test); those counters are not peak query memory. The production server was not restarted or upgraded.
+
+### CRM-3 write performance (2026-09-27) {#disk-state-crm3-write-performance-20260927}
+
+A fresh frozen sample of one million logical rows was staged locally on CRM-3: 32 target columns, approximately 587 uncompressed bytes per row, a four-column unique key and one monthly partition. The host has two Xeon E5-2680 v3 processors, 48 logical CPUs and 251 GiB of RAM. Both the isolated benchmark and the existing server use the same rotational XFS filesystem behind a PERC H730 Mini controller. The production service was not restarted or upgraded. The original 1,384-rows/s run used a different, no-longer-retained sample; the following comparisons use the same new frozen sample and fresh targets.
+
+Timings include source reads, client dispatch and synchronous commit, excluding sample staging, table creation and verification. Bulk cases use one multi-block `INSERT SELECT`, four preparation threads and 48,000-row blocks. The small serial case uses forty separate 2,500-row statements and one thread. Background maintenance stays enabled. All cases verify row count, exact unique-key count and version totals; the final cases also compare two aggregate fingerprints over all target columns.
+
+| Input and part configuration | Rows per run | Before, rows/s | After, rows/s |
+| --- | ---: | ---: | ---: |
+| Serial 2,500-row statements, `Wide` | 100,000 | 1,174 | 3,754 |
+| Bulk 48,000-row blocks, `Wide` | 1,000,000 | 43,147 | 69,656 |
+| Bulk 48,000-row blocks, `Compact` | 1,000,000 | 75,169 | 131,791 (median of three) |
+
+The three final bulk `Compact` runs achieved 127,546, 131,791 and 134,396 rows/s (7.840, 7.588 and 7.441 seconds). Their median is 1.75 times the old binary with identical settings. On the final binary, a full one-million-row overwrite achieved 41,871 input rows/s; resending the stale original rows achieved 60,015 input rows/s. Both preserved the one-million-row logical result, updated payloads and version two, including after `DETACH`/`ATTACH`. The initial-insert result is not a 100K-rows/s claim for overwrites.
+
+The unchanged small-statement configuration does not reach 100,000 rows/s. The measured bulk `Compact` case does, using this table setting at creation:
+
+```sql
+SETTINGS min_bytes_for_wide_part = 67108864
+```
+
+Its insert settings are:
+
+```sql
+SET async_insert = 0;
+SET max_threads = 4;
+SET max_insert_threads = 4;
+SET max_block_size = 48000;
+SET max_insert_block_size = 48000;
+SET min_insert_block_size_rows = 48000;
+SET min_insert_block_size_bytes = 0;
+```
+
+The benchmark uses an 8-GiB query memory limit and sets both thread minimum-free-memory thresholds to zero; resource policies may otherwise reduce concurrency. The first successful bulk `Compact` run reports approximately 424 MiB peak query memory and 21 compact parts. The 64-MiB setting selects the part format; the engine's internal input-unit limit remains 32 MiB. A 32-MiB format threshold can unexpectedly select `Wide` for near-limit units once internal columns are added. `ALTER` remains gated, so this configuration is for a new table; it is not an instruction to edit an existing table's metadata. Narrow-column read performance and long-running mixed ingestion still need separate evaluation.
+
+The changes group payload file barriers, omit an unused input hash when no retry token is present, and enable complete-key Bloom filters in the state database. A diagnostic run before the filter change spent approximately 5.6 of 18.2 sampled CPU seconds in `RocksDB` `MultiGet`, predominantly searching for absent keys. The final binary passed 59 unit tests, two stateless regressions and sixteen local-adapter integration cases. The payload barrier path also passed a blocked-`WAL` test: readers used the prior published version while the writer waited for its real sync operation. These short runs are not a long-term throughput guarantee or full container integration certification.
+
+The baseline binary SHA-256 is `23c0189860a90bc04364d84387ad8d2f9a1bdacaa9bc6cba2f0b619094398ca0`; the final binary is `ef9aee4498a49bccf4f231124562f94e6098ec4897399b0265b866df7695b02d`.
 
 ## Keys and values {#disk-state-encoding}
 

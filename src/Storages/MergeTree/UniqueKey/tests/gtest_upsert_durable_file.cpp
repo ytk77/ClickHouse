@@ -64,3 +64,18 @@ TEST_F(UpsertDurableFileTest, EmptyFileAndExplicitDirectoryBarrier)
     EXPECT_NO_THROW(syncDirectory(directory.string()));
     EXPECT_THROW(syncDirectory(path), Exception);
 }
+
+TEST_F(UpsertDurableFileTest, GroupedFileBarriersPropagateErrors)
+{
+    const auto first = (directory / "first").string();
+    const auto second = (directory / "second").string();
+    createDurableFile(first, "one");
+    createDurableFile(second, "two");
+    EXPECT_NO_THROW(syncFiles({first, second}));
+    EXPECT_THROW(syncFiles({first, (directory / "missing").string(), second}), Exception);
+    const auto link = directory / "link";
+    std::filesystem::create_symlink("second", link);
+    EXPECT_THROW(syncFiles({first, link.string()}), Exception);
+    EXPECT_EQ(readBoundedFile(first, 3), "one");
+    EXPECT_EQ(readBoundedFile(second, 3), "two");
+}

@@ -15,6 +15,7 @@
 #if USE_ROCKSDB
 #include <rocksdb/cache.h>
 #include <rocksdb/db.h>
+#include <rocksdb/filter_policy.h>
 #include <rocksdb/options.h>
 #include <rocksdb/table.h>
 #include <rocksdb/write_batch.h>
@@ -331,6 +332,9 @@ DiskState::DiskState(const String & table_path, ObjectID incarnation, bool attac
     options.use_fsync = true;
     options.max_open_files = 128;
     options.write_buffer_size = 16U << 20;
+    /// Most initial-insert probes miss. Filter complete keys without changing winner equality or key routing.
+    options.memtable_prefix_bloom_size_ratio = 0.1;
+    options.memtable_whole_key_filtering = true;
     options.max_write_buffer_number = 3;
     options.max_total_wal_size = 64U << 20;
     options.max_manifest_file_size = 16U << 20;
@@ -339,6 +343,8 @@ DiskState::DiskState(const String & table_path, ObjectID incarnation, bool attac
     rocksdb::BlockBasedTableOptions table_options;
     table_options.block_cache = rocksdb::NewLRUCache(64U << 20);
     table_options.cache_index_and_filter_blocks = true;
+    table_options.filter_policy.reset(rocksdb::NewBloomFilterPolicy(10));
+    table_options.whole_key_filtering = true;
     options.table_factory.reset(rocksdb::NewBlockBasedTableFactory(table_options));
     rocksdb::DB * database = nullptr;
     check(rocksdb::DB::Open(options, path.string(), &database));

@@ -132,10 +132,11 @@ changed files and unauthorized final parts fail attachment. Native dense-index r
 because it cannot recreate the versioned lineage. Ambiguous commit failures fence reads and writes
 until restart and recovery.
 
-`insert_deduplication_token` identifies each input block within each partition. An identical retry
+`insert_deduplication_token` identifies each bounded input unit within each partition. An identical retry
 retains its original result, even after a newer update. Reusing the token with different evaluated
 input fails. Retries must preserve block boundaries and input values. Atomicity is per partition
-and input block; a query containing several units can partially commit.
+and input unit; a query containing several units can partially commit. Oversized blocks are split
+automatically using the [shared sink's bounded-input policy](/development/upsert-merge-tree-disk-state#disk-state-automatic-input-splitting).
 
 ## Resource bounds and remaining gates {#resource-bounds-and-remaining-gates}
 
@@ -151,7 +152,7 @@ are disabled. Admission fails at the following bounds; no automatic reclamation 
 | Encoded live-key bytes per partition | 64 MiB |
 | Retained retry tokens per partition | 4,096 |
 | Log file | 256 MiB |
-| Input block | 1,048,576 rows and 32 MiB |
+| Internal input unit (larger blocks are split) | 1,048,576 rows and 32 MiB |
 | Token text | 1,024 bytes |
 
 The coordinator copies bounded in-memory key state and masks during preparation. The table-wide

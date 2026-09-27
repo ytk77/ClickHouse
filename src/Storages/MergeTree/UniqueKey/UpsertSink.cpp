@@ -162,15 +162,38 @@ void Sink::consume(Chunk & chunk)
 {
     if (!chunk.getNumRows())
         return;
-    auto block = getHeader().cloneWithColumns(chunk.getColumns());
-    if (block.rows() > MAX_UNIT_ROWS || block.bytes() > MAX_UNIT_BYTES)
-        throw Exception(ErrorCodes::LIMIT_EXCEEDED, "UpsertMergeTree input block exceeds {} rows or {} bytes", MAX_UNIT_ROWS, MAX_UNIT_BYTES);
     const String client_token = context->getSettingsRef()[Setting::insert_deduplication_token];
     if (client_token.size() > 1024)
         throw Exception(ErrorCodes::LIMIT_EXCEEDED, "UpsertMergeTree deduplication token exceeds 1024 bytes");
+    const auto input = getHeader().cloneWithColumns(chunk.getColumns());
+    size_t offset = 0;
+    size_t max_rows = MAX_UNIT_ROWS;
+    while (offset < input.rows() && !isCancelled())
+    {
+        if (auto process = context->getProcessListElement())
+            process->checkTimeLimit();
+        CurrentMemoryTracker::check();
+        auto block = cutInputBlock(input, offset, max_rows);
+        const size_t rows = block.rows();
+        if (!consumeBlock(std::move(block), offset, client_token))
+        {
+            /// A wide encoded key can exhaust the independent lineage budget even when the columns fit.
+            if (rows == 1)
+                throw Exception(ErrorCodes::LIMIT_EXCEEDED,
+                    "UpsertMergeTree cannot split input row {}: its row metadata exceeds {} bytes", offset, MAX_RECORD_BYTES);
+            max_rows = rows / 2;
+            continue;
+        }
+        offset += rows;
+        max_rows = MAX_UNIT_ROWS;
+    }
+}
+
+bool Sink::consumeBlock(Block block, size_t first_row, const String & client_token)
+{
     auto ordinals = ColumnUInt64::create();
     for (size_t row = 0; row < block.rows(); ++row)
-        ordinals->insertValue(row);
+        ordinals->insertValue(first_row + row);
     const auto & settings = context->getSettingsRef();
     IColumn::Selector selector;
     auto partitions = MergeTreeDataWriter::splitBlockIntoParts(
@@ -182,18 +205,21 @@ void Sink::consume(Chunk & chunk)
         partition_ordinals = static_cast<const IColumn &>(*ordinals).scatter(partitions.size(), selector);
     for (size_t i = 0; i < partitions.size(); ++i)
         partitions[i].block->insert({std::move(partition_ordinals[i]), std::make_shared<DataTypeUInt64>(), ORDINAL_COLUMN});
-    /// Validate and fold every partition before committing the first one from this input block.
+    /// Validate and fold every partition before committing the first one from this bounded input unit.
     std::vector<Token> tokens;
     tokens.reserve(partitions.size());
     for (auto & partition : partitions)
     {
-        tokens.push_back({client_token, unit, hashInputBlock(*partition.block), 0});
-        foldBlock(*partition.block, *metadata, storage.merging_params.upsert_version_column, settings[Setting::unique_key_max_encoded_size]);
+        /// Only token-based retries compare the evaluated input hash. Payload authentication is independent.
+        tokens.push_back({client_token, unit, client_token.empty() ? ObjectID{} : hashInputBlock(*partition.block), 0});
+        if (foldBlock(*partition.block, *metadata, storage.merging_params.upsert_version_column,
+                settings[Setting::unique_key_max_encoded_size]) > MAX_RECORD_BYTES)
+            return false;
     }
     for (size_t i = 0; i < partitions.size(); ++i)
     {
         if (isCancelled())
-            return;
+            return true;
         if (auto process = context->getProcessListElement())
             process->checkTimeLimit();
         if (!impl->pool)
@@ -213,7 +239,7 @@ void Sink::consume(Chunk & chunk)
             || bytes > Impl::max_pending_bytes - impl->pending_bytes))
             finishFront();
         if (isCancelled())
-            return;
+            return true;
         /// Allocate the queue entry before scheduling so every worker has a tracked future, including on exceptions.
         impl->pending.push_back({bytes, {}});
         impl->pending_bytes += bytes;
@@ -225,6 +251,7 @@ void Sink::consume(Chunk & chunk)
             }, *impl->pool, ThreadName::DEFAULT_THREAD_POOL);
     }
     ++unit;
+    return true;
 }
 }
 

@@ -977,7 +977,8 @@ MergeTreeTemporaryPartPtr MergeTreeDataWriter::writeTempPartImpl(
 
     data_part_storage->createDirectories();
 
-    if ((*data_settings)[MergeTreeSetting::fsync_part_directory])
+    /// `UpsertMergeTree` owns a complete payload barrier after all streams and sidecars are finalized.
+    if ((*data_settings)[MergeTreeSetting::fsync_part_directory] && !data.merging_params.upsert)
     {
         const auto disk = data_part_volume->getDisk();
         sync_guard = disk->getDirectorySyncGuard(data_part_storage->getFullPath());
@@ -1099,7 +1100,7 @@ MergeTreeTemporaryPartPtr MergeTreeDataWriter::writeTempPartImpl(
     auto finalizer = out->finalizePartAsync(
         new_data_part,
         gathered_data,
-        (*data_settings)[MergeTreeSetting::fsync_after_insert]);
+        (*data_settings)[MergeTreeSetting::fsync_after_insert] && !data.merging_params.upsert);
 
     temp_part->part = new_data_part;
     temp_part->streams.emplace_back(MergeTreeTemporaryPart::Stream{.stream = std::move(out), .finalizer = std::move(finalizer)});

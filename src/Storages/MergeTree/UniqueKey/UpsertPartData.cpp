@@ -28,7 +28,6 @@ namespace DB::ErrorCodes
 extern const int BAD_ARGUMENTS;
 extern const int CANNOT_OPEN_FILE;
 extern const int CANNOT_READ_FROM_FILE_DESCRIPTOR;
-extern const int CANNOT_FSYNC;
 }
 
 namespace DB::Upsert
@@ -129,7 +128,61 @@ ValidatedPartRows::ValidatedPartRows(PartRows rows_, ObjectID part_) : rows(std:
         throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree input has duplicate keys");
 }
 
-void foldBlock(Block & block, const StorageInMemoryMetadata & metadata, const String & version_column, size_t max_key_bytes)
+Block cutInputBlock(const Block & block, size_t offset, size_t max_rows, size_t max_bytes)
+{
+    chassert(offset < block.rows() && max_rows && max_bytes);
+    if (!offset && block.rows() <= max_rows && block.bytes() <= max_bytes)
+        return block;
+
+    const size_t end = offset + std::min(max_rows, block.rows() - offset);
+    size_t rows = 0;
+    size_t bytes = 0;
+    for (size_t row = offset; row < end; ++row)
+    {
+        size_t row_bytes = 0;
+        for (const auto & column : block)
+        {
+            if (rows && column.column->isConst())
+                continue;
+            const size_t column_bytes = column.column->byteSizeAt(row);
+            if (column_bytes > max_bytes - row_bytes)
+            {
+                row_bytes = max_bytes + 1;
+                break;
+            }
+            row_bytes += column_bytes;
+        }
+        if (row_bytes > max_bytes - bytes)
+            break;
+        bytes += row_bytes;
+        ++rows;
+    }
+    if (!rows)
+        throw Exception(ErrorCodes::LIMIT_EXCEEDED,
+            "UpsertMergeTree cannot split input row {}: a single row exceeds the {} byte unit limit", offset, max_bytes);
+
+    while (true)
+    {
+        auto result = block.cloneEmpty();
+        for (size_t i = 0; i < block.columns(); ++i)
+        {
+            /// Copy the range into an empty column so `LowCardinality` dictionaries are compacted too.
+            auto column = result.getByPosition(i).column->assumeMutable();
+            column->insertRangeFrom(*block.getByPosition(i).column, offset, rows);
+            result.getByPosition(i).column = std::move(column);
+        }
+        if (result.bytes() <= max_bytes)
+            return result;
+        /// Per-value accounting can omit column-level overhead. Check the actual slice before admission.
+        if (rows == 1)
+            throw Exception(ErrorCodes::LIMIT_EXCEEDED,
+                "UpsertMergeTree cannot split input row {}: its column representation uses {} bytes, exceeding the {} byte unit limit",
+                offset, result.bytes(), max_bytes);
+        rows /= 2;
+    }
+}
+
+size_t foldBlock(Block & block, const StorageInMemoryMetadata & metadata, const String & version_column, size_t max_key_bytes)
 {
     auto keys = encodeKeys(block, metadata, max_key_bytes);
     std::map<String, size_t> winners;
@@ -147,11 +200,17 @@ void foldBlock(Block & block, const StorageInMemoryMetadata & metadata, const St
         }
     }
     IColumn::Filter keep(block.rows(), UInt8{0});
+    size_t lineage_bytes = PART_ROWS_ENVELOPE_BYTES;
     for (const auto & [key, row] : winners)
+    {
         keep[row] = 1;
+        /// Two four-byte string lengths plus the 42- or 50-byte encoded `IndexValue`.
+        lineage_bytes += key.size() + 8 + (versions ? 50 : 42);
+    }
     if (winners.size() != block.rows())
         for (auto & column : block)
             column.column = column.column->filter(keep, static_cast<ssize_t>(winners.size()));
+    return lineage_bytes;
 }
 
 ObjectID hashInputBlock(const Block & block)
@@ -202,7 +261,7 @@ void writePartIndex(
     const auto hash = hashing.getHash();
     hashing.finalize();
     out->finalize();
-    out->sync();
+    /// The coordinator synchronizes the complete finalized part before durable authorization.
     checksums.addFile(ROWS_FILE, bytes.size(), hash);
 
     std::vector<size_t> order(rows.size());
@@ -240,6 +299,7 @@ ObjectID hashPartDirectory(const String & path, bool sync_files)
         else
             throw Exception(ErrorCodes::CORRUPTED_DATA, "Non-regular file in UpsertMergeTree part {}", path);
     }
+    /// Preserve `std::filesystem::path` component ordering in the persisted inventory hash.
     std::sort(files.begin(), files.end());
     BinaryWriter inventory;
     std::vector<char> buffer(65536);
@@ -267,16 +327,6 @@ ObjectID hashPartDirectory(const String & path, bool sync_files)
                 hash.update(buffer.data(), static_cast<size_t>(bytes));
                 size += static_cast<UInt64>(bytes);
             }
-            if (sync_files)
-            {
-                int result;
-                do
-                {
-                    result = ::fsync(fd);
-                } while (result < 0 && errno == EINTR);
-                if (result < 0)
-                    ErrnoException::throwWithErrno(ErrorCodes::CANNOT_FSYNC, errno, "Cannot sync UpsertMergeTree part file");
-            }
             ObjectID digest;
             hash.get128(digest[0], digest[1]);
             inventory.string(fs::relative(file, path).string());
@@ -291,8 +341,16 @@ ObjectID hashPartDirectory(const String & path, bool sync_files)
         ::close(fd);
     }
     if (sync_files)
+    {
+        /// Finalize and authenticate every file before issuing one group of payload barriers.
+        std::vector<String> paths;
+        paths.reserve(files.size());
+        for (const auto & file : files)
+            paths.push_back(file.string());
+        syncFiles(paths);
         for (auto it = directories.rbegin(); it != directories.rend(); ++it)
             syncDirectory(it->string());
+    }
     return hashLogRecord(inventory.bytes);
 }
 }

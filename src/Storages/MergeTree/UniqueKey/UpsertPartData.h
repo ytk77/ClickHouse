@@ -55,8 +55,12 @@ String objectName(ObjectID id);
 String encodePartRows(const PartRows & rows);
 PartRows decodePartRows(std::string_view bytes);
 
+/// Take a bounded contiguous slice. Small inputs retain their columns without copying.
+Block cutInputBlock(const Block & block, size_t offset, size_t max_rows = MAX_UNIT_ROWS, size_t max_bytes = MAX_UNIT_BYTES);
+
 /// Fold before the native sort, retaining original input ordinals for equal-version ties.
-void foldBlock(Block & block, const StorageInMemoryMetadata & metadata, const String & version_column, size_t max_key_bytes);
+/// Return the encoded size of `upsert_rows.bin`, including its envelope.
+size_t foldBlock(Block & block, const StorageInMemoryMetadata & metadata, const String & version_column, size_t max_key_bytes);
 ObjectID hashInputBlock(const Block & block);
 
 void writePartIndex(

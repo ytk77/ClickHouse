@@ -28,6 +28,7 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl;
     void finishFront();
+    bool consumeBlock(Block block, size_t first_row, const String & client_token);
 };
 }
 }
