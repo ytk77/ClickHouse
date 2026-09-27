@@ -1,0 +1,16 @@
+during	1	10
+during	2	20
+other partition	20
+count during	2
+after	1	11
+after	2	20
+pinned	1	10
+pinned	2	20
+during	1	10
+during	2	20
+other partition	20
+count during	2
+after	1	11
+after	2	20
+pinned	1	10
+pinned	2	20

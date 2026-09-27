@@ -293,17 +293,19 @@ void StorageMergeTree::commitUpsertBlock(Upsert::PreparedInsert & input)
     }
     if (prepared.replayed_token)
         return;
+    /// Allocate the complete next read version before any ambiguous durable operation.
+    auto read_snapshot = prepareUpsertReadSnapshot(prepared.snapshot, prepared.produces_part ? part : nullptr, {}, lock);
     try
     {
         if (prepared.produces_part)
-            commitUpsertPart(part, prepared.snapshot, [&]()
+            commitUpsertPart(part, [&]()
             {
                 upsert_store->append(prepared);
             }, lock);
         else
             upsert_store->append(prepared);
         upsert_store->publish(prepared);
-        upsert_state = upsert_store->snapshot();
+        publishUpsertReadSnapshot(std::move(read_snapshot));
     }
     catch (...)
     {
@@ -312,8 +314,7 @@ void StorageMergeTree::commitUpsertBlock(Upsert::PreparedInsert & input)
     }
 }
 
-void MergeTreeData::commitUpsertPart(MutableDataPartPtr & part, Upsert::SnapshotPtr snapshot,
-    const std::function<void()> & persist, DataPartsLock & lock)
+void MergeTreeData::commitUpsertPart(MutableDataPartPtr & part, const std::function<void()> & persist, DataPartsLock & lock)
 {
     Transaction transaction(*this, nullptr);
     try
@@ -334,10 +335,9 @@ void MergeTreeData::commitUpsertPart(MutableDataPartPtr & part, Upsert::Snapshot
         {
             throw Exception(ErrorCodes::FAULT_INJECTED, "Injected UpsertMergeTree failure before publication");
         });
-        /// This changes the state of an existing index node and swaps preallocated visibility state.
+        /// The caller publishes the preallocated read version after all native part changes complete.
         modifyPartState(part, DataPartState::Active, lock);
         increaseDataVolume(static_cast<ssize_t>(part->getBytesOnDisk()), static_cast<ssize_t>(part->rows_count), 1);
-        upsert_state.swap(snapshot);
         transaction.clear();
     }
     catch (...)

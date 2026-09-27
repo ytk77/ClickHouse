@@ -13,7 +13,7 @@ public:
     virtual std::shared_ptr<const DeleteBitmap> getMask(const String & part) const = 0;
 };
 
-/// Published under the parts lock. A query owns this immutable state together with its parts.
+/// Published with the matching native parts as one immutable read version, independently of the writer's parts lock.
 /// A composed mask represents the base plus every visible delta at the partition's recorded CSN.
 struct SnapshotState
 {

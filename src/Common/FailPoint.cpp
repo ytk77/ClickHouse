@@ -34,6 +34,8 @@ static struct InitFiu
 #define APPLY_FOR_FAILPOINTS(ONCE, REGULAR, PAUSEABLE_ONCE, PAUSEABLE) \
     ONCE(upsert_log_throw_after_append) \
     ONCE(upsert_log_throw_after_sync) \
+    PAUSEABLE_ONCE(upsert_pause_before_state_write) \
+    PAUSEABLE_ONCE(upsert_pause_after_state_sync) \
     ONCE(upsert_throw_after_rename) \
     ONCE(upsert_throw_before_publish) \
     PAUSEABLE_ONCE(upsert_pause_after_read_snapshot) \

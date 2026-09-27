@@ -32,6 +32,7 @@ void StorageMergeTree::runUpsertMaintenance()
     /// Each task handles a bounded unit; native merges remain disabled for this protocol.
     constexpr size_t max_source_bytes = 32U << 20;
     constexpr size_t max_sources = 16;
+    constexpr size_t max_lineage_bytes = Upsert::MAX_RECORD_BYTES - Upsert::PART_ROWS_ENVELOPE_BYTES;
     bool did_work = false;
     try
     {
@@ -58,9 +59,21 @@ void StorageMergeTree::runUpsertMaintenance()
                 return;
             size_t bytes = 0;
             size_t rows = 0;
+            size_t lineage_bytes = 0;
             bool needs_rewrite = false;
             auto worthy = [&] { return sources.size() >= 2 || needs_rewrite; };
-            for (const auto & candidate : getDataPartsStateRange(DataPartState::Active))
+            auto candidates = getDataPartsVectorForInternalUsage({DataPartState::Active}, lock);
+            if (upsert_maintenance_cursor)
+            {
+                const auto next = std::upper_bound(candidates.begin(), candidates.end(), *upsert_maintenance_cursor,
+                    [](const auto & info, const auto & candidate)
+                    {
+                        return info < candidate->info;
+                    });
+                std::rotate(candidates.begin(), next, candidates.end());
+            }
+            snapshot = upsert_store->snapshot();
+            for (const auto & candidate : candidates)
             {
                 const auto & id = candidate->info.getPartitionId();
                 if (id != partition)
@@ -70,35 +83,47 @@ void StorageMergeTree::runUpsertMaintenance()
                     sources.clear();
                     bytes = 0;
                     rows = 0;
+                    lineage_bytes = 0;
                     needs_rewrite = false;
                     partition = id;
                 }
                 const auto size = candidate->getBytesUncompressedOnDisk();
                 if (size > max_source_bytes || candidate->rows_count > Upsert::MAX_UNIT_ROWS)
                     continue;
-                if (bytes + size > max_source_bytes || rows + candidate->rows_count > Upsert::MAX_UNIT_ROWS)
+                const auto checksum = candidate->checksums.files.find(Upsert::ROWS_FILE);
+                if (checksum == candidate->checksums.files.end() || checksum->second.is_compressed
+                    || checksum->second.file_size <= Upsert::PART_ROWS_ENVELOPE_BYTES
+                    || checksum->second.file_size > Upsert::MAX_RECORD_BYTES)
+                    throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree maintenance source has invalid lineage size");
+                /// Resolving `SELF` and sorting preserve encoded row widths. Filtering can only reduce this bound.
+                const auto candidate_lineage_bytes = checksum->second.file_size - Upsert::PART_ROWS_ENVELOPE_BYTES;
+                const auto mask = snapshot->getMask(candidate->getDeleteBitmapCacheIdentity());
+                if (!mask)
+                    throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree maintenance source lacks a mask");
+                const bool rewrite = mask->cardinality() > 0 && mask->cardinality() * 4 >= candidate->rows_count;
+                /// Target-sized healthy parts are complete; they must not block later small parts in any budget dimension.
+                if (!rewrite && (size > max_source_bytes / 2 || candidate->rows_count > Upsert::MAX_UNIT_ROWS / 2
+                    || candidate_lineage_bytes > max_lineage_bytes / 2))
+                    continue;
+                if (size > max_source_bytes - bytes || candidate->rows_count > Upsert::MAX_UNIT_ROWS - rows
+                    || candidate_lineage_bytes > max_lineage_bytes - lineage_bytes)
                 {
                     if (worthy())
                         break;
                     continue;
                 }
-                const auto mask = upsert_store->snapshot()->getMask(candidate->getDeleteBitmapCacheIdentity());
-                if (!mask)
-                    throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree maintenance source lacks a mask");
-                const bool rewrite = mask->cardinality() > 0 && mask->cardinality() * 4 >= candidate->rows_count;
-                /// A healthy target-sized part must not block selection of later small parts.
-                if (!rewrite && (size > max_source_bytes / 2 || candidate->rows_count > Upsert::MAX_UNIT_ROWS / 2))
-                    continue;
                 needs_rewrite |= rewrite;
                 sources.push_back(candidate);
                 bytes += size;
                 rows += candidate->rows_count;
+                lineage_bytes += candidate_lineage_bytes;
                 if (sources.size() == max_sources)
                     break;
             }
             if (!worthy())
                 sources.clear();
-            snapshot = upsert_store->snapshot();
+            if (!sources.empty())
+                upsert_maintenance_cursor = sources.back()->info;
             for (const auto & source : sources)
                 lineage.push_back(upsert_store->loadPartRows(source->name));
         }
@@ -196,15 +221,17 @@ void StorageMergeTree::runUpsertMaintenance()
                 authorization.final_name = temporary->part->name;
             }
             auto prepared = upsert_store->prepareMerge(partition, std::move(authorization), output_rows, source_names);
+            auto read_snapshot = prepareUpsertReadSnapshot(
+                prepared.snapshot, prepared.produces_part ? temporary->part : nullptr, sources, lock);
             try
             {
                 if (prepared.produces_part)
-                    commitUpsertPart(temporary->part, prepared.snapshot, [&] { upsert_store->append(prepared); }, lock);
+                    commitUpsertPart(temporary->part, [&] { upsert_store->append(prepared); }, lock);
                 else
                     upsert_store->append(prepared);
                 removePartsFromWorkingSet(nullptr, sources, true, lock);
                 upsert_store->publish(prepared);
-                upsert_state = upsert_store->snapshot();
+                publishUpsertReadSnapshot(std::move(read_snapshot));
                 did_work = true;
             }
             catch (...)

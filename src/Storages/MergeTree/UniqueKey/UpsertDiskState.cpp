@@ -33,6 +33,8 @@ namespace DB::FailPoints
 {
 extern const char upsert_log_throw_after_sync[];
 extern const char upsert_log_throw_after_append[];
+extern const char upsert_pause_before_state_write[];
+extern const char upsert_pause_after_state_sync[];
 }
 
 namespace DB::Upsert
@@ -732,8 +734,10 @@ void DiskState::append(const StateStore::Prepared & prepared)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree commit sequence changed under the commit lock");
     rocksdb::WriteOptions options;
     options.sync = true;
+    FailPointInjection::pauseFailPoint(FailPoints::upsert_pause_before_state_write);
     check(impl->database->db->Write(options, &prepared.disk->batch));
     prepared.disk->durable = true;
+    FailPointInjection::pauseFailPoint(FailPoints::upsert_pause_after_state_sync);
     fiu_do_on(FailPoints::upsert_log_throw_after_append,
     {
         throw Exception(ErrorCodes::FAULT_INJECTED, "Injected UpsertMergeTree failure after disk-state batch write");

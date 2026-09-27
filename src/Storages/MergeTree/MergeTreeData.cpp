@@ -3331,7 +3331,11 @@ catch (...)
         throw;
 }
 
-MergeTreeData::~MergeTreeData() = default;
+MergeTreeData::~MergeTreeData()
+{
+    /// Release cached part owners while all storage members are still alive.
+    publishUpsertReadSnapshot(nullptr);
+}
 
 void MergeTreeData::loadUnexpectedDataParts()
 try
@@ -7485,6 +7489,24 @@ void MergeTreeData::addPartContributionToColumnAndSecondaryIndexSizesUnlocked(co
 
 IStorage::ColumnSizeByName MergeTreeData::getColumnSizes(const Names & columns) const
 {
+    if (merging_params.upsert)
+    {
+        const auto snapshot = getUpsertReadSnapshotForQuery();
+        auto result = snapshot->column_sizes;
+        for (const auto & name : columns)
+        {
+            if (result.contains(name))
+                continue;
+            for (const auto & range : *snapshot->parts)
+            {
+                const auto column = range.data_part->tryGetColumn(name);
+                if (column && column->isSubcolumn())
+                    result[name].add(range.data_part->getSubcolumnSize(name));
+            }
+        }
+        return result;
+    }
+
     auto result = getColumnSizes();
 
     /// Collect subcolumn names that are not already in the result.
@@ -12071,6 +12093,104 @@ StorageMetadataHandle MergeTreeData::getInMemoryMetadataPtr(ContextPtr query_con
 #endif
 }
 
+MergeTreeData::UpsertReadSnapshotPtr MergeTreeData::prepareUpsertReadSnapshot(
+    Upsert::SnapshotPtr visibility, const DataPartPtr & added_part, const DataPartsVector & removed_parts, DataPartsLock & lock) const
+{
+    auto result = std::make_shared<UpsertReadSnapshot>();
+    const auto current = getUpsertReadSnapshot();
+    if (current)
+        *result = *current;
+    result->visibility = std::move(visibility);
+    if (current && !added_part && removed_parts.empty())
+        return result;
+
+    auto parts = getDataPartsVectorForInternalUsage({DataPartState::Active}, lock);
+
+    /// Planner statistics must use the same publication mechanism rather than reacquiring the writer's mutex.
+    const auto metadata = getInMemoryMetadataPtr(getContext(), true);
+    auto update_sizes = [&](const DataPartPtr & part, bool add)
+    {
+        auto update = [&](ColumnSize & total, const ColumnSize & size)
+        {
+            if (add)
+                total.add(size);
+            else
+            {
+                if (size.data_compressed > total.data_compressed || size.data_uncompressed > total.data_uncompressed
+                    || size.marks > total.marks)
+                    throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree published size counter underflow");
+                total.data_compressed -= size.data_compressed;
+                total.data_uncompressed -= size.data_uncompressed;
+                total.marks -= size.marks;
+            }
+        };
+        for (const auto & column : part->getColumns())
+            update(result->column_sizes[column.name], part->getColumnSize(column.name));
+        for (const auto & index : metadata->secondary_indices)
+            update(result->secondary_index_sizes[index.name], part->getSecondaryIndexSize(index.name));
+        update(result->primary_index_size, part->getIndexSizeFromFile());
+        const auto bytes = part->getBytesUncompressedOnDisk();
+        if (add)
+            result->bytes_uncompressed += bytes;
+        else
+        {
+            if (bytes > result->bytes_uncompressed)
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree published byte counter underflow");
+            result->bytes_uncompressed -= bytes;
+        }
+    };
+    if (current)
+    {
+        for (const auto & part : removed_parts)
+            update_sizes(part, false);
+    }
+    else
+    {
+        for (const auto & part : parts)
+            update_sizes(part, true);
+    }
+    std::erase_if(parts, [&](const auto & part)
+    {
+        return std::find(removed_parts.begin(), removed_parts.end(), part) != removed_parts.end();
+    });
+    if (added_part)
+    {
+        update_sizes(added_part, true);
+        const auto position = std::lower_bound(parts.begin(), parts.end(), added_part,
+            [](const auto & lhs, const auto & rhs)
+            {
+                return lhs->info < rhs->info;
+            });
+        parts.insert(position, added_part);
+    }
+    result->parts = std::make_shared<const RangesInDataParts>(parts);
+    result->parts_info = getPartsSnapshotInfo(parts);
+    return result;
+}
+
+MergeTreeData::UpsertReadSnapshotPtr MergeTreeData::getUpsertReadSnapshot() const
+{
+    std::lock_guard lock(upsert_snapshot_mutex);
+    return upsert_read_snapshot;
+}
+
+MergeTreeData::UpsertReadSnapshotPtr MergeTreeData::getUpsertReadSnapshotForQuery() const
+{
+    auto snapshot = getUpsertReadSnapshot();
+    if (upsert_fenced || !snapshot)
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree is fenced pending recovery");
+    return snapshot;
+}
+
+void MergeTreeData::publishUpsertReadSnapshot(UpsertReadSnapshotPtr snapshot)
+{
+    {
+        std::lock_guard lock(upsert_snapshot_mutex);
+        upsert_read_snapshot.swap(snapshot);
+    }
+    /// Releasing an old version can reclaim parts or a database snapshot; do that outside the publication mutex.
+}
+
 StorageSnapshotPtr
 MergeTreeData::createStorageSnapshot(const StorageMetadataPtr & metadata_snapshot, ContextPtr query_context, bool without_data) const
 {
@@ -12083,15 +12203,12 @@ MergeTreeData::createStorageSnapshot(const StorageMetadataPtr & metadata_snapsho
     PartsSnapshotInfo parts_info;
     if (merging_params.upsert)
     {
-        auto lock = readLockParts();
-        if (upsert_fenced || !upsert_state)
-            throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree is fenced pending recovery");
+        const auto published = getUpsertReadSnapshotForQuery();
         if (query_context->getCurrentTransaction())
             throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree does not support explicit transactions");
-        auto parts = getDataPartsVectorForInternalUsage({DataPartState::Active}, lock);
-        snapshot_data->parts = std::make_shared<const RangesInDataParts>(parts);
-        snapshot_data->upsert_snapshot = upsert_state;
-        parts_info = getPartsSnapshotInfo(parts);
+        snapshot_data->parts = published->parts;
+        snapshot_data->upsert_snapshot = published->visibility;
+        parts_info = published->parts_info;
     }
     else
     {

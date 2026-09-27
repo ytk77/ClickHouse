@@ -17,6 +17,8 @@ namespace Upsert
 inline constexpr auto ORDINAL_COLUMN = "_upsert_block_ordinal";
 inline constexpr auto LINEAGE_COLUMN = "_upsert_merge_lineage";
 inline constexpr auto ROWS_FILE = "upsert_rows.bin";
+/// Eight-byte magic, four-byte row count and four-byte checksum in `upsert_rows.bin`.
+inline constexpr size_t PART_ROWS_ENVELOPE_BYTES = 16;
 inline constexpr size_t MAX_UNIT_ROWS = 1U << 20;
 inline constexpr size_t MAX_UNIT_BYTES = 32U << 20;
 

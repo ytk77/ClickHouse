@@ -1,6 +1,7 @@
 #pragma once
 #include <Storages/MergeTree/UniqueKey/UpsertSnapshot.h>
 
+#include <atomic>
 #include <mutex>
 #include <tuple>
 #include <base/defines.h>
@@ -703,8 +704,7 @@ public:
     StorageSnapshotPtr getStorageSnapshotWithoutData(const StorageMetadataPtr & metadata_snapshot, ContextPtr query_context) const override;
 
     /// Preallocate native part publication before the durable authorization callback.
-    void commitUpsertPart(MutableDataPartPtr & part, Upsert::SnapshotPtr snapshot,
-        const std::function<void()> & persist, DataPartsLock & lock);
+    void commitUpsertPart(MutableDataPartPtr & part, const std::function<void()> & persist, DataPartsLock & lock);
 
     /// Load the set of data parts from disk. Call once - immediately after the object is created.
     void loadDataParts(bool skip_sanity_checks, std::optional<std::unordered_set<std::string>> expected_parts);
@@ -1149,6 +1149,12 @@ public:
 
     size_t getColumnCompressedSize(const std::string & name) const
     {
+        if (merging_params.upsert)
+        {
+            const auto snapshot = getUpsertReadSnapshotForQuery();
+            const auto it = snapshot->column_sizes.find(name);
+            return it == snapshot->column_sizes.end() ? 0 : it->second.data_compressed;
+        }
         /// Always keep locks order parts_lock -> sizes_lock
         auto parts_lock = readLockParts();
         std::unique_lock sizes_lock(columns_and_secondary_indices_sizes_mutex);
@@ -1159,6 +1165,8 @@ public:
 
     ColumnSizeByName getColumnSizes() const override
     {
+        if (merging_params.upsert)
+            return getUpsertReadSnapshotForQuery()->column_sizes;
         /// Always keep locks order parts_lock -> sizes_lock
         auto parts_lock = readLockParts();
         std::unique_lock sizes_lock(columns_and_secondary_indices_sizes_mutex);
@@ -1170,6 +1178,8 @@ public:
 
     IndexSizeByName getSecondaryIndexSizes() const override
     {
+        if (merging_params.upsert)
+            return getUpsertReadSnapshotForQuery()->secondary_index_sizes;
         /// Always keep locks order parts_lock -> sizes_lock
         auto parts_lock = readLockParts();
         std::unique_lock sizes_lock(columns_and_secondary_indices_sizes_mutex);
@@ -1179,6 +1189,8 @@ public:
 
     IndexSize getPrimaryIndexSize() const
     {
+        if (merging_params.upsert)
+            return getUpsertReadSnapshotForQuery()->primary_index_size;
         /// Always keep locks order parts_lock -> sizes_lock
         auto parts_lock = readLockParts();
         std::unique_lock sizes_lock(columns_and_secondary_indices_sizes_mutex);
@@ -1567,9 +1579,30 @@ private:
 protected:
     void loadPartAndFixMetadataImpl(MergeTreeData::MutableDataPartPtr part, ContextPtr local_context) const;
 
-    /// Both fields are protected by the parts mutex, including journal-only publication.
-    Upsert::SnapshotPtr upsert_state;
-    bool upsert_fenced = false;
+    /// One published version owns both the native parts and their matching visibility state.
+    /// Readers never acquire the parts mutex used for durable writer serialization.
+    struct UpsertReadSnapshot
+    {
+        RangesInDataPartsPtr parts;
+        Upsert::SnapshotPtr visibility;
+        PartsSnapshotInfo parts_info;
+        ColumnSizeByName column_sizes;
+        IndexSizeByName secondary_index_sizes;
+        IndexSize primary_index_size;
+        UInt64 bytes_uncompressed = 0;
+    };
+    using UpsertReadSnapshotPtr = std::shared_ptr<const UpsertReadSnapshot>;
+
+    UpsertReadSnapshotPtr prepareUpsertReadSnapshot(
+        Upsert::SnapshotPtr visibility, const DataPartPtr & added_part, const DataPartsVector & removed_parts, DataPartsLock & lock) const;
+    UpsertReadSnapshotPtr getUpsertReadSnapshot() const;
+    UpsertReadSnapshotPtr getUpsertReadSnapshotForQuery() const;
+    void publishUpsertReadSnapshot(UpsertReadSnapshotPtr snapshot);
+
+    /// This mutex only protects copying or swapping a pointer, never I/O or snapshot construction/destruction.
+    mutable std::mutex upsert_snapshot_mutex;
+    UpsertReadSnapshotPtr upsert_read_snapshot;
+    std::atomic<bool> upsert_fenced{false};
 
     void unregisterFromMergeSelection(const MergeTreeSettingsPtr & settings);
 

@@ -223,7 +223,6 @@ StorageMergeTree::StorageMergeTree(
 
     if (merging_params.upsert)
     {
-        upsert_state = std::make_shared<const Upsert::SnapshotState>();
         const auto disks = getDisks();
         if (disks.size() != 1 || disks.front()->getDataSourceDescription().type != DataSourceType::Local)
             throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree currently requires exactly one local disk");
@@ -234,7 +233,6 @@ StorageMergeTree::StorageMergeTree(
 
         upsert_store = std::make_unique<Upsert::StateStore>(fs::path(disks.front()->getPath()) / relative_data_path_,
             incarnation, LoadingStrictnessLevel::ATTACH <= mode, use_disk_state);
-        upsert_state = upsert_store->snapshot();
     }
 
     loadDataParts(LoadingStrictnessLevel::FORCE_RESTORE <= mode, std::nullopt);
@@ -250,6 +248,8 @@ StorageMergeTree::StorageMergeTree(
             if (!id || Upsert::objectName(*id) != part->getDeleteBitmapCacheIdentity())
                 throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree loaded part identity mismatch");
         }
+        auto lock = lockParts();
+        publishUpsertReadSnapshot(prepareUpsertReadSnapshot(upsert_store->snapshot(), nullptr, {}, lock));
     }
 
     if (mode < LoadingStrictnessLevel::ATTACH && !getDataPartsForInternalUsage().empty() && !isTableReadonly())
@@ -483,6 +483,8 @@ std::optional<UInt64> StorageMergeTree::totalBytes(ContextPtr) const
 
 std::optional<UInt64> StorageMergeTree::totalBytesUncompressed(const Settings &) const
 {
+    if (merging_params.upsert)
+        return getUpsertReadSnapshotForQuery()->bytes_uncompressed;
     UInt64 res = 0;
     auto parts = getDataPartsForInternalUsage();
     for (const auto & part : parts)
@@ -3641,6 +3643,10 @@ MergeTreeData::MutationsSnapshotPtr StorageMergeTree::getMutationsSnapshot(const
     DataPartsVector patch_parts;
     MutationCounters mutations_snapshot_counters;
     MutationsSnapshot::MutationsByVersion mutations_snapshot;
+
+    /// `UpsertMergeTree` rejects mutations and patch parts. Do not reacquire the writer's parts lock for an empty patch snapshot.
+    if (merging_params.upsert)
+        return std::make_shared<MutationsSnapshot>(params, std::move(mutations_snapshot_counters), std::move(mutations_snapshot), std::move(patch_parts));
 
     if (params.need_patch_parts)
         patch_parts = getPatchPartsVectorForInternalUsage();

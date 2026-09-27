@@ -150,6 +150,8 @@ private:
     std::unique_ptr<MergeTreeDeduplicationLog> deduplication_log;
     std::unique_ptr<Upsert::StateStore> upsert_store;
     BackgroundSchedulePoolTaskHolder upsert_maintenance_task;
+    /// Accessed only by the single table maintenance task; resume after the previous selected unit.
+    std::optional<MergeTreePartInfo> upsert_maintenance_cursor;
     void runUpsertMaintenance();
 
     /// For block numbers.

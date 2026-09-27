@@ -86,7 +86,7 @@ String encodePartRows(const PartRows & rows)
 
 PartRows decodePartRows(std::string_view bytes)
 {
-    if (bytes.size() < 16 || bytes.size() > MAX_RECORD_BYTES || !bytes.starts_with("UMPROW01"))
+    if (bytes.size() < PART_ROWS_ENVELOPE_BYTES || bytes.size() > MAX_RECORD_BYTES || !bytes.starts_with("UMPROW01"))
         throw Exception(ErrorCodes::CORRUPTED_DATA, "Invalid UpsertMergeTree row metadata header");
     BinaryReader checksum{bytes.substr(bytes.size() - 4)};
     if (checksum.number(4) != crc(bytes.substr(0, bytes.size() - 4)))

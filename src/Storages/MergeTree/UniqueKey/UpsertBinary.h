@@ -26,7 +26,7 @@ struct BinaryWriter
     }
     void string(std::string_view value)
     {
-        if (value.size() > MAX_RECORD_BYTES || bytes.size() > MAX_RECORD_BYTES - value.size())
+        if (value.size() > MAX_RECORD_BYTES - 4 || bytes.size() > MAX_RECORD_BYTES - 4 - value.size())
             throw Exception(ErrorCodes::LIMIT_EXCEEDED, "UpsertMergeTree payload exceeds its byte limit");
         number(value.size(), 4);
         bytes.append(value);
