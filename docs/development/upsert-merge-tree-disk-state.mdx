@@ -91,6 +91,23 @@ Tokens retain their result for 86,400 seconds according to the server clock. A o
 
 These initial resource budgets are implementation defaults, not configurable SQL settings: 64-MiB index block cache, three 16-MiB write buffers, 128-MiB pending database batch, one-GiB free-disk maintenance reserve, and bounded maintenance input units. Foreground mask updates process one affected source at a time. Budgets limit current work or retained retry promises, not total partition or live-key counts.
 
+## Local validation on 2026-09-27 {#disk-state-validation-20260927}
+
+Commit `e93d416bd18669a197dd1595696c4968a66fba8c` was compiled with Clang 21 in Release mode. Both `clickhouse` and `unit_tests_dbms` linked successfully; the server build had no compiler warnings or errors.
+
+| Validation | Result |
+| --- | --- |
+| Stateless functional tests | 8 passed, including `04772_upsert_mvcc_publication` and `04773_upsert_maintenance_lineage_budget` |
+| Scoped unit tests | 52 passed across 8 suites |
+| Existing integration test functions through an isolated local-server adapter | 13 passed |
+| Paused state WAL synchronization | Five read queries returned the previous version while the writer remained blocked; the new version became visible after release |
+
+The lineage-budget regression verifies that two 524,288-row versioned parts whose combined sidecar would exceed 64 MiB remain separate, subsequent small parts consolidate, and superseded rows are reclaimed after another overwrite. The concurrency and recovery cases cover ordered preparation, cancellation, memory-limit exceptions, concurrent clients, retry tokens, late updates during a merge, pinned readers, and four durable-commit failure points. No `UpsertMergeTree maintenance failed` message occurred during these runs.
+
+The WAL experiment intercepted one `fsync` or `fdatasync` in the isolated server and resumed the original syscall after releasing a FIFO gate. Reads covered the writer's partition, another partition, `count`, `PREWHERE`, and `FINAL`. Their client wall times were 0.116–0.159 seconds, including client process overhead; these are controlled fault-test observations, not production latency percentiles.
+
+The unit tests used a scoped executable containing all Upsert test objects, excluding the unrelated `SilkEnvironment` fixture whose `io_uring` initialization is unavailable on this host. The integration functions used a local adapter, so this run does not establish Docker or Praktika harness coverage. Large-batch cases reported `Too much memory has been allocated without checking for memory limits`: approximately 3.659 GiB for the lineage-budget case and 2.632 GiB for the capacity case. These values describe allocations without intervening memory-limit checks, not peak memory. ASan, sustained overload, and long-running soak validation remain outstanding. The existing server was not restarted or upgraded.
+
 ## Remaining production gates {#disk-state-remaining-gates}
 
 This implementation still uses native eager part metadata and synchronously creates one part per accepted request unit. Maintenance uses a bounded in-memory mapping; it does not yet split oversized sources or spill that mapping to disk. Large sources beyond its operation budget are skipped. Some source verification and index relocation run under the commit lock. These are explicit limitations, not evidence that all continuous-ingestion workloads are production-ready.
