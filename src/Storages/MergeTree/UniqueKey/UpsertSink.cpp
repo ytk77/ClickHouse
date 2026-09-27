@@ -208,12 +208,36 @@ bool Sink::consumeBlock(Block block, size_t first_row, const String & client_tok
     /// Validate and fold every partition before committing the first one from this bounded input unit.
     std::vector<Token> tokens;
     tokens.reserve(partitions.size());
+    bool split_state = false;
     for (auto & partition : partitions)
     {
         /// Only token-based retries compare the evaluated input hash. Payload authentication is independent.
         tokens.push_back({client_token, unit, client_token.empty() ? ObjectID{} : hashInputBlock(*partition.block), 0});
-        if (foldBlock(*partition.block, *metadata, storage.merging_params.upsert_version_column,
-                settings[Setting::unique_key_max_encoded_size]) > MAX_RECORD_BYTES)
+        const auto lineage_bytes = foldBlock(*partition.block, *metadata, storage.merging_params.upsert_version_column,
+            settings[Setting::unique_key_max_encoded_size]);
+        if (lineage_bytes > MAX_RECORD_BYTES)
+            return false;
+        const auto partition_id = partition.partition.getID(metadata->getPartitionKey().sample_block);
+        split_state |= estimateInsertStateBytes(lineage_bytes, partition.block->rows(), partition_id.size(), client_token.size()) > MAX_PENDING_STATE_BYTES;
+    }
+    if (split_state)
+    {
+        bool preserve_committed_boundary = false;
+        if (!client_token.empty())
+        {
+            /// One legacy partition may have committed before a failure in another partition of this unit.
+            /// Its boundary also fixes the token numbering of subsequent units, even if it is small itself.
+            for (size_t i = 0; i < partitions.size(); ++i)
+            {
+                const auto partition_id = partitions[i].partition.getID(metadata->getPartitionKey().sample_block);
+                if (storage.isUpsertTokenCommitted(partition_id, tokens[i]))
+                {
+                    preserve_committed_boundary = true;
+                    break;
+                }
+            }
+        }
+        if (!preserve_committed_boundary)
             return false;
     }
     for (size_t i = 0; i < partitions.size(); ++i)
@@ -257,6 +281,16 @@ bool Sink::consumeBlock(Block block, size_t first_row, const String & client_tok
 
 namespace DB
 {
+bool StorageMergeTree::isUpsertTokenCommitted(const String & partition, const Upsert::Token & token) const
+{
+    auto lock = readLockParts();
+    if (upsert_fenced)
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree is fenced pending restart and recovery");
+    /// A smaller unit may already use this number under the current splitting policy.
+    /// Only an exact match permits replaying an older, larger boundary unchanged.
+    return upsert_store->tokenAlreadyCommitted(partition, token, false);
+}
+
 std::unique_ptr<Upsert::PreparedInsert> StorageMergeTree::prepareUpsertBlock(
     BlockWithPartition & block, const StorageMetadataPtr & metadata, ContextPtr query_context, Upsert::Token token)
 {

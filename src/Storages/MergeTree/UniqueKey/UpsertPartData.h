@@ -21,6 +21,7 @@ inline constexpr auto ROWS_FILE = "upsert_rows.bin";
 inline constexpr size_t PART_ROWS_ENVELOPE_BYTES = 16;
 inline constexpr size_t MAX_UNIT_ROWS = 1U << 20;
 inline constexpr size_t MAX_UNIT_BYTES = 32U << 20;
+inline constexpr size_t MAX_PENDING_STATE_BYTES = 128U << 20;
 
 struct PartRow
 {
@@ -61,6 +62,8 @@ Block cutInputBlock(const Block & block, size_t offset, size_t max_rows = MAX_UN
 /// Fold before the native sort, retaining original input ordinals for equal-version ties.
 /// Return the encoded size of `upsert_rows.bin`, including its envelope.
 size_t foldBlock(Block & block, const StorageInMemoryMetadata & metadata, const String & version_column, size_t max_key_bytes);
+/// Bound winner replacements, authorization and the new mask; existing source masks remain state-dependent.
+size_t estimateInsertStateBytes(size_t lineage_bytes, size_t rows, size_t partition_bytes, size_t token_bytes);
 ObjectID hashInputBlock(const Block & block);
 
 void writePartIndex(

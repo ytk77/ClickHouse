@@ -45,12 +45,11 @@ namespace
 {
 constexpr UInt64 retry_window_seconds = 86400;
 constexpr UInt64 retry_state_budget = 1ULL << 30;
-constexpr UInt64 pending_batch_budget = 128ULL << 20;
 constexpr UInt64 maintenance_disk_reserve = 1ULL << 30;
 
 void checkBatchBudget(const rocksdb::WriteBatch & batch)
 {
-    if (batch.GetDataSize() > pending_batch_budget)
+    if (batch.GetDataSize() > MAX_PENDING_STATE_BYTES)
         throw Exception(ErrorCodes::LIMIT_EXCEEDED, "UpsertMergeTree pending state batch exceeds its byte budget");
 }
 
@@ -328,7 +327,8 @@ DiskState::DiskState(const String & table_path, ObjectID incarnation, bool attac
     options.create_if_missing = !attach;
     options.error_if_exists = !attach;
     options.paranoid_checks = true;
-    options.wal_recovery_mode = rocksdb::WALRecoveryMode::kAbsoluteConsistency;
+    options.wal_recovery_mode = rocksdb::WALRecoveryMode::kTolerateCorruptedTailRecords;
+    options.track_and_verify_wals = true;
     options.use_fsync = true;
     options.max_open_files = 128;
     options.write_buffer_size = 16U << 20;
@@ -470,7 +470,7 @@ std::optional<ObjectID> DiskState::authorizedPart(const String & name) const
     return decodePartCommit(*value).part;
 }
 
-bool DiskState::tokenAlreadyCommitted(const String & partition, const Token & token) const
+bool DiskState::tokenAlreadyCommitted(const String & partition, const Token & token, bool throw_on_mismatch) const
 {
     if (token.client_token.empty())
         return false;
@@ -485,7 +485,11 @@ bool DiskState::tokenAlreadyCommitted(const String & partition, const Token & to
     if (expires <= impl->clock())
         return false;
     if (hash != token.payload_hash)
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "UpsertMergeTree deduplication token was reused with a different evaluated block");
+    {
+        if (throw_on_mismatch)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "UpsertMergeTree deduplication token was reused with a different evaluated block");
+        return false;
+    }
     return true;
 }
 
@@ -788,7 +792,7 @@ std::optional<ObjectID> DiskState::authorizedPart(const String &) const
 {
     std::unreachable();
 }
-bool DiskState::tokenAlreadyCommitted(const String &, const Token &) const
+bool DiskState::tokenAlreadyCommitted(const String &, const Token &, bool) const
 {
     std::unreachable();
 }

@@ -210,10 +210,10 @@ StateStore::Partition & StateStore::getOrCreatePartition(const String & partitio
     }
 }
 
-bool StateStore::tokenAlreadyCommitted(const String & partition, const Token & token) const
+bool StateStore::tokenAlreadyCommitted(const String & partition, const Token & token, bool throw_on_mismatch) const
 {
     if (disk)
-        return disk->tokenAlreadyCommitted(partition, token);
+        return disk->tokenAlreadyCommitted(partition, token, throw_on_mismatch);
     if (token.client_token.empty())
         return false;
     auto it = partitions.find(partition);
@@ -224,7 +224,11 @@ bool StateStore::tokenAlreadyCommitted(const String & partition, const Token & t
     if (old == tokens.end())
         return false;
     if (old->second.payload_hash != token.payload_hash)
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "UpsertMergeTree deduplication token was reused with a different evaluated block");
+    {
+        if (throw_on_mismatch)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "UpsertMergeTree deduplication token was reused with a different evaluated block");
+        return false;
+    }
     return true;
 }
 

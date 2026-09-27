@@ -9,6 +9,11 @@
 
 namespace DB
 {
+namespace MergeTreeSetting
+{
+    extern const MergeTreeSettingsBool async_insert;
+}
+
 namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
@@ -37,6 +42,9 @@ bool supportedKeyType(const IDataType & type)
 void validateUpsertMergeTreeMetadata(
     const StorageInMemoryMetadata & metadata, const String & version_column, MergeTreeSettings & settings)
 {
+    if (settings[MergeTreeSetting::async_insert])
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree does not support the async_insert table setting");
+
     if (!metadata.hasUniqueKey())
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "UpsertMergeTree requires a nonempty UNIQUE KEY");
 

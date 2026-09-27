@@ -213,6 +213,15 @@ size_t foldBlock(Block & block, const StorageInMemoryMetadata & metadata, const 
     return lineage_bytes;
 }
 
+size_t estimateInsertStateBytes(size_t lineage_bytes, size_t rows, size_t partition_bytes, size_t token_bytes)
+{
+    /// Relative to lineage, each winner `Put` adds the partition prefix, physical part ID,
+    /// record framing and a possible 20-byte kill. Three bytes cover key-length varint growth.
+    /// The remaining allowance covers bounded names, counters, retry records and a dense new mask.
+    const size_t mask_bytes = 16 + ((rows + 65535) / 65536) * (8192 + 8);
+    return lineage_bytes + rows * (43 + partition_bytes) + 4096 + 3 * token_bytes + 4 * partition_bytes + mask_bytes;
+}
+
 ObjectID hashInputBlock(const Block & block)
 {
     SipHash hash;

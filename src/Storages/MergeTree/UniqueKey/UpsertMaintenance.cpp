@@ -60,6 +60,7 @@ void StorageMergeTree::runUpsertMaintenance()
             size_t bytes = 0;
             size_t rows = 0;
             size_t lineage_bytes = 0;
+            size_t state_bytes = 0;
             bool needs_rewrite = false;
             auto worthy = [&] { return sources.size() >= 2 || needs_rewrite; };
             auto candidates = getDataPartsVectorForInternalUsage({DataPartState::Active}, lock);
@@ -84,6 +85,7 @@ void StorageMergeTree::runUpsertMaintenance()
                     bytes = 0;
                     rows = 0;
                     lineage_bytes = 0;
+                    state_bytes = 0;
                     needs_rewrite = false;
                     partition = id;
                 }
@@ -100,13 +102,25 @@ void StorageMergeTree::runUpsertMaintenance()
                 const auto mask = snapshot->getMask(candidate->getDeleteBitmapCacheIdentity());
                 if (!mask)
                     throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree maintenance source lacks a mask");
+                if (mask->cardinality() > candidate->rows_count)
+                    throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree maintenance mask exceeds its source rows");
+                const size_t version_bytes = merging_params.upsert_version_column.empty() ? 0 : 8;
+                if (candidate_lineage_bytes < candidate->rows_count * (50 + version_bytes))
+                    throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree maintenance lineage is too short for its source rows");
+                /// Bound winner relocation plus the original authorization retained in each retirement record.
+                /// Dead rows need no winner `Put`; retain their key bytes and worst-case original kills in the bound.
+                const size_t winner_overhead = 73 + id.size() + version_bytes;
+                const auto candidate_state_bytes = Upsert::estimateInsertStateBytes(
+                    checksum->second.file_size, candidate->rows_count, id.size(), 1024)
+                    - mask->cardinality() * winner_overhead;
                 const bool rewrite = mask->cardinality() > 0 && mask->cardinality() * 4 >= candidate->rows_count;
                 /// Target-sized healthy parts are complete; they must not block later small parts in any budget dimension.
                 if (!rewrite && (size > max_source_bytes / 2 || candidate->rows_count > Upsert::MAX_UNIT_ROWS / 2
-                    || candidate_lineage_bytes > max_lineage_bytes / 2))
+                    || candidate_lineage_bytes > max_lineage_bytes / 2 || candidate_state_bytes > Upsert::MAX_PENDING_STATE_BYTES / 2))
                     continue;
                 if (size > max_source_bytes - bytes || candidate->rows_count > Upsert::MAX_UNIT_ROWS - rows
-                    || candidate_lineage_bytes > max_lineage_bytes - lineage_bytes)
+                    || candidate_lineage_bytes > max_lineage_bytes - lineage_bytes
+                    || candidate_state_bytes > Upsert::MAX_PENDING_STATE_BYTES - state_bytes)
                 {
                     if (worthy())
                         break;
@@ -117,6 +131,7 @@ void StorageMergeTree::runUpsertMaintenance()
                 bytes += size;
                 rows += candidate->rows_count;
                 lineage_bytes += candidate_lineage_bytes;
+                state_bytes += candidate_state_bytes;
                 if (sources.size() == max_sources)
                     break;
             }

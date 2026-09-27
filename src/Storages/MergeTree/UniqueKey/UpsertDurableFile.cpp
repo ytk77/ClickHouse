@@ -30,6 +30,7 @@ namespace ErrorCodes
     extern const int CANNOT_FSYNC;
     extern const int CORRUPTED_DATA;
     extern const int FAULT_INJECTED;
+    extern const int BAD_ARGUMENTS;
 }
 
 namespace FailPoints
@@ -85,6 +86,29 @@ void syncDirectory(const String & path)
 {
     FileDescriptor directory(path, O_RDONLY | O_DIRECTORY);
     directory.sync();
+}
+
+void syncDirectoryAncestors(const String & path, const String & root)
+{
+    auto normalize = [](const String & value)
+    {
+        auto result = std::filesystem::absolute(value).lexically_normal();
+        if (result.has_relative_path() && result.filename().empty())
+            result = result.parent_path();
+        return result;
+    };
+    auto directory = normalize(path);
+    const auto boundary = normalize(root);
+    const auto relative = directory.lexically_relative(boundary);
+    if (relative.empty() || *relative.begin() == "..")
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "UpsertMergeTree table directory is outside its disk root");
+    while (true)
+    {
+        syncDirectory(directory);
+        if (directory == boundary)
+            break;
+        directory = directory.parent_path();
+    }
 }
 
 void syncFiles(const std::vector<String> & paths)

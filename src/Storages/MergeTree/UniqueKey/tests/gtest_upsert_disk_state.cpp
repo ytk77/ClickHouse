@@ -5,9 +5,11 @@
 #include "config.h"
 #include <gtest/gtest.h>
 #include <filesystem>
+#include <fstream>
 
 #if USE_ROCKSDB
 #include <rocksdb/db.h>
+#include <rocksdb/write_batch.h>
 using namespace DB;
 using namespace DB::Upsert;
 
@@ -77,7 +79,141 @@ protected:
         }
         return store.prepareMerge("p", std::move(part), rows, sources);
     }
+
+    std::pair<std::filesystem::path, size_t> appendUnpublishedBatch()
+    {
+        rocksdb::Options options;
+        options.avoid_flush_during_shutdown = true;
+        options.track_and_verify_wals = true;
+        rocksdb::DB * raw = nullptr;
+        const auto path = directory / "upsert_state_v2";
+        const auto status = rocksdb::DB::Open(options, path.string(), &raw);
+        if (!status.ok())
+            throw std::runtime_error(status.ToString());
+        std::unique_ptr<rocksdb::DB> database(raw);
+        std::filesystem::path wal;
+        for (const auto & entry : std::filesystem::directory_iterator(path))
+            if (entry.path().extension() == ".log" && entry.path() > wal)
+                wal = entry.path();
+        const auto boundary = std::filesystem::file_size(wal);
+        rocksdb::WriteBatch batch;
+        String count(8, '\0');
+        count[0] = 2;
+        batch.Put("part_count", count);
+        batch.Put("unfinished_test_batch", String(256U << 10, 'x'));
+        const auto write_status = database->Write(rocksdb::WriteOptions{}, &batch);
+        if (!write_status.ok())
+            throw std::runtime_error(write_status.ToString());
+        database.reset();
+        return {wal, boundary};
+    }
 };
+
+TEST_F(UpsertDiskStateTest, IncompleteFinalBatchRetainsEarlierDurableCommit)
+{
+    {
+        StateStore store(directory, incarnation, false, true);
+        auto first = prepare(store, {{"key", 10}});
+        commit(store, first);
+    }
+    const auto [wal, boundary] = appendUnpublishedBatch();
+    ASSERT_GT(std::filesystem::file_size(wal), boundary + 40000);
+    /// Preserve the first fragment and tear the following one before the batch can be acknowledged.
+    std::filesystem::resize_file(wal, boundary + 40000);
+    {
+        StateStore reopened(directory, incarnation, true, true);
+        EXPECT_EQ(reopened.authorizedPartCount(), 1);
+        auto stale = prepare(reopened, {{"key", 9}});
+        EXPECT_FALSE(stale.produces_part);
+        auto next = prepare(reopened, {{"key", 11}});
+        commit(reopened, next);
+    }
+    StateStore reopened(directory, incarnation, true, true);
+    EXPECT_EQ(reopened.authorizedPartCount(), 2);
+    EXPECT_FALSE(prepare(reopened, {{"key", 10}}).produces_part);
+}
+
+TEST_F(UpsertDiskStateTest, CompleteFinalBatchWithBadChecksumStillFailsClosed)
+{
+    {
+        StateStore store(directory, incarnation, false, true);
+        auto first = prepare(store, {{"key", 10}});
+        commit(store, first);
+    }
+    const auto [wal, boundary] = appendUnpublishedBatch();
+    std::fstream file(wal, std::ios::in | std::ios::out | std::ios::binary);
+    file.seekg(static_cast<std::streamoff>(boundary + 100));
+    const auto byte = file.get();
+    ASSERT_NE(byte, std::char_traits<char>::eof());
+    file.seekp(static_cast<std::streamoff>(boundary + 100));
+    file.put(static_cast<char>(byte ^ 0x80));
+    file.close();
+    EXPECT_THROW((StateStore(directory, incarnation, true, true)), Exception);
+}
+
+TEST_F(UpsertDiskStateTest, AttachStateCreatedWithoutWalTracking)
+{
+    const auto path = directory / "upsert_state_v2";
+    rocksdb::Options options;
+    options.create_if_missing = true;
+    options.avoid_flush_during_shutdown = true;
+    rocksdb::DB * raw = nullptr;
+    ASSERT_TRUE(rocksdb::DB::Open(options, path.string(), &raw).ok());
+    std::unique_ptr<rocksdb::DB> database(raw);
+    rocksdb::WriteBatch batch;
+    batch.Put("identity", "upsert_disk_state_v2:" + objectName(incarnation));
+    batch.Put("part_count", String(8, '\0'));
+    batch.Put("retry_bytes", String(8, '\0'));
+    rocksdb::WriteOptions write;
+    write.sync = true;
+    ASSERT_TRUE(database->Write(write, &batch).ok());
+    database.reset();
+    {
+        StateStore store(directory, incarnation, true, true);
+        auto first = prepare(store, {{"key", 10}});
+        commit(store, first);
+    }
+    StateStore reopened(directory, incarnation, true, true);
+    EXPECT_EQ(reopened.authorizedPartCount(), 1);
+    EXPECT_FALSE(prepare(reopened, {{"key", 9}}).produces_part);
+}
+
+TEST_F(UpsertDiskStateTest, TruncatedPredecessorWalFailsClosed)
+{
+    {
+        StateStore store(directory, incarnation, false, true);
+        auto first = prepare(store, {{"key", 10}});
+        commit(store, first);
+    }
+    rocksdb::Options options;
+    options.avoid_flush_during_shutdown = true;
+    options.track_and_verify_wals = true;
+    options.write_buffer_size = 64U << 10;
+    options.max_write_buffer_number = 4;
+    const auto path = directory / "upsert_state_v2";
+    rocksdb::DB * raw = nullptr;
+    ASSERT_TRUE(rocksdb::DB::Open(options, path.string(), &raw).ok());
+    std::unique_ptr<rocksdb::DB> database(raw);
+    ASSERT_TRUE(database->PauseBackgroundWork().ok());
+    rocksdb::WriteOptions write;
+    write.sync = true;
+    std::filesystem::path predecessor;
+    for (const auto & entry : std::filesystem::directory_iterator(path))
+        if (entry.path().extension() == ".log" && entry.path() > predecessor)
+            predecessor = entry.path();
+    ASSERT_TRUE(database->Put(write, "wal_rotation_padding", String(128U << 10, 'x')).ok());
+    ASSERT_TRUE(database->Put(write, "wal_successor", "value").ok());
+    std::filesystem::path successor;
+    for (const auto & entry : std::filesystem::directory_iterator(path))
+        if (entry.path().extension() == ".log" && entry.path() > successor)
+            successor = entry.path();
+    ASSERT_NE(predecessor, successor);
+    database.reset();
+    const auto size = std::filesystem::file_size(predecessor);
+    ASSERT_GT(size, 0);
+    std::filesystem::resize_file(predecessor, size - 1);
+    EXPECT_THROW((StateStore(directory, incarnation, true, true)), Exception);
+}
 
 TEST_F(UpsertDiskStateTest, DurableWinnersAndSnapshots)
 {

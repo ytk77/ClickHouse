@@ -1,6 +1,7 @@
 #include <future>
 #include <string>
 #include <vector>
+#include <unordered_set>
 #include <Interpreters/AsynchronousInsertQueue.h>
 
 #include <Access/Common/AccessFlags.h>
@@ -39,6 +40,8 @@
 #include <QueryPipeline/Pipe.h>
 #include <QueryPipeline/QueryPipeline.h>
 #include <Storages/IStorage.h>
+#include <Storages/StorageAlias.h>
+#include <Storages/StorageMaterializedView.h>
 #include <Common/CurrentThread.h>
 #include <Common/QueryScope.h>
 #include <Common/DateLUT.h>
@@ -105,6 +108,7 @@ namespace ErrorCodes
     extern const int BAD_ARGUMENTS;
     extern const int LOGICAL_ERROR;
     extern const int INVALID_SETTING_VALUE;
+    extern const int SUPPORT_IS_DISABLED;
 }
 
 static const NameSet settings_to_skip
@@ -444,6 +448,37 @@ void AsynchronousInsertQueue::preprocessInsertQuery(const ASTPtr & query, const 
         /// background flush: by then the query has already returned success to the user (with
         /// `wait_for_async_insert = 0`) and the user's privileges may have changed.
         table->checkInsertIsAllowed(query_context);
+    }
+
+    /// Reject unsupported destinations before acknowledging queued data, including cascading views.
+    /// `UpsertMergeTree` cannot consume the asynchronous flush protocol in its sink.
+    std::vector<StoragePtr> destinations{table};
+    std::unordered_set<StorageID, StorageID::DatabaseAndTableNameAndUUIDHash, StorageID::DatabaseAndTableNameAndUUIDEqual> visited;
+    for (size_t i = 0; i < destinations.size(); ++i)
+    {
+        const auto destination = destinations[i];
+        const auto id = destination->getStorageID();
+        if (!visited.insert(id).second)
+            continue;
+        if (destination->getName() == "UpsertMergeTree")
+            throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree requires synchronous inserts, including through materialized views");
+        if (const auto * view = dynamic_cast<const StorageMaterializedView *>(destination.get()))
+        {
+            /// Missing destinations retain the flush-time materialized-view error policy.
+            if (auto target = view->tryGetTargetTable())
+                destinations.push_back(std::move(target));
+        }
+        else if (const auto * alias = dynamic_cast<const StorageAlias *>(destination.get()))
+            destinations.push_back(alias->getTargetTable());
+        else
+        {
+            for (const auto & view_id : DatabaseCatalog::instance().getDependentViews(id))
+            {
+                /// A concurrently dropped view is no longer an insert destination.
+                if (auto dependent = DatabaseCatalog::instance().tryGetTable(view_id, query_context))
+                    destinations.push_back(std::move(dependent));
+            }
+        }
     }
 
     insert_query.columns = make_intrusive<ASTExpressionList>();

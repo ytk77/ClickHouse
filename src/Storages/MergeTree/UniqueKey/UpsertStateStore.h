@@ -94,7 +94,8 @@ public:
     void pruneRetired();
     void append(const Prepared & prepared);
     void publish(Prepared & prepared) noexcept;
-    bool tokenAlreadyCommitted(const String & partition, const Token & token) const;
+    /// A non-throwing mismatch probe only selects a compatible input boundary; commits always check strictly.
+    bool tokenAlreadyCommitted(const String & partition, const Token & token, bool throw_on_mismatch = true) const;
     void checkAdmission() const;
     bool isFenced() const
     {

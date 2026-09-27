@@ -79,3 +79,14 @@ TEST_F(UpsertDurableFileTest, GroupedFileBarriersPropagateErrors)
     EXPECT_EQ(readBoundedFile(first, 3), "one");
     EXPECT_EQ(readBoundedFile(second, 3), "two");
 }
+
+TEST_F(UpsertDurableFileTest, NestedDirectoryBarriersValidateDiskBoundary)
+{
+    const auto table = directory / "store" / "abc" / "table";
+    std::filesystem::create_directories(table);
+    EXPECT_NO_THROW(syncDirectoryAncestors(table.string() + "/", directory.string() + "/"));
+    EXPECT_NO_THROW(syncDirectoryAncestors(directory, directory));
+    EXPECT_THROW(syncDirectoryAncestors(directory.parent_path(), directory), Exception);
+    EXPECT_THROW(syncDirectoryAncestors(table, directory / "other"), Exception);
+    EXPECT_THROW(syncDirectoryAncestors(table / "missing", directory), Exception);
+}

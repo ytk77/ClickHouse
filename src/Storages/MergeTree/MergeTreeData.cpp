@@ -3829,6 +3829,11 @@ size_t MergeTreeData::clearOldTemporaryDirectories(const String & root_path, siz
                         LOG_INFO(LogFrequencyLimiter(log.load(), 10), "{} is in use (by merge/mutation/INSERT) (consider increasing temporary_directories_lifetime setting)", full_path);
                         continue;
                     }
+                    /// Check after the temporary-part guard: its release follows fencing an ambiguous commit.
+                    /// Recovery still needs the `tmp_upsert_` payload if durable authorization preceded the exception.
+                    if (merging_params.upsert && startsWith(basename, "tmp_upsert_") && upsert_fenced)
+                        continue;
+
                     if (!disk->existsDirectory(it->path()))
                     {
                         /// We should recheck that the dir exists, otherwise we can get "No such file or directory"
@@ -4504,6 +4509,9 @@ size_t MergeTreeData::clearUnusedPatchParts()
 
 void MergeTreeData::rename(const String & new_table_path, const StorageID & new_table_id)
 {
+    if (merging_params.upsert && new_table_path != relative_data_path)
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree does not support renames that move its data directory");
+
     LOG_INFO(log, "Renaming table to path {} with ID {}", new_table_path, new_table_id.getFullTableName());
 
     auto disks = getStoragePolicy()->getDisks();

@@ -900,6 +900,11 @@ static bool partHasStaleTopKIndex(
     const MergeTreeData::MutationsSnapshotPtr & mutations_snapshot,
     const ContextPtr & context)
 {
+    /// `UpsertMergeTree` masks superseded rows after index analysis. Physical extrema
+    /// cannot reserve top-k slots without checking the query's pinned visibility snapshot.
+    if (part->storage.merging_params.upsert)
+        return true;
+
     /// Materialized lightweight delete: the part carries a _row_exists column.
     if (part->hasLightweightDelete())
         return true;

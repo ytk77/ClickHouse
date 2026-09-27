@@ -17,7 +17,7 @@ namespace ErrorCodes
 namespace Upsert
 {
 ObjectID initializeTableManifest(
-    const String & table_path, const String & disk_name,
+    const String & table_path, const String & disk_name, const String & disk_path,
     const StorageInMemoryMetadata & metadata, const String & version_column, bool attach, bool & use_disk_state)
 {
     const String legacy_prefix = "UpsertMergeTree\nrow_metadata=1\nkey_encoding=1\ncommit_protocol=parts_sync_v1\n";
@@ -60,7 +60,7 @@ ObjectID initializeTableManifest(
     LogRecord manifest{.incarnation = incarnation, .partition_id = "table_manifest", .csn = 1,
         .operation_id = incarnation, .kind = RecordKind::Noop, .payload = disk_prefix + schema};
     createDurableFile(path, encodeLogRecord(manifest));
-    syncDirectory(std::filesystem::path(table_path).parent_path());
+    syncDirectoryAncestors(table_path, disk_path);
     return incarnation;
 }
 }

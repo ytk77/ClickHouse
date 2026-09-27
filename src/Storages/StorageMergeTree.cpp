@@ -228,7 +228,7 @@ StorageMergeTree::StorageMergeTree(
             throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree currently requires exactly one local disk");
         bool use_disk_state = false;
         const auto incarnation = Upsert::initializeTableManifest(
-            fs::path(disks.front()->getPath()) / relative_data_path_, disks.front()->getName(),
+            fs::path(disks.front()->getPath()) / relative_data_path_, disks.front()->getName(), disks.front()->getPath(),
             metadata_, merging_params.upsert_version_column, LoadingStrictnessLevel::ATTACH <= mode, use_disk_state);
 
         upsert_store = std::make_unique<Upsert::StateStore>(fs::path(disks.front()->getPath()) / relative_data_path_,
