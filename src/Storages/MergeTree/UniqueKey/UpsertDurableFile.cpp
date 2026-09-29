@@ -104,9 +104,14 @@ void syncDirectoryAncestors(const String & path, const String & root)
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "UpsertMergeTree table directory is outside its disk root");
     while (true)
     {
-        syncDirectory(directory);
         if (directory == boundary)
+        {
+            /// The configured disk root may be a symbolic link. Resolve only this trusted boundary;
+            /// keep rejecting symbolic links in table directories and files with `O_NOFOLLOW`.
+            syncDirectory(std::filesystem::canonical(boundary));
             break;
+        }
+        syncDirectory(directory);
         directory = directory.parent_path();
     }
 }

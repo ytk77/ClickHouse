@@ -90,3 +90,29 @@ TEST_F(UpsertDurableFileTest, NestedDirectoryBarriersValidateDiskBoundary)
     EXPECT_THROW(syncDirectoryAncestors(table, directory / "other"), Exception);
     EXPECT_THROW(syncDirectoryAncestors(table / "missing", directory), Exception);
 }
+
+TEST_F(UpsertDurableFileTest, DirectoryBarriersAllowConfiguredDiskRootSymlink)
+{
+    const auto target = directory / "physical_disk";
+    const auto root = directory / "disk_link";
+    std::filesystem::create_directories(target / "store" / "abc" / "table");
+    std::filesystem::create_directory_symlink("physical_disk", root);
+
+    EXPECT_NO_THROW(syncDirectoryAncestors((root / "store" / "abc" / "table").string() + "/", root.string() + "/"));
+    EXPECT_NO_THROW(syncDirectoryAncestors(root, root));
+    EXPECT_THROW(syncDirectory(root), Exception);
+    EXPECT_THROW(syncDirectoryAncestors(directory, root), Exception);
+}
+
+TEST_F(UpsertDurableFileTest, DirectoryBarriersRejectSymlinksBelowConfiguredDiskRoot)
+{
+    const auto target = directory / "physical_disk";
+    const auto root = directory / "disk_link";
+    std::filesystem::create_directories(target / "store");
+    std::filesystem::create_directories(directory / "outside" / "table");
+    std::filesystem::create_directory_symlink("physical_disk", root);
+    std::filesystem::create_directory_symlink("../../outside", target / "store" / "redirect");
+
+    EXPECT_THROW(syncDirectoryAncestors(root / "store" / "redirect" / "table", root), Exception);
+    EXPECT_THROW(syncDirectoryAncestors(root / "store" / "redirect", root), Exception);
+}
