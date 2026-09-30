@@ -42,7 +42,10 @@ there is no global partition-operation lock. Preparation pins native parts and m
 without excluding inserts. Publication takes only one table's schema write lock,
 expiration lock and parts lock at a time. Removals retire the selected parts and check
 current winner identities; later inserts survive. Partition counters and retry tokens
-are reset only if that table's published snapshot still matches the removal snapshot.
+are reset only if that partition's commit sequence matches its value in the removal
+snapshot. A whole-partition removal always uses a winner range tombstone, followed
+by reinstating current winners belonging to surviving active parts in the same batch.
+Only these survivors, rather than every removed row, consume per-winner batch space.
 
 `DETACH` and `FREEZE` synchronize a checksummed visibility record and each copied
 payload through the containing disk root before source removal or success. `ATTACH`

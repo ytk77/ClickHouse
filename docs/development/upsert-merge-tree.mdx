@@ -149,10 +149,21 @@ it rejects the operation before changing live data. Preparation pins a source sn
 and allows concurrent inserts. Only the publication phase excludes inserts. Schema
 changes and maintenance serialize with preparation on the participating tables;
 unrelated tables can perform partition operations concurrently.
-Removals retire the parts selected in that snapshot. Rows inserted afterward remain,
-and their winner identities are checked at publication. Partition retry tokens are
-cleared only if the removal table's published state has not changed since selection;
-otherwise existing tokens are retained to protect concurrent writes.
+Removals retire the parts selected in that snapshot. Parts inserted afterward remain,
+and their winner identities are checked at publication before comparing imported rows. Partition retry tokens are
+cleared only if that partition's commit sequence has not changed since selection;
+writes to other partitions do not prevent clearing them. Otherwise existing tokens
+are retained to protect concurrent writes. Whole-partition removal uses a winner
+range deletion and restores winners owned by surviving parts. Its state budget
+depends on retirement metadata, token cleanup, imports and concurrent survivors,
+rather than the number of old winners being removed. Exceptionally large survivor sets or imports can still
+exceed the 128-MiB limit; the operation then leaves live data unchanged.
+
+On an unversioned table, imported rows in `REPLACE PARTITION` are committed after
+preparation. For the same key, they replace even an insert committed during preparation;
+concurrent keys absent from the import survive. Versioned tables compare versions at
+publication, so a newer concurrent version remains the winner.
+
 `MOVE ... TO TABLE` commits the destination first, then removes the source. These are
 two table commits: interruption between them can leave visible copies in both tables.
 Inspect both tables before retrying an interrupted move, especially without versions.
@@ -173,6 +184,19 @@ inspect the backup before restoring it over newer data. If recovery finds both a
 uncommitted `attaching_` directory and its original detached name, it preserves the
 former under an `upsert_recovered_` name and logs a warning. This preserved copy
 requires inspection and is excluded from automatic partition attachment.
+
+To recover a preserved copy, inspect `system.detached_parts` and the warning log,
+then choose which copy to retain. Pause partition-management commands while changing
+files. Inside this table's `detached` directory, rename the selected
+`upsert_recovered_<id>_<part>` directory back to `<part>` only when that name is free;
+never overwrite the conflicting copy. Preserve every file, including
+`upsert_visibility.bin`. Then run `ALTER TABLE table_name ATTACH PART '<part>'`.
+The prefixed recovery name itself cannot be used as an `ATTACH PART` argument.
+
+Failures while registering temporary parts, before the durable state write begins,
+roll back registration and leave the table available for retry. An incomplete rollback
+or an ambiguous failure after the durable state write begins still fences the table
+until restart and recovery.
 
 The first partition operation adds `partition_policy=state_v1` to the table manifest.
 Older binaries reject this header; downgrade requires a compatible binary. These

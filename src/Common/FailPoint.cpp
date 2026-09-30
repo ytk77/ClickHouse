@@ -38,6 +38,8 @@ static struct InitFiu
     PAUSEABLE_ONCE(upsert_pause_after_state_sync) \
     ONCE(upsert_throw_after_rename) \
     ONCE(upsert_throw_before_publish) \
+    ONCE(upsert_throw_during_part_precommit) \
+    ONCE(upsert_throw_before_part_persist) \
     PAUSEABLE_ONCE(upsert_pause_after_read_snapshot) \
     PAUSEABLE_ONCE(upsert_pause_before_merge_commit) \
     PAUSEABLE_ONCE(upsert_partition_pause_after_prepare) \

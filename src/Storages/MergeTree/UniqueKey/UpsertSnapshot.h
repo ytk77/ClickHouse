@@ -10,6 +10,7 @@ class MaskSnapshot
 {
 public:
     virtual ~MaskSnapshot() = default;
+    virtual UInt64 getPartitionCSN(const String & partition) const = 0;
     virtual std::shared_ptr<const DeleteBitmap> getMask(const String & part) const = 0;
 };
 
@@ -20,6 +21,14 @@ struct SnapshotState
     std::map<String, UInt64> partition_csns;
     std::map<String, std::shared_ptr<const DeleteBitmap>> part_masks;
     std::shared_ptr<const MaskSnapshot> disk_masks;
+
+    UInt64 getPartitionCSN(const String & partition) const
+    {
+        if (disk_masks)
+            return disk_masks->getPartitionCSN(partition);
+        const auto it = partition_csns.find(partition);
+        return it == partition_csns.end() ? 0 : it->second;
+    }
 
     std::shared_ptr<const DeleteBitmap> getMask(const String & part) const
     {

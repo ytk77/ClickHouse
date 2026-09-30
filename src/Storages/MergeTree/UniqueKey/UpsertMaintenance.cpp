@@ -435,15 +435,18 @@ bool StorageMergeTree::rewriteUpsertParts(const DataPartsVector & sources, const
         const auto & retired_sources = retire_sources ? sources : DataPartsVector{};
         auto read_snapshot = prepareUpsertReadSnapshot(
             prepared.snapshot, prepared.produces_part ? temporary->part : nullptr, retired_sources, lock);
+        bool persist_started = false;
+        auto persist = [&]
+        {
+            persist_started = true;
+            upsert_store->append(prepared);
+        };
         try
         {
             if (prepared.produces_part)
-                commitUpsertPart(temporary->part, [&]
-                {
-                    upsert_store->append(prepared);
-                }, lock);
+                commitUpsertPart(temporary->part, persist, lock);
             else
-                upsert_store->append(prepared);
+                persist();
             removePartsFromWorkingSet(nullptr, retired_sources, true, lock);
             upsert_store->publish(prepared);
             publishUpsertReadSnapshot(std::move(read_snapshot));
@@ -461,7 +464,8 @@ bool StorageMergeTree::rewriteUpsertParts(const DataPartsVector & sources, const
         }
         catch (...)
         {
-            upsert_fenced = true;
+            if (persist_started)
+                upsert_fenced = true;
             throw;
         }
     };

@@ -382,11 +382,12 @@ StateStore::Prepared StateStore::prepareTruncate()
 
 StateStore::Prepared StateStore::preparePartition(
     std::vector<PartCommit> additions, const std::vector<ValidatedPartRows> & rows,
-    const std::vector<String> & removed, const std::vector<String> & reset_partitions, const std::vector<String> & detached)
+    const std::vector<String> & removed, const std::vector<String> & reset_partitions, const std::vector<String> & detached,
+    const std::vector<String> & cleared_partitions)
 {
     if (!disk)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Legacy UpsertMergeTree does not authorize partition operations");
-    return disk->preparePartition(std::move(additions), rows, removed, reset_partitions, detached);
+    return disk->preparePartition(std::move(additions), rows, removed, reset_partitions, detached, cleared_partitions);
 }
 
 PartRows StateStore::loadPartRows(const String & name) const

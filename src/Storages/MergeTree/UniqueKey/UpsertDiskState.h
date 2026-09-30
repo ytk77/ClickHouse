@@ -25,7 +25,8 @@ public:
     StateStore::Prepared prepareTruncate();
     StateStore::Prepared preparePartition(
         std::vector<PartCommit> additions, const std::vector<ValidatedPartRows> & rows,
-        const std::vector<String> & removed, const std::vector<String> & reset_partitions, const std::vector<String> & detached);
+        const std::vector<String> & removed, const std::vector<String> & reset_partitions, const std::vector<String> & detached,
+        const std::vector<String> & cleared_partitions);
     PartRows loadPartRows(const String & name) const;
     void pruneRetired();
     void append(const StateStore::Prepared & prepared);

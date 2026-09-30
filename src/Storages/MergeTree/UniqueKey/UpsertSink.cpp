@@ -50,6 +50,8 @@ namespace DB::FailPoints
 {
 extern const char upsert_throw_after_rename[];
 extern const char upsert_throw_before_publish[];
+extern const char upsert_throw_during_part_precommit[];
+extern const char upsert_throw_before_part_persist[];
 extern const char upsert_pause_first_preparation[];
 extern const char upsert_pause_ready_preparation[];
 extern const char upsert_throw_during_preparation[];
@@ -393,21 +395,25 @@ bool StorageMergeTree::commitUpsertBlock(Upsert::PreparedInsert & input)
         return false;
     /// Allocate the complete next read version before any ambiguous durable operation.
     auto read_snapshot = prepareUpsertReadSnapshot(prepared.snapshot, prepared.produces_part ? part : nullptr, {}, lock);
+    bool persist_started = false;
+    auto persist = [&]
+    {
+        persist_started = true;
+        upsert_store->append(prepared);
+    };
     try
     {
         if (prepared.produces_part)
-            commitUpsertPart(part, [&]()
-            {
-                upsert_store->append(prepared);
-            }, lock);
+            commitUpsertPart(part, persist, lock);
         else
-            upsert_store->append(prepared);
+            persist();
         upsert_store->publish(prepared);
         publishUpsertReadSnapshot(std::move(read_snapshot));
     }
     catch (...)
     {
-        upsert_fenced = true;
+        if (persist_started)
+            upsert_fenced = true;
         throw;
     }
     return true;
@@ -421,16 +427,29 @@ void MergeTreeData::commitUpsertPart(MutableDataPartPtr & part, const std::funct
 void MergeTreeData::commitUpsertParts(const MutableDataPartsVector & parts, const std::function<void()> & persist, DataPartsLock & lock)
 {
     Transaction transaction(*this, nullptr);
+    bool persist_started = false;
+    size_t precommitted = 0;
     try
     {
         /// Allocate index nodes, transaction bookkeeping and column counters before authorization.
         for (auto part : parts)
         {
+            if (precommitted)
+                fiu_do_on(FailPoints::upsert_throw_during_part_precommit,
+                {
+                    throw Exception(ErrorCodes::FAULT_INJECTED, "Injected UpsertMergeTree precommit failure");
+                });
             if (!renameTempPartAndAdd(part, transaction, lock, true))
                 throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree part could not be prepared");
             part->assertHasVersionMetadata(nullptr);
             addPartContributionToColumnAndSecondaryIndexSizes(part);
+            ++precommitted;
         }
+        fiu_do_on(FailPoints::upsert_throw_before_part_persist,
+        {
+            throw Exception(ErrorCodes::FAULT_INJECTED, "Injected UpsertMergeTree failure before persistence");
+        });
+        persist_started = true;
         persist();
         transaction.renameParts();
         Upsert::syncDirectory(std::filesystem::path(getDisks().front()->getPath()) / getRelativeDataPath());
@@ -452,6 +471,29 @@ void MergeTreeData::commitUpsertParts(const MutableDataPartsVector & parts, cons
     }
     catch (...)
     {
+        if (!persist_started)
+        {
+            try
+            {
+                transaction.rollback(&lock);
+                /// Registration can fail before transaction bookkeeping takes ownership.
+                /// Incomplete rollback must still require recovery, even without a durable write.
+                for (const auto & part : parts)
+                    if (part->getState() == DataPartState::PreActive)
+                        throw Exception(ErrorCodes::LOGICAL_ERROR, "Incomplete UpsertMergeTree precommit rollback for {}", part->name);
+                /// Discard possibly partial accounting; lazy calculation uses only active parts.
+                std::unique_lock sizes_lock(columns_and_secondary_indices_sizes_mutex);
+                are_columns_and_secondary_indices_sizes_calculated = false;
+                primary_index_size = {};
+            }
+            catch (...)
+            {
+                transaction.clear();
+                upsert_fenced = true;
+                throw;
+            }
+            throw;
+        }
         /// Neither rollback nor temporary-part destruction may remove ambiguously committed payloads.
         transaction.clear();
         for (const auto & part : parts)

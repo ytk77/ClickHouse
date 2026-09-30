@@ -255,8 +255,12 @@ Pipe StorageMergeTree::alterPartition(
         auto schema_lock = target.tryLockTimed(target.upsert_schema_lock, RWLockImpl::Write,
             query_context->getCurrentQueryId(), settings[Setting::lock_acquire_timeout]);
         std::lock_guard ttl_lock(target.upsert_ttl_mutex);
-        const auto reset = !removal_snapshot || target.getUpsertReadSnapshotForQuery() == removal_snapshot
-            ? partitions : std::vector<String>{};
+        std::vector<String> reset;
+        const auto current_snapshot = target.getUpsertReadSnapshotForQuery();
+        for (const auto & partition : partitions)
+            if (!removal_snapshot || current_snapshot->visibility->getPartitionCSN(partition)
+                == removal_snapshot->visibility->getPartitionCSN(partition))
+                reset.push_back(partition);
         std::vector<std::unique_ptr<PlainCommittingBlockHolder>> block_holders;
         auto lock = target.lockParts();
         if (target.upsert_fenced)
@@ -269,7 +273,7 @@ Pipe StorageMergeTree::alterPartition(
         std::vector<String> removed_names;
         for (const auto & part : removed)
             removed_names.push_back(part->name);
-        auto prepared = target.upsert_store->preparePartition(std::move(imported.records), imported.rows, removed_names, reset, detached);
+        auto prepared = target.upsert_store->preparePartition(std::move(imported.records), imported.rows, removed_names, reset, detached, partitions);
         NameSet accepted;
         for (const auto & record : prepared.added_parts)
             accepted.insert(record.final_name);
@@ -278,6 +282,7 @@ Pipe StorageMergeTree::alterPartition(
             if (accepted.contains(temporary->part->name))
                 added.push_back(temporary->part);
         auto read_snapshot = target.prepareUpsertReadSnapshot(prepared.snapshot, nullptr, removed, lock, added);
+        bool persist_started = false;
         try
         {
             MutableDataPartsVector accepted_parts;
@@ -286,6 +291,7 @@ Pipe StorageMergeTree::alterPartition(
                     accepted_parts.push_back(temporary->part);
             target.commitUpsertParts(accepted_parts, [&]()
             {
+                persist_started = true;
                 target.upsert_store->append(prepared);
             }, lock);
             target.removePartsFromWorkingSet(nullptr, removed, true, lock);
@@ -295,6 +301,8 @@ Pipe StorageMergeTree::alterPartition(
         }
         catch (...)
         {
+            if (!persist_started && !target.upsert_fenced)
+                throw;
             for (auto & temporary : imported.temporary)
                 if (accepted.contains(temporary->part->name))
                     temporary->part->is_temp = false;
@@ -392,6 +400,7 @@ Pipe StorageMergeTree::alterPartition(
             }
             if (command.detach)
                 FailPointInjection::pauseFailPoint(FailPoints::upsert_partition_pause_after_detach_clone);
+            FailPointInjection::pauseFailPoint(FailPoints::upsert_partition_pause_after_prepare);
             ImportParts empty;
             apply(*this, empty, parts, reset_partitions(*this, command, parts), {}, snapshot);
             continue;

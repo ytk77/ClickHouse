@@ -203,6 +203,18 @@ public:
         if (!cut)
             throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree could not pin its disk snapshot");
     }
+    UInt64 getPartitionCSN(const String & partition) const override
+    {
+        if (!cut)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree disk snapshot was read before commit");
+        const auto value = database->get(prefix('C', partition), cut);
+        if (!value)
+            return 0;
+        BinaryReader in{*value};
+        const auto csn = in.number();
+        in.end();
+        return csn;
+    }
     std::shared_ptr<const DeleteBitmap> getMask(const String & part) const override
     {
         if (!cut)
@@ -931,7 +943,8 @@ StateStore::Prepared DiskState::prepareTruncate()
 
 StateStore::Prepared DiskState::preparePartition(
     std::vector<PartCommit> additions, const std::vector<ValidatedPartRows> & rows,
-    const std::vector<String> & removed, const std::vector<String> & reset_partitions, const std::vector<String> & detached)
+    const std::vector<String> & removed, const std::vector<String> & reset_partitions, const std::vector<String> & detached,
+    const std::vector<String> & cleared_partitions)
 {
     if (additions.size() != rows.size())
         throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree partition import row count mismatch");
@@ -941,6 +954,7 @@ StateStore::Prepared DiskState::preparePartition(
     result.disk->previous_part_count = impl->part_count;
     auto & batch = result.disk->batch;
     const std::set<String> reset(reset_partitions.begin(), reset_partitions.end());
+    const std::set<String> cleared(cleared_partitions.begin(), cleared_partitions.end());
     std::set<ObjectID> retired_ids;
     std::set<String> retired_names;
     for (const auto & name : removed)
@@ -953,7 +967,7 @@ StateStore::Prepared DiskState::preparePartition(
             throw Exception(ErrorCodes::CORRUPTED_DATA, "Invalid UpsertMergeTree partition source authorization");
         retired_ids.insert(source.part);
         const auto partition = MergeTreePartInfo::fromPartName(name, MERGE_TREE_DATA_MIN_FORMAT_VERSION_WITH_CUSTOM_PARTITIONING).getPartitionId();
-        if (!reset.contains(partition))
+        if (!cleared.contains(partition))
         {
             const auto source_rows = loadPartRows(name);
             impl->database->forEachWinner(partition, source_rows, [&](const PartRow & row, const String & key, std::optional<std::string_view> winner)
@@ -991,8 +1005,7 @@ StateStore::Prepared DiskState::preparePartition(
         batch.Put("D" + name, "");
         checkBatchBudget(batch);
     }
-    auto retry_bytes = impl->database->integer("retry_bytes");
-    for (const auto & partition : reset)
+    for (const auto & partition : cleared)
     {
         const auto winner_prefix = prefix('W', partition);
         auto upper = winner_prefix;
@@ -1002,6 +1015,40 @@ StateStore::Prepared DiskState::preparePartition(
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Invalid UpsertMergeTree partition prefix");
         upper.back() = static_cast<char>(static_cast<unsigned char>(upper.back()) + 1);
         check(batch.DeleteRange(winner_prefix, upper));
+    }
+    /// A range tombstone removes old winners in constant space. Restore only winners
+    /// owned by parts that were committed after selection and remain active.
+    rocksdb::ReadOptions survivor_options;
+    survivor_options.fill_cache = false;
+    std::unique_ptr<rocksdb::Iterator> survivor(impl->database->db->NewIterator(survivor_options));
+    for (survivor->Seek("A"); !cleared.empty() && survivor->Valid() && survivor->key().starts_with("A"); survivor->Next())
+    {
+        const auto source = decodePartCommit(survivor->value().ToStringView());
+        if (retired_names.contains(source.final_name))
+            continue;
+        const auto partition = MergeTreePartInfo::fromPartName(
+            source.final_name, MERGE_TREE_DATA_MIN_FORMAT_VERSION_WITH_CUSTOM_PARTITIONING).getPartitionId();
+        if (!cleared.contains(partition))
+            continue;
+        const auto source_rows = loadPartRows(source.final_name);
+        impl->database->forEachWinner(partition, source_rows, [&](const PartRow & row, const String & key, std::optional<std::string_view> winner)
+        {
+            if (!winner)
+                return;
+            BinaryReader in{*winner};
+            const auto id = in.id();
+            const auto value = decodeIndexValue(in.string());
+            in.end();
+            if (id == source.part && value.row_offset == row.value.row_offset)
+                batch.Put(key, rocksdb::Slice(winner->data(), winner->size()));
+            checkBatchBudget(batch);
+            CurrentMemoryTracker::check();
+        });
+    }
+    check(survivor->status());
+    auto retry_bytes = impl->database->integer("retry_bytes");
+    for (const auto & partition : reset)
+    {
         batch.Delete(prefix('C', partition));
         const auto token_prefix = prefix('T', partition);
         rocksdb::ReadOptions options;
@@ -1216,7 +1263,7 @@ void DiskState::pruneRetired()
     std::unreachable();
 }
 StateStore::Prepared DiskState::preparePartition(std::vector<PartCommit>, const std::vector<ValidatedPartRows> &,
-    const std::vector<String> &, const std::vector<String> &, const std::vector<String> &)
+    const std::vector<String> &, const std::vector<String> &, const std::vector<String> &, const std::vector<String> &)
 {
     std::unreachable();
 }

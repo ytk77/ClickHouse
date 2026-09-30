@@ -338,6 +338,19 @@ def test_detached_recovery_name_collision():
         ), names
         node.query("ALTER TABLE name_collision ATTACH PARTITION 1")
         assert node.query("SELECT value FROM name_collision") == "one\n"
+        recovered = next(name for name in names if name.startswith("upsert_recovered_"))
+        assert recovered in node.query(
+            "SELECT name FROM system.detached_parts WHERE table='name_collision'"
+        )
+        node.query("ALTER TABLE name_collision DROP PARTITION 1")
+        files(
+            "import pathlib,sys; d=pathlib.Path(sys.argv[1])/'detached'; old=d/sys.argv[2]; target=d/sys.argv[2].split('_',3)[3]; assert not target.exists(); old.rename(target)",
+            path,
+            recovered,
+        )
+        node.query("ALTER TABLE name_collision ATTACH PARTITION 1")
+        node.restart_clickhouse(kill=True)
+        assert node.query("SELECT value FROM name_collision") == "one\n"
     finally:
         node.query(f"SYSTEM DISABLE FAILPOINT {point}")
         drop("name_collision")
@@ -632,3 +645,263 @@ def test_replace_preserves_concurrent_winners_and_tokens():
     finally:
         node.query(f"SYSTEM DISABLE FAILPOINT {point}")
         drop("replace_source", "replace_target")
+
+
+def test_large_partition_removal_with_concurrent_inserts():
+    # Encoded winner keys alone exceed the 128 MiB state batch budget.
+    for operation, same_partition in (
+        ("DROP", False),
+        ("DETACH", True),
+        ("REPLACE", True),
+    ):
+        for table in ("large_remove", "large_import"):
+            node.query(
+                f"CREATE TABLE {table} (p UInt8,id String,ver UInt64,value String) ENGINE=UpsertMergeTree(ver) PARTITION BY p ORDER BY id UNIQUE KEY id"
+            )
+        point = "upsert_partition_pause_after_prepare"
+        seed_settings = {"insert_deduplication_token": "old-seed"}
+        concurrent_settings = {"insert_deduplication_token": "new-seed"}
+        try:
+            node.query(
+                "INSERT INTO large_remove VALUES (1,'seed',1,'old')",
+                settings=seed_settings,
+            )
+            node.query(
+                "INSERT INTO large_remove SELECT 1,concat(repeat('k',200),toString(number)),1,'old' FROM numbers(800000)",
+                timeout=240,
+            )
+            node.query("INSERT INTO large_import VALUES (1,'replacement',1,'imported')")
+            sql = "ALTER TABLE large_remove " + (
+                "REPLACE PARTITION 1 FROM large_import"
+                if operation == "REPLACE"
+                else f"{operation} PARTITION 1"
+            )
+            node.query(f"SYSTEM ENABLE FAILPOINT {point}")
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                removal = pool.submit(node.query, sql, timeout=240)
+                try:
+                    node.query(f"SYSTEM WAIT FAILPOINT {point} PAUSE", timeout=60)
+                    partition = 1 if same_partition else 2
+                    node.query(
+                        f"INSERT INTO large_remove VALUES ({partition},'concurrent',2,'new')",
+                        settings=concurrent_settings,
+                        timeout=10,
+                    )
+                    if same_partition:
+                        node.query(
+                            "INSERT INTO large_remove SELECT 1,concat(repeat('k',200),'0'),2,'new-winner'",
+                            timeout=10,
+                        )
+                finally:
+                    node.query(f"SYSTEM DISABLE FAILPOINT {point}")
+                removal.result(timeout=240)
+            assert node.query("SELECT count() FROM large_remove WHERE p=1") == (
+                "3\n" if operation == "REPLACE" else "2\n" if same_partition else "0\n"
+            )
+            if same_partition:
+                assert (
+                    node.query(
+                        "SELECT value FROM large_remove WHERE id=concat(repeat('k',200),'0')"
+                    )
+                    == "new-winner\n"
+                )
+            node.query(
+                "INSERT INTO large_remove VALUES (1,'seed',1,'old')",
+                settings=seed_settings,
+            )
+            assert node.query("SELECT count() FROM large_remove WHERE id='seed'") == (
+                "0\n" if same_partition else "1\n"
+            )
+            node.query("DELETE FROM large_remove WHERE id='concurrent'")
+            node.query(
+                f"INSERT INTO large_remove VALUES ({partition},'concurrent',2,'new')",
+                settings=concurrent_settings,
+            )
+            assert (
+                node.query("SELECT count() FROM large_remove WHERE id='concurrent'")
+                == "0\n"
+            )
+            node.restart_clickhouse(kill=True)
+            assert node.query("SELECT count() FROM large_remove WHERE value='old'") == (
+                "0\n" if same_partition else "1\n"
+            )
+        finally:
+            node.query(f"SYSTEM DISABLE FAILPOINT {point}")
+            drop("large_remove", "large_import")
+
+
+def test_partition_precommit_failure_leaves_table_usable():
+    create_partitioned("precommit_source")
+    create_partitioned("precommit_target")
+    try:
+        for start in (0, 10000):
+            node.query(
+                f"INSERT INTO precommit_source SELECT 1,number,1,concat(toString(number),repeat('x',2000)) FROM numbers({start},10000)"
+            )
+        node.query("INSERT INTO precommit_target VALUES (1,99999,1,'sentinel')")
+        for point in (
+            "upsert_throw_during_part_precommit",
+            "upsert_throw_before_part_persist",
+        ):
+            node.query(f"SYSTEM ENABLE FAILPOINT {point}")
+            try:
+                assert "FAULT_INJECTED" in node.query_and_get_error(
+                    "ALTER TABLE precommit_target REPLACE PARTITION 1 FROM precommit_source"
+                )
+            finally:
+                node.query(f"SYSTEM DISABLE FAILPOINT {point}")
+            assert node.query("SELECT value FROM precommit_target") == "sentinel\n"
+            assert node.query("SELECT count() FROM precommit_source") == "20000\n"
+            assert (
+                node.query(
+                    "SELECT count() FROM system.parts WHERE table='precommit_target' AND active"
+                )
+                == "1\n"
+            )
+            node.query("INSERT INTO precommit_target VALUES (2,1,1,'usable')")
+            node.query("ALTER TABLE precommit_target DROP PARTITION 2")
+        node.query(
+            "ALTER TABLE precommit_target REPLACE PARTITION 1 FROM precommit_source"
+        )
+        node.restart_clickhouse(kill=True)
+        assert node.query("SELECT count() FROM precommit_target") == "20000\n"
+    finally:
+        drop("precommit_source", "precommit_target")
+
+
+def test_insert_precommit_failure_preserves_retry():
+    create_partitioned("precommit_insert")
+    point = "upsert_throw_before_part_persist"
+    settings = {"insert_deduplication_token": "precommit-token"}
+    try:
+        node.query(f"SYSTEM ENABLE FAILPOINT {point}")
+        try:
+            assert "FAULT_INJECTED" in node.query_and_get_error(
+                "INSERT INTO precommit_insert VALUES (1,1,1,'one')", settings=settings
+            )
+        finally:
+            node.query(f"SYSTEM DISABLE FAILPOINT {point}")
+        assert node.query("SELECT count() FROM precommit_insert") == "0\n"
+        node.query(
+            "INSERT INTO precommit_insert VALUES (1,1,1,'one')", settings=settings
+        )
+        node.restart_clickhouse(kill=True)
+        assert node.query("SELECT value FROM precommit_insert") == "one\n"
+    finally:
+        drop("precommit_insert")
+
+
+def test_replace_unversioned_import_wins_same_key():
+    create_partitioned("replace_plain_source", versioned=False)
+    create_partitioned("replace_plain_target", versioned=False)
+    node.query("INSERT INTO replace_plain_source VALUES (1,1,1,'imported')")
+    node.query("INSERT INTO replace_plain_target VALUES (1,1,1,'old')")
+    point = "upsert_partition_pause_after_prepare"
+    try:
+        node.query(f"SYSTEM ENABLE FAILPOINT {point}")
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            replacing = pool.submit(
+                node.query,
+                "ALTER TABLE replace_plain_target REPLACE PARTITION 1 FROM replace_plain_source",
+            )
+            try:
+                node.query(f"SYSTEM WAIT FAILPOINT {point} PAUSE")
+                node.query(
+                    "INSERT INTO replace_plain_target VALUES (1,1,2,'concurrent'),(1,2,1,'untouched')",
+                    timeout=10,
+                )
+            finally:
+                node.query(f"SYSTEM DISABLE FAILPOINT {point}")
+            replacing.result(timeout=30)
+        node.restart_clickhouse(kill=True)
+        assert (
+            node.query("SELECT id,value FROM replace_plain_target ORDER BY id")
+            == "1\timported\n2\tuntouched\n"
+        )
+    finally:
+        node.query(f"SYSTEM DISABLE FAILPOINT {point}")
+        drop("replace_plain_source", "replace_plain_target")
+
+
+def test_partition_survivor_budget_failure_is_atomic():
+    node.query(
+        "CREATE TABLE survivor_budget (p UInt8,id String,value UInt64) ENGINE=UpsertMergeTree PARTITION BY p ORDER BY id UNIQUE KEY id"
+    )
+    node.query("INSERT INTO survivor_budget VALUES (1,'old',0)")
+    point = "upsert_partition_pause_after_prepare"
+    try:
+        node.query(f"SYSTEM ENABLE FAILPOINT {point}")
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            removal = pool.submit(
+                node.query_and_get_error,
+                "ALTER TABLE survivor_budget DROP PARTITION 1",
+                timeout=240,
+            )
+            try:
+                node.query(f"SYSTEM WAIT FAILPOINT {point} PAUSE")
+                node.query(
+                    "INSERT INTO survivor_budget SELECT 1,concat(repeat('k',200),toString(number)),number FROM numbers(800000)",
+                    timeout=240,
+                )
+            finally:
+                node.query(f"SYSTEM DISABLE FAILPOINT {point}")
+            assert "LIMIT_EXCEEDED" in removal.result(timeout=240)
+        assert node.query("SELECT count() FROM survivor_budget") == "800001\n"
+        assert node.query("SELECT value FROM survivor_budget WHERE id='old'") == "0\n"
+        node.query("INSERT INTO survivor_budget VALUES (2,'usable',1)")
+        node.restart_clickhouse(kill=True)
+        assert node.query("SELECT count() FROM survivor_budget") == "800002\n"
+        node.query("ALTER TABLE survivor_budget DROP PARTITION 1")
+        assert node.query("SELECT id FROM survivor_budget") == "usable\n"
+    finally:
+        node.query(f"SYSTEM DISABLE FAILPOINT {point}")
+        drop("survivor_budget")
+
+
+def test_partition_range_removal_recovers_survivors():
+    for replace in (False, True):
+        create_partitioned("range_recover")
+        create_partitioned("range_import")
+        node.query("INSERT INTO range_recover VALUES (1,1,1,'old'),(1,2,1,'removed')")
+        node.query(
+            "INSERT INTO range_import VALUES (1,1,1,'imported-old'),(1,4,1,'imported')"
+        )
+        prepare = "upsert_partition_pause_after_prepare"
+        durable = "upsert_pause_after_state_sync"
+        try:
+            node.query(f"SYSTEM ENABLE FAILPOINT {prepare}")
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                command = (
+                    "REPLACE PARTITION 1 FROM range_import"
+                    if replace
+                    else "DROP PARTITION 1"
+                )
+                removal = pool.submit(
+                    node.query, "ALTER TABLE range_recover " + command
+                )
+                try:
+                    node.query(f"SYSTEM WAIT FAILPOINT {prepare} PAUSE")
+                    node.query(
+                        "INSERT INTO range_recover VALUES (1,1,2,'new-winner'),(1,3,1,'survivor')"
+                    )
+                    node.query(f"SYSTEM ENABLE FAILPOINT {durable}")
+                    node.query(f"SYSTEM DISABLE FAILPOINT {prepare}")
+                    node.query(f"SYSTEM WAIT FAILPOINT {durable} PAUSE")
+                    node.restart_clickhouse(kill=True)
+                    with pytest.raises(Exception):
+                        removal.result(timeout=30)
+                finally:
+                    node.query(f"SYSTEM DISABLE FAILPOINT {prepare}")
+                    node.query(f"SYSTEM DISABLE FAILPOINT {durable}")
+            expected = "1\tnew-winner\n3\tsurvivor\n" + (
+                "4\timported\n" if replace else ""
+            )
+            assert (
+                node.query("SELECT id,value FROM range_recover ORDER BY id") == expected
+            )
+            node.query("INSERT INTO range_recover VALUES (1,2,1,'reinsert')")
+            assert (
+                node.query("SELECT value FROM range_recover WHERE id=2") == "reinsert\n"
+            )
+        finally:
+            drop("range_recover", "range_import")
