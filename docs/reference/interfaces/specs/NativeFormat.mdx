@@ -16,6 +16,8 @@ The Native format is the columnar wire format ClickHouse uses to move tabular da
 
 This page describes the bytes inside a Block — the columnar payload — and the per-column type encodings that build it. Packet framing, connection state, and version negotiation belong to the [native protocol specification](/reference/interfaces/specs/NativeProtocol).
 
+Insert scheduling does not change the `Native` block encoding. For a destination requiring synchronous execution, such as `UpsertMergeTree`, the server processes received blocks synchronously even if the client enables `async_insert`. It consumes the input terminator once and completes the write before sending success, including when `wait_for_async_insert=0`; no additional client settings or block fields are required.
+
 All multi-byte integer fields are little-endian. Signed integers use two's complement.
 
 <Tip>

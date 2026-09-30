@@ -1408,6 +1408,8 @@ AsynchronousInsertQueue::PushResult TCPHandler::processAsyncInsertQuery(QuerySta
 void TCPHandler::processInsertQuery(QueryState & state)
 {
     size_t num_threads = state.io.pipeline.getNumThreads();
+    bool input_started = false;
+    bool input_finished = false;
 
     auto run_executor = [&](auto & executor, Block processed_data)
     {
@@ -1418,12 +1420,12 @@ void TCPHandler::processInsertQuery(QueryState & state)
             /// client receive exception before sending data.
             executor.start();
 
-            if (!processed_data.empty())
+            if (processed_data.rows())
                 executor.push(std::move(processed_data));
-            else
+            if (!input_started)
                 startInsertQuery(state);
 
-            while (receivePacketsExpectDataConcurrentWithExecutor(state))
+            while (!input_finished && receivePacketsExpectDataConcurrentWithExecutor(state))
             {
                 executor.push(std::move(state.block_for_insert));
 
@@ -1454,6 +1456,7 @@ void TCPHandler::processInsertQuery(QueryState & state)
 
     if (insert_queue && async_insert_enabled && !insert_query.select)
     {
+        input_started = true;
         auto result = processAsyncInsertQuery(state, *insert_queue);
         if (result.status == AsynchronousInsertQueue::PushResult::OK)
         {
@@ -1493,6 +1496,12 @@ void TCPHandler::processInsertQuery(QueryState & state)
         {
             LOG_DEBUG(log, "Setting async_insert=1, but INSERT query will be executed synchronously because it has too much data");
             processed_block = std::move(result.insert_block);
+        }
+        else if (result.status == AsynchronousInsertQueue::PushResult::SYNCHRONOUS)
+        {
+            LOG_DEBUG(log, "INSERT query will be executed synchronously because a destination uses UpsertMergeTree");
+            processed_block = std::move(result.insert_block);
+            input_finished = true;
         }
     }
 

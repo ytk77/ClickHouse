@@ -19,9 +19,10 @@ which remains supported for existing v7 tables. Its fixed capacity limits do not
 
 ## Initial SQL definition {#initial-sql-definition}
 
-```sql
-SET allow_experimental_unique_key = 1;
+`CREATE TABLE` with `UpsertMergeTree` does not require `allow_experimental_unique_key`.
+The `UNIQUE KEY` clause is required and validated by the engine, including when the setting is disabled.
 
+```sql
 CREATE TABLE player_state
 (
     tenant_id UInt64,
@@ -38,7 +39,14 @@ UNIQUE KEY (tenant_id, player_id);
 The optional engine argument names one stored, non-null `UInt64`, `DateTime`, or `DateTime64` version column.
 Omitting it selects the commit-order winner contract. Higher versions win; equal versions use
 later commit order, then the original row position within the input block. Each insert supplies
-a complete replacement row. Use `SET async_insert = 0` for this engine.
+a complete replacement row. Inserts execute synchronously automatically, including when the
+session or user profile enables `async_insert`. Existing `INSERT` and `INSERT SELECT` statements
+do not need an additional `SETTINGS` clause. Success is returned after the engine completes its
+durable commit, even with `wait_for_async_insert = 0`. This also applies to inserts through
+`Alias` tables and cascading materialized views whose destination is `UpsertMergeTree`.
+
+`join_use_nulls` retains its ordinary query meaning. The engine requires neither a particular
+value nor an explicit setting for `SELECT` or `INSERT SELECT`.
 
 Time versions compare the stored instant, independently of the display timezone. `DateTime` has
 second precision; `DateTime64` retains the column's declared precision from zero to nine fractional
@@ -70,10 +78,62 @@ record. The record is synchronized before part rename, directory synchronization
 The table manifest must exist during attachment and must match the schema and disk.
 An existing data directory cannot be imported as a new `UpsertMergeTree` table.
 
-`ALTER` other than `MODIFY TTL` and `REMOVE TTL`, `TRUNCATE`, mutations, partition operations, projections, sampling definitions,
+`TRUNCATE`, partition operations other than the mutation partition filters described below, projections, sampling definitions,
 streaming, backup, restore, `CHECK TABLE`, background moves, and incremental materialized views are gated.
 The `_upsert_` prefix is reserved; the input-only delete flag is not connected yet.
-General `DELETE WHERE` and partial-column updates are not part of the initial contract.
+Partial-column updates remain unsupported; replace a row by inserting a new version.
+
+
+## Deletes, columns and indexes {#upsert-delete-columns-indexes}
+
+Tables using `disk_state_v2` support the usual `MergeTree` syntax:
+
+```sql
+DELETE FROM current_state WHERE id = 42;
+ALTER TABLE current_state DELETE WHERE id = 43;
+ALTER TABLE current_state ADD COLUMN category String DEFAULT 'unknown';
+ALTER TABLE current_state ADD INDEX category_idx category TYPE bloom_filter GRANULARITY 1;
+ALTER TABLE current_state MATERIALIZE INDEX category_idx;
+ALTER TABLE current_state DROP INDEX category_idx;
+ALTER TABLE current_state DROP COLUMN category;
+```
+
+`DELETE` and `MATERIALIZE INDEX` also accept `IN PARTITION`. Deletes evaluate the predicate
+against visible winners, and durably remove matching winners before returning. A concurrent insert
+that replaces a selected row is preserved. As with expiration, deletion removes the version floor;
+a later insert with a lower version can create the key again. Completed part operations survive
+restart. A query affecting several rewrite units can complete some units before an exception or interruption;
+the whole query is not an atomic transaction. Execution is synchronous even when
+`lightweight_deletes_sync` or `mutations_sync` is zero.
+
+Column and index changes use local `Atomic` or `Ordinary` database metadata. Standard column
+defaults, `MATERIALIZED` and `ALIAS` expressions, placement clauses and conditional
+`IF EXISTS` / `IF NOT EXISTS` clauses use the existing `MergeTree` validation rules.
+Key columns, the version column and required expression dependencies cannot be dropped.
+`ADD COLUMN` reads defaults for older parts. `DROP COLUMN` rewrites affected parts through the
+engine's durable replacement protocol; reusing the name does not restore the dropped values,
+including after interruption and restart. Schema publication waits for active insert pipelines.
+Cleanup runs before acquiring and after releasing the schema write lock, so inserts can proceed
+while obsolete payloads are rewritten. Cleanup only rewrites parts containing removed columns
+or index payloads; adding a new index does not rewrite healthy existing parts.
+When one statement drops and re-adds the same name, removal is committed before the new
+definition; an interruption can leave the removal committed.
+
+`ADD INDEX` applies to newly written parts; use `MATERIALIZE INDEX` to build indexes for existing
+parts. Index removal and materialization replace authenticated parts without modifying their
+files in place. These operations may read and rewrite existing data, so their cost depends on
+table size. Rewrites stream output into units targeting 32 MiB and also bound row count,
+lineage and pending state. A source part can produce several output parts, including when added
+column defaults expand its data. An indivisible wide row can exceed the byte target and remains
+subject to the query memory limit. Each unit durably relocates winners and masks their source
+positions together. Sources remain readable until the final unit retires them; interruption can
+leave completed units committed within a source part. The disk-state format is unchanged.
+
+The first column or index alteration upgrades an older disk-state manifest to
+`schema_policy=metadata_v1`. SQL metadata then owns mutable column and index definitions,
+while the manifest continues to bind the disk, keys, version type and table incarnation.
+Older binaries reject this manifest. The legacy `parts_sync_v1` protocol does not support these
+operations.
 
 ## Row expiration {#upsert-row-expiration}
 
@@ -141,7 +201,7 @@ upgraded manifest, so a downgrade requires a compatible binary. Editing metadata
 
 `parts_sync_v1` tables and replicated database metadata are not supported by these alterations.
 `MATERIALIZE TTL`, column expiration, `TO DISK`, `TO VOLUME`, `RECOMPRESS`, `GROUP BY` and
-`ttl_only_drop_parts=1` remain unsupported. Other schema alterations remain gated.
+`ttl_only_drop_parts=1` remain unsupported. `ADD/DROP COLUMN` and `ADD/DROP INDEX` are supported as described above. Other schema alterations remain gated.
 
 ## Row metadata version 1 {#row-metadata-version-1}
 

@@ -4842,15 +4842,22 @@ void MergeTreeData::checkAlterIsPossible(const AlterCommands & commands, Context
     if (merging_params.upsert)
     {
         for (const auto & command : commands)
-            if (command.type != AlterCommand::MODIFY_TTL && command.type != AlterCommand::REMOVE_TTL)
-                throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree supports only MODIFY TTL and REMOVE TTL alters");
+        {
+            if ((command.type != AlterCommand::MODIFY_TTL && command.type != AlterCommand::REMOVE_TTL
+                && command.type != AlterCommand::ADD_COLUMN && command.type != AlterCommand::DROP_COLUMN
+                && command.type != AlterCommand::ADD_INDEX && command.type != AlterCommand::DROP_INDEX)
+                || command.clear || command.partition)
+                throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
+                    "UpsertMergeTree supports ADD/DROP COLUMN, ADD/DROP INDEX, MODIFY TTL and REMOVE TTL alters");
+            if (command.type == AlterCommand::DROP_COLUMN && command.column_name == merging_params.upsert_version_column)
+                throw Exception(ErrorCodes::ALTER_OF_COLUMN_IS_FORBIDDEN, "Cannot drop the UpsertMergeTree version column");
+        }
         const auto old_metadata = getInMemoryMetadataPtr(local_context, false);
         auto new_metadata = *old_metadata;
         auto settings = *getSettings();
         commands.apply(new_metadata, local_context, settings[MergeTreeSetting::share_nested_offsets]);
         validateUpsertMergeTreeMetadata(new_metadata, merging_params.upsert_version_column, settings);
         checkTTLExpressions(new_metadata, *old_metadata);
-        return;
     }
 
     /// Reject schema-changing ALTER while a streaming query holds a subscription on this storage.
@@ -4940,7 +4947,7 @@ void MergeTreeData::checkAlterIsPossible(const AlterCommands & commands, Context
             /// clears an expression, and a column ALTER with no TTL clause leaves
             /// `command.ttl` null.
             /// TODO(unique-key): support TTL on UNIQUE KEY tables (lands with PR-14 merges).
-            if (command.type == AlterCommand::MODIFY_TTL)
+            if (command.type == AlterCommand::MODIFY_TTL && !merging_params.upsert)
                 throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
                     "MODIFY TTL is not supported on tables with UNIQUE KEY");
             if ((command.type == AlterCommand::ADD_COLUMN || command.type == AlterCommand::MODIFY_COLUMN)
@@ -5669,6 +5676,14 @@ static bool hasTextIndexMaterialization(const MutationCommands & commands, Stora
 
 void MergeTreeData::checkMutationIsPossible(const MutationCommands & commands, const Settings & /*settings*/) const
 {
+    if (merging_params.upsert)
+    {
+        for (const auto & command : commands)
+            if (command.type != MutationCommand::DELETE && command.type != MutationCommand::MATERIALIZE_INDEX)
+                throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree supports only DELETE and MATERIALIZE INDEX mutations");
+        return;
+    }
+
     for (const auto & disk : getDisks())
         if (!disk->supportsHardLinks())
             throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "Mutations are not supported for immutable disk '{}'", disk->getName());

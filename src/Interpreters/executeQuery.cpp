@@ -1746,7 +1746,10 @@ static BlockIO executeQueryImpl(
 
             /// Invoke HTTP 100-Continue callback after async insert quota checks are completed
             if (http_continue_callback && !internal)
+            {
                 http_continue_callback();
+                http_continue_callback = {};
+            }
 
             auto result = queue->pushQueryWithInlinedData(out_ast, context);
 
@@ -1770,6 +1773,11 @@ static BlockIO executeQueryImpl(
                 const auto & table_id = insert_query->table_id;
                 if (!table_id.empty())
                     context->setInsertionTable(table_id);
+            }
+            else if (result.status == AsynchronousInsertQueue::PushResult::SYNCHRONOUS)
+            {
+                async_insert = false;
+                LOG_DEBUG(logger, "INSERT query will be executed synchronously because a destination uses UpsertMergeTree");
             }
             else if (result.status == AsynchronousInsertQueue::PushResult::TOO_MUCH_DATA)
             {

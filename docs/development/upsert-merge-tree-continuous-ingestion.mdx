@@ -83,7 +83,7 @@ INSERT（保留原始 token、unit 與 row identity）
 
 初期可先完成 v7.1 的不可變 segment 正確性，再以嚴格的檔案數與 bytes 預算限制它；在 production gate 前完成 segment 聚合、輪替及回收。不得將 segment 爆量問題留給營運人員。
 
-維持 payload／目錄持久化先於 terminal commit 的順序。`group_commit` 可以共享同步成本，但必須保留每個原始重試單元及其結果，不能因重新分塊破壞 idempotency。只有資料和決策已達到宣告的持久性、且可見狀態已公布後才回覆成功。現行 `async_insert` 相容性仍未完成；此提案不是要求直接打開該設定。
+維持 payload／目錄持久化先於 terminal commit 的順序。`group_commit` 可以共享同步成本，但必須保留每個原始重試單元及其結果，不能因重新分塊破壞 idempotency。只有資料和決策已達到宣告的持久性、且可見狀態已公布後才回覆成功。現行寫入入口已接受連線的 `async_insert=1`，並自動同步執行 `UpsertMergeTree` 寫入；即使 `wait_for_async_insert=0` 也會等持久化完成。此處提議的引擎內部批次處理仍需另外實作。
 
 ## 唯一鍵索引：容量不綁定完整常駐記憶體 {#disk-backed-key-index}
 

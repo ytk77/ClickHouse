@@ -271,6 +271,8 @@ MergeTreeDataPartChecksum ttlPolicyChecksum(const StorageInMemoryMetadata & meta
     WriteBufferFromOwnString out;
     HashingWriteBuffer hashing(out);
     hashing.write(policy.data(), policy.size());
+    hashing.finalize();
+    out.finalize();
     return {policy.size(), hashing.getHash()};
 }
 

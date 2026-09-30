@@ -760,8 +760,9 @@ static StoragePtr create(const StorageFactory::Arguments & args)
 
         if (args.storage_def->unique_key)
         {
-            /// Gate on CREATE only; ATTACH must load existing metadata regardless of session setting.
-            if (args.mode <= LoadingStrictnessLevel::CREATE
+            /// `UpsertMergeTree` requires `UNIQUE KEY` as part of its ordinary table definition.
+            /// Gate other engines on `CREATE` only; `ATTACH` must load existing metadata regardless of the session setting.
+            if (!merging_params.upsert && args.mode <= LoadingStrictnessLevel::CREATE
                 && !local_settings[Setting::allow_experimental_unique_key])
             {
                 throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,

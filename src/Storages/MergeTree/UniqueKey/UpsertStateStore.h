@@ -89,9 +89,17 @@ public:
     UInt64 authorizedPartCount() const;
     Prepared prepare(const String & partition, PartCommit part, const PartRows & rows);
     Prepared prepare(const String & partition, PartCommit part, const ValidatedPartRows & rows);
+    /// Immutable lineage loaded by `loadPartRows` while the sources are pinned and serialized against retirement.
+    /// Intermediate commits use the selected offsets; final retirement checks every source row.
+    struct MergeInput
+    {
+        SnapshotPtr snapshot;
+        const std::vector<PartRows> & lineage;
+        const std::vector<std::vector<UInt32>> & offsets;
+    };
     Prepared prepareMerge(
         const String & partition, PartCommit part, const PartRows & rows, const std::vector<String> & sources,
-        const PartRows & expired = {});
+        const PartRows & expired = {}, bool retire_sources = true, const MergeInput * input = nullptr);
     PartRows loadPartRows(const String & name) const;
     void pruneRetired();
     void append(const Prepared & prepared);

@@ -8351,7 +8351,8 @@ write path that constructs the probe is wired up. Declared now so the lever ship
 implementation.
 )", EXPERIMENTAL) \
     DECLARE(Bool, allow_experimental_unique_key, false, R"(
-Allows creation of tables with the `UNIQUE KEY` clause on MergeTree-family engines.
+Allows creation of tables with the `UNIQUE KEY` clause on `MergeTree`-family engines other than `UpsertMergeTree`.
+`UpsertMergeTree` supports `UNIQUE KEY` without enabling this setting.
 )", EXPERIMENTAL) \
     DECLARE(Bool, allow_experimental_codecs, false, R"(
 If it is set to true, allow to specify experimental compression codecs (but we don't have those yet and this option does nothing).

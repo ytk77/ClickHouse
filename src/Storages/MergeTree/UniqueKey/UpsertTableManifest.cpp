@@ -22,8 +22,10 @@ namespace
 const String legacy_prefix = "UpsertMergeTree\nrow_metadata=1\nkey_encoding=1\ncommit_protocol=parts_sync_v1\n";
 const String disk_prefix = "UpsertMergeTree\nrow_metadata=1\nkey_encoding=1\ncommit_protocol=disk_state_v2\n";
 const String mutable_ttl_prefix = disk_prefix + "ttl_policy=metadata_v1\n";
+const String mutable_schema_prefix = mutable_ttl_prefix + "schema_policy=metadata_v1\n";
 
-String schemaFingerprint(const String & disk_name, const StorageInMemoryMetadata & metadata, const String & version_column, bool include_ttl)
+String schemaFingerprint(const String & disk_name, const StorageInMemoryMetadata & metadata, const String & version_column,
+    bool include_ttl, bool include_columns = true)
 {
     String schema;
     /// Length delimiters make the fingerprint independent of embedded newlines in identifiers.
@@ -32,8 +34,11 @@ String schemaFingerprint(const String & disk_name, const StorageInMemoryMetadata
         schema += std::to_string(field.size()) + ":" + field;
     };
     append(disk_name);
-    append(metadata.columns.toString(/*include_comments=*/false));
+    if (include_columns)
+        append(metadata.columns.toString(/*include_comments=*/false));
     append(version_column);
+    if (!include_columns && !version_column.empty())
+        append(metadata.columns.getPhysical(version_column).type->getName());
     for (const auto * key : {&metadata.unique_key, &metadata.partition_key, &metadata.sorting_key, &metadata.primary_key})
     {
         append(key->expression_list_ast ? key->expression_list_ast->formatWithSecretsOneLine() : String{});
@@ -68,8 +73,10 @@ ObjectID initializeTableManifest(
         const auto record = readManifest(path);
         use_disk_state = record.payload.starts_with(disk_prefix);
         const bool mutable_ttl = record.payload.starts_with(mutable_ttl_prefix);
-        const auto & protocol_prefix = mutable_ttl ? mutable_ttl_prefix : (use_disk_state ? disk_prefix : legacy_prefix);
-        if (record.payload != protocol_prefix + schemaFingerprint(disk_name, metadata, version_column, !mutable_ttl))
+        const bool mutable_schema = record.payload.starts_with(mutable_schema_prefix);
+        const auto & protocol_prefix = mutable_schema ? mutable_schema_prefix
+            : (mutable_ttl ? mutable_ttl_prefix : (use_disk_state ? disk_prefix : legacy_prefix));
+        if (record.payload != protocol_prefix + schemaFingerprint(disk_name, metadata, version_column, !mutable_ttl, !mutable_schema))
             throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree table manifest does not match its schema or disk");
         return record.incarnation;
     }
@@ -91,7 +98,8 @@ void enableMutableTTL(
     const auto path = (std::filesystem::path(table_path) / "upsert_manifest.bin").string();
     auto record = readManifest(path);
     const auto target = mutable_ttl_prefix + schemaFingerprint(disk_name, metadata, version_column, false);
-    if (record.payload == target)
+    if (record.payload == target
+        || record.payload == mutable_schema_prefix + schemaFingerprint(disk_name, metadata, version_column, false, false))
     {
         /// A previous upgrade may have replaced the file but failed its directory barrier.
         syncDirectory(table_path);
@@ -102,6 +110,22 @@ void enableMutableTTL(
 
     /// Upgrade before changing SQL metadata: both sides of this atomic replacement accept the current policy.
     /// Afterward the database's metadata commit is the sole authority for mutable `TTL` rules.
+    record.payload = target;
+    const auto temporary = path + "." + toString(UUIDHelpers::generateV4()) + ".tmp";
+    createDurableFile(temporary, encodeLogRecord(record));
+    std::filesystem::rename(temporary, path);
+    syncDirectory(table_path);
+}
+
+void enableMutableSchema(
+    const String & table_path, const String & disk_name, const StorageInMemoryMetadata & metadata, const String & version_column)
+{
+    enableMutableTTL(table_path, disk_name, metadata, version_column);
+    const auto path = (std::filesystem::path(table_path) / "upsert_manifest.bin").string();
+    auto record = readManifest(path);
+    const auto target = mutable_schema_prefix + schemaFingerprint(disk_name, metadata, version_column, false, false);
+    if (record.payload == target)
+        return;
     record.payload = target;
     const auto temporary = path + "." + toString(UUIDHelpers::generateV4()) + ".tmp";
     createDurableFile(temporary, encodeLogRecord(record));

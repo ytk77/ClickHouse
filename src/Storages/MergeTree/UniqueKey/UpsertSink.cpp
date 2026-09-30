@@ -27,6 +27,7 @@ extern const Metric LocalThreadScheduled;
 
 namespace DB::Setting
 {
+extern const SettingsSeconds lock_acquire_timeout;
 extern const SettingsUInt64 max_partitions_per_insert_block;
 extern const SettingsUInt64 unique_key_max_encoded_size;
 extern const SettingsString insert_deduplication_token;
@@ -102,8 +103,14 @@ struct Sink::Impl
 };
 
 Sink::Sink(StorageMergeTree & storage_, StorageMetadataPtr metadata_, ContextPtr context_)
-    : SinkToStorage(std::make_shared<const Block>(metadata_->getSampleBlock())), storage(storage_), metadata(std::move(metadata_)), context(std::move(context_))
+    : SinkToStorage(std::make_shared<const Block>(metadata_->getSampleBlock())), storage(storage_), metadata(std::move(metadata_)),
+      context(std::move(context_)), schema_lock(storage.tryLockTimed(storage.upsert_schema_lock,
+          RWLockImpl::Read, context->getCurrentQueryId(), context->getSettingsRef()[Setting::lock_acquire_timeout]))
 {
+    const auto current_metadata = storage.getInMemoryMetadataPtr(context, true);
+    if (metadata->getColumns().toString(false) != current_metadata->getColumns().toString(false)
+        || metadata->getSecondaryIndices().allToString() != current_metadata->getSecondaryIndices().allToString())
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree schema changed before insert; retry the query");
     if (context->getSettingsRef()[Setting::input_format_max_block_wait_ms])
         throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree does not support streaming inserts");
 }

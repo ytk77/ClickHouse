@@ -330,3 +330,35 @@ TEST_F(UpsertTTLManifestTest, MismatchingSchemaAndLegacyProtocolCannotUpgrade)
     EXPECT_THROW(enableMutableTTL(directory, "default", metadata, ""), Exception);
     EXPECT_THROW(enableMutableTTL(directory, "other_disk", metadata, ""), Exception);
 }
+
+TEST_F(UpsertTTLManifestTest, MutableSchemaPreservesKeysAndDisk)
+{
+    metadata.unique_key.expression_list_ast = make_intrusive<ASTIdentifier>("id");
+    metadata.unique_key.data_types = {std::make_shared<DataTypeUInt64>()};
+    bool disk_state;
+    const auto incarnation = initialize(false, disk_state);
+    enableMutableSchema(directory, "default", metadata, "");
+    auto columns = metadata.getColumns();
+    columns.add(ColumnDescription("extra", std::make_shared<DataTypeUInt64>()));
+    metadata.setColumns(columns);
+    EXPECT_EQ(initialize(true, disk_state), incarnation);
+    enableMutableSchema(directory, "default", metadata, "");
+    enableMutableTTL(directory, "default", metadata, "");
+    columns.remove("extra");
+    metadata.setColumns(columns);
+    EXPECT_EQ(initialize(true, disk_state), incarnation);
+    EXPECT_THROW(enableMutableSchema(directory, "other_disk", metadata, ""), Exception);
+    metadata.unique_key.expression_list_ast = make_intrusive<ASTIdentifier>("other_key");
+    EXPECT_THROW(initialize(true, disk_state), Exception);
+}
+
+TEST_F(UpsertTTLManifestTest, MutableSchemaUpgradesFixedTTLManifest)
+{
+    metadata.table_ttl.definition_ast = make_intrusive<ASTIdentifier>("expires");
+    makeLegacyManifest(true, true);
+    bool disk_state;
+    const auto incarnation = initialize(true, disk_state);
+    enableMutableSchema(directory, "default", metadata, "");
+    metadata.table_ttl = {};
+    EXPECT_EQ(initialize(true, disk_state), incarnation);
+}

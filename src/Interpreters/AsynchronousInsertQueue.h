@@ -49,6 +49,7 @@ public:
         {
             OK,
             TOO_MUCH_DATA,
+            SYNCHRONOUS,
         };
 
         Status status;
@@ -62,7 +63,7 @@ public:
         std::unique_ptr<ReadBuffer> insert_data_buffer{};
 
         /// Block that contains received by Native
-        /// protocol data in case of too much data.
+        /// protocol data when the insert must execute synchronously.
         Block insert_block{};
     };
 
@@ -303,7 +304,8 @@ private:
         const QueueShardFlushTimeHistory::TimePoints & flush_time_points,
         std::chrono::steady_clock::time_point now) const;
 
-    void preprocessInsertQuery(const ASTPtr & query, const ContextPtr & query_context);
+    /// Returns false when a destination requires synchronous execution.
+    bool preprocessInsertQuery(const ASTPtr & query, const ContextPtr & query_context);
 
     void processBatchDeadlines(size_t shard_num);
     void scheduleDataProcessingJob(const InsertQuery & key, InsertDataPtr data, ContextPtr global_context, size_t shard_num, ThreadGroupPtr current_query_thread_group = nullptr);

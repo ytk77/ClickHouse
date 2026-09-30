@@ -108,7 +108,6 @@ namespace ErrorCodes
     extern const int BAD_ARGUMENTS;
     extern const int LOGICAL_ERROR;
     extern const int INVALID_SETTING_VALUE;
-    extern const int SUPPORT_IS_DISABLED;
 }
 
 static const NameSet settings_to_skip
@@ -401,7 +400,7 @@ void AsynchronousInsertQueue::scheduleDataProcessingJob(
     }
 }
 
-void AsynchronousInsertQueue::preprocessInsertQuery(const ASTPtr & query, const ContextPtr & query_context)
+bool AsynchronousInsertQueue::preprocessInsertQuery(const ASTPtr & query, const ContextPtr & query_context)
 {
     auto & insert_query = query->as<ASTInsertQuery &>();
     insert_query.async_insert_flush = true;
@@ -450,7 +449,7 @@ void AsynchronousInsertQueue::preprocessInsertQuery(const ASTPtr & query, const 
         table->checkInsertIsAllowed(query_context);
     }
 
-    /// Reject unsupported destinations before acknowledging queued data, including cascading views.
+    /// Select synchronous execution before consuming input or acknowledging data, including cascading views.
     /// `UpsertMergeTree` cannot consume the asynchronous flush protocol in its sink.
     std::vector<StoragePtr> destinations{table};
     std::unordered_set<StorageID, StorageID::DatabaseAndTableNameAndUUIDHash, StorageID::DatabaseAndTableNameAndUUIDEqual> visited;
@@ -461,7 +460,7 @@ void AsynchronousInsertQueue::preprocessInsertQuery(const ASTPtr & query, const 
         if (!visited.insert(id).second)
             continue;
         if (destination->getName() == "UpsertMergeTree")
-            throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree requires synchronous inserts, including through materialized views");
+            return false;
         if (const auto * view = dynamic_cast<const StorageMaterializedView *>(destination.get()))
         {
             /// Missing destinations retain the flush-time materialized-view error policy.
@@ -484,23 +483,20 @@ void AsynchronousInsertQueue::preprocessInsertQuery(const ASTPtr & query, const 
     insert_query.columns = make_intrusive<ASTExpressionList>();
     for (const auto & column : sample_block)
         insert_query.columns->children.push_back(make_intrusive<ASTIdentifier>(column.name));
+    return true;
 }
 
 AsynchronousInsertQueue::PushResult
 AsynchronousInsertQueue::pushQueryWithInlinedData(ASTPtr query, ContextPtr query_context)
 {
-    {
-        /// we clone query to avoid modifying the original one
-        /// but we move tail buffer to the new query
-        auto copy_ptr = query;
-        query = query->clone();
-        if (auto * insert_query = copy_ptr->as<ASTInsertQuery>())
-        {
-            if (insert_query->tail)
-                insert_query->tail.reset();
-        }
-    }
-    preprocessInsertQuery(query, query_context);
+    auto original_query = query;
+    query = query->clone();
+    if (!preprocessInsertQuery(query, query_context))
+        return PushResult{.status = PushResult::SYNCHRONOUS};
+
+    /// Transfer the tail only after selecting queue admission. Synchronous execution uses the original input.
+    if (auto * insert_query = original_query->as<ASTInsertQuery>())
+        insert_query->tail.reset();
 
     StringWithMemoryTracking bytes;
     {
@@ -554,7 +550,8 @@ AsynchronousInsertQueue::pushQueryWithInlinedData(ASTPtr query, ContextPtr query
 AsynchronousInsertQueue::PushResult AsynchronousInsertQueue::pushQueryWithBlock(ASTPtr query, Block && block, ContextPtr query_context)
 {
     query = query->clone();
-    preprocessInsertQuery(query, query_context);
+    if (!preprocessInsertQuery(query, query_context))
+        return PushResult{.status = PushResult::SYNCHRONOUS, .insert_block = std::move(block)};
     return pushDataChunk(std::move(query), std::move(block), std::move(query_context));
 }
 

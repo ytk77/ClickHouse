@@ -536,7 +536,7 @@ void StorageMergeTree::alter(
 
     if (merging_params.upsert)
     {
-        alterUpsertTTL(commands, local_context);
+        alterUpsertMetadata(commands, local_context);
         return;
     }
 
@@ -1173,6 +1173,12 @@ void StorageMergeTree::setMutationCSN(const String & mutation_id, CSN csn)
 void StorageMergeTree::mutate(const MutationCommands & commands, ContextPtr query_context)
 {
     assertNotReadonly();
+
+    if (merging_params.upsert)
+    {
+        mutateUpsert(commands, query_context);
+        return;
+    }
 
     delayMutationOrThrowIfNeeded(nullptr, query_context);
 
@@ -3650,7 +3656,7 @@ MergeTreeData::MutationsSnapshotPtr StorageMergeTree::getMutationsSnapshot(const
     MutationCounters mutations_snapshot_counters;
     MutationsSnapshot::MutationsByVersion mutations_snapshot;
 
-    /// `UpsertMergeTree` rejects mutations and patch parts. Do not reacquire the writer's parts lock for an empty patch snapshot.
+    /// `UpsertMergeTree` rejects native mutations and patch parts. Do not reacquire the writer's parts lock for an empty patch snapshot.
     if (merging_params.upsert)
         return std::make_shared<MutationsSnapshot>(params, std::move(mutations_snapshot_counters), std::move(mutations_snapshot), std::move(patch_parts));
 

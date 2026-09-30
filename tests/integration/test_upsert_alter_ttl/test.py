@@ -139,7 +139,7 @@ def test_invalid_alter_preserves_policy_and_table_availability():
     create_table(table, "TTL expires + INTERVAL 200 YEAR")
     try:
         original = node.query(f"SHOW CREATE TABLE {table}")
-        for clause in ("MODIFY TTL expires RECOMPRESS CODEC(LZ4)", "MODIFY TTL missing_column", "MODIFY TTL expires, ADD COLUMN extra UInt8"):
+        for clause in ("MODIFY TTL expires RECOMPRESS CODEC(LZ4)", "MODIFY TTL missing_column"):
             assert node.query_and_get_error(f"ALTER TABLE {table} {clause}")
             assert node.query(f"SHOW CREATE TABLE {table}") == original
         node.query(f"INSERT INTO {table} VALUES (1,10,'2000-01-01',1)", settings=settings)

@@ -131,17 +131,25 @@ struct Database
 
     /// Bound temporary lookup memory independently of the input unit size.
     template <typename Callback>
-    void forEachWinner(const String & partition, const PartRows & rows, Callback && callback) const
+    void forEachWinner(const String & partition, const PartRows & rows, Callback && callback, const std::vector<UInt32> * offsets = nullptr) const
     {
         constexpr size_t lookup_batch_size = 1024;
         const auto key_prefix = prefix('W', partition);
-        for (size_t begin = 0; begin < rows.size(); begin += lookup_batch_size)
+        const size_t size = offsets ? offsets->size() : rows.size();
+        auto row_at = [&](size_t position) -> const PartRow &
         {
-            const auto count = std::min(lookup_batch_size, rows.size() - begin);
+            const auto offset = offsets ? (*offsets)[position] : position;
+            if (offset >= rows.size())
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree selected source offset exceeds its lineage");
+            return rows[offset];
+        };
+        for (size_t begin = 0; begin < size; begin += lookup_batch_size)
+        {
+            const auto count = std::min(lookup_batch_size, size - begin);
             std::vector<String> keys;
             keys.reserve(count);
             for (size_t i = 0; i < count; ++i)
-                keys.push_back(key_prefix + rows[begin + i].key);
+                keys.push_back(key_prefix + row_at(begin + i).key);
             std::vector<rocksdb::Slice> slices;
             slices.reserve(count);
             for (const auto & key : keys)
@@ -157,7 +165,7 @@ struct Database
                     check(statuses[i]);
                     value = std::string_view(values[i].data(), values[i].size());
                 }
-                callback(rows[begin + i], keys[i], value);
+                callback(row_at(begin + i), keys[i], value);
             }
             CurrentMemoryTracker::check();
         }
@@ -626,16 +634,20 @@ StateStore::Prepared DiskState::prepare(const String & partition, PartCommit par
 }
 
 StateStore::Prepared DiskState::prepareMerge(
-    const String & partition, PartCommit part, const PartRows & rows, const std::vector<String> & sources, const PartRows & expired)
+    const String & partition, PartCommit part, const PartRows & rows, const std::vector<String> & sources,
+    const PartRows & expired, bool retire_sources, const StateStore::MergeInput * input)
 {
-    if (sources.empty() || sources.size() > 32 || part.rows != rows.size() || rows.size() > MAX_UNIT_ROWS
+    if ((!retire_sources && !input)
+        || (input && (!input->snapshot || input->lineage.size() != sources.size() || input->offsets.size() != sources.size()))
+        || sources.empty() || sources.size() > 32 || part.rows != rows.size() || rows.size() > MAX_UNIT_ROWS
         || expired.size() > MAX_UNIT_ROWS - rows.size()
         || part.part == ObjectID{} || impl->database->get("O" + objectName(part.part)))
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid UpsertMergeTree maintenance unit");
     StateStore::Prepared result;
     result.partition = partition;
     result.operation_id = part.part;
-    result.retired_parts = sources;
+    if (retire_sources)
+        result.retired_parts = sources;
     result.disk = std::make_shared<DiskPrepared>();
     const auto csn_key = prefix('C', partition);
     result.disk->previous_csn = impl->database->integer(csn_key);
@@ -660,8 +672,9 @@ StateStore::Prepared DiskState::prepareMerge(
     std::set<String> source_names;
     std::set<String> mapped_output;
     std::set<String> mapped_expirations;
-    for (const auto & name : sources)
+    for (size_t source_index = 0; source_index < sources.size(); ++source_index)
     {
+        const auto & name = sources[source_index];
         if (!source_names.insert(name).second || name == part.final_name)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "Duplicate UpsertMergeTree merge source or reused output name");
         auto authorization = impl->database->get("A" + name);
@@ -671,16 +684,29 @@ StateStore::Prepared DiskState::prepareMerge(
         const auto info = MergeTreePartInfo::fromPartName(name, MERGE_TREE_DATA_MIN_FORMAT_VERSION_WITH_CUSTOM_PARTITIONING);
         if (info.getPartitionId() != partition)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree merge crosses SQL partitions");
-        const auto source_rows = loadPartRows(name);
+        PartRows loaded_rows;
+        if (!input)
+            loaded_rows = loadPartRows(name);
+        const auto & source_rows = input ? input->lineage[source_index] : loaded_rows;
+        if (source_rows.size() != source.rows)
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree cached source lineage has a different row count");
         const auto source_mask = impl->current->getMask(objectName(source.part));
         if (!source_mask)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree merge source has no visibility mask");
+        const auto original_mask = input ? input->snapshot->getMask(objectName(source.part)) : nullptr;
+        if (input && !original_mask)
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree rewrite source is absent from its read snapshot");
+        DeleteBitmap rewritten_mask;
+        rewritten_mask.merge(*source_mask);
         impl->database->forEachWinner(partition, source_rows, [&](const PartRow & row, const String & key, std::optional<std::string_view> value)
         {
             auto it = output.find(row.key);
-            const bool maps_to_output = it != output.end() && it->second->value.row == row.value.row;
+            /// A partial rewrite leaves masked copies of the same lineage in an active source.
+            /// Only the copy visible when the payload was read can authorize an output or expiration.
+            const bool was_visible = !original_mask || !original_mask->contains(row.value.row_offset);
+            const bool maps_to_output = was_visible && it != output.end() && it->second->value.row == row.value.row;
             auto expiration = expirations.find(row.key);
-            const bool expires = expiration != expirations.end() && expiration->second->value == row.value;
+            const bool expires = was_visible && expiration != expirations.end() && expiration->second->value == row.value;
             if (maps_to_output && !mapped_output.insert(row.key).second)
                 throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree merge maps an output identity twice");
             if (expires && !mapped_expirations.insert(row.key).second)
@@ -698,6 +724,8 @@ StateStore::Prepared DiskState::prepareMerge(
             in.end();
             if (winner_part == source.part && winner.row_offset == row.value.row_offset)
             {
+                if (!retire_sources && !maps_to_output && !expires)
+                    return;
                 if ((!maps_to_output && !expires) || winner.row != row.value.row || source_mask->contains(row.value.row_offset))
                     throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree merge omitted or changed a live source identity");
                 if (expires)
@@ -709,6 +737,7 @@ StateStore::Prepared DiskState::prepareMerge(
                     updated.string(encodeIndexValue(it->second->value));
                     batch.Put(key, updated.bytes);
                 }
+                rewritten_mask.add(row.value.row_offset);
                 checkBatchBudget(batch);
             }
             else if (maps_to_output)
@@ -716,11 +745,19 @@ StateStore::Prepared DiskState::prepareMerge(
                 /// A concurrent upsert superseded this exact source row after the merge snapshot.
                 dead->add(it->second->value.row_offset);
             }
-        });
-        batch.Put("R" + name, *authorization);
-        batch.Delete("A" + name);
-        batch.Delete("M" + objectName(source.part));
-        batch.Delete("O" + objectName(source.part));
+        }, retire_sources ? nullptr : &input->offsets[source_index]);
+        if (retire_sources)
+        {
+            batch.Put("R" + name, *authorization);
+            batch.Delete("A" + name);
+            batch.Delete("M" + objectName(source.part));
+            batch.Delete("O" + objectName(source.part));
+        }
+        else
+        {
+            /// Relocation and source masking share one durable batch; readers cannot see both copies.
+            batch.Put("M" + objectName(source.part), encodeMask(rewritten_mask));
+        }
     }
     if (mapped_output.size() != output.size())
         throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree merge invented an output identity");
@@ -750,9 +787,11 @@ StateStore::Prepared DiskState::prepareMerge(
     }
     else
         part = {};
-    if (sources.size() > impl->part_count)
+    if (result.retired_parts.size() > impl->part_count)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree merge retired more parts than exist");
-    batch.Put("part_count", number(impl->part_count - sources.size() + result.produces_part));
+    if (result.produces_part && result.retired_parts.empty() && impl->part_count == std::numeric_limits<UInt64>::max())
+        throw Exception(ErrorCodes::LIMIT_EXCEEDED, "UpsertMergeTree part counter exhausted");
+    batch.Put("part_count", number(impl->part_count - result.retired_parts.size() + result.produces_part));
     batch.Put(csn_key, number(result.csn));
     result.record = std::move(part);
     checkBatchBudget(batch);
@@ -827,7 +866,7 @@ StateStore::Prepared DiskState::prepare(const String &, PartCommit, const Valida
 {
     std::unreachable();
 }
-StateStore::Prepared DiskState::prepareMerge(const String &, PartCommit, const PartRows &, const std::vector<String> &, const PartRows &)
+StateStore::Prepared DiskState::prepareMerge(const String &, PartCommit, const PartRows &, const std::vector<String> &, const PartRows &, bool, const StateStore::MergeInput *)
 {
     std::unreachable();
 }

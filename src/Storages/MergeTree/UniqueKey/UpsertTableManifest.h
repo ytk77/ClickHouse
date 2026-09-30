@@ -15,5 +15,8 @@ ObjectID initializeTableManifest(
 /// Atomically upgrade old disk-state manifests before allowing mutable `TTL` metadata.
 void enableMutableTTL(
     const String & table_path, const String & disk_name, const StorageInMemoryMetadata & metadata, const String & version_column);
+/// Keep immutable key bindings in the manifest while SQL metadata owns columns and indexes.
+void enableMutableSchema(
+    const String & table_path, const String & disk_name, const StorageInMemoryMetadata & metadata, const String & version_column);
 }
 }

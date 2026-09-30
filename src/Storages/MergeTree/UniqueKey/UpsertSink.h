@@ -3,6 +3,7 @@
 #include <Processors/Sinks/SinkToStorage.h>
 #include <Storages/StorageInMemoryMetadata.h>
 #include <Interpreters/Context_fwd.h>
+#include <Common/RWLock.h>
 
 namespace DB
 {
@@ -24,6 +25,7 @@ private:
     StorageMergeTree & storage;
     StorageMetadataPtr metadata;
     ContextPtr context;
+    RWLockImpl::LockHolder schema_lock;
     UInt64 unit = 0;
     struct Impl;
     std::unique_ptr<Impl> impl;

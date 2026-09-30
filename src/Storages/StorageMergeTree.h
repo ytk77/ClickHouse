@@ -30,6 +30,7 @@ namespace DB
 namespace Upsert
 {
 class StateStore;
+class Sink;
 struct Token;
 struct PreparedInsert;
 }
@@ -69,6 +70,11 @@ public:
     bool supportsParallelInsert() const override { return !merging_params.upsert; }
 
     bool supportsStreaming() const override { return !merging_params.upsert; }
+
+    bool supportsDelete() const override
+    {
+        return merging_params.upsert;
+    }
 
     CursorPromotersMap buildPromoters() override;
 
@@ -139,6 +145,7 @@ public:
     bool isUpsertTokenCommitted(const String & partition, const Upsert::Token & token) const;
 
 private:
+    friend class Upsert::Sink;
 
     /// Mutex and condvar for synchronous mutations wait
     std::mutex mutation_wait_mutex;
@@ -154,7 +161,15 @@ private:
     /// Accessed only by the single table maintenance task; resume after the previous selected unit.
     std::optional<MergeTreePartInfo> upsert_maintenance_cursor;
     void runUpsertMaintenance();
-    void alterUpsertTTL(const AlterCommands & commands, ContextPtr local_context);
+    void alterUpsertMetadata(const AlterCommands & commands, ContextPtr local_context);
+    void mutateUpsert(const MutationCommands & commands, ContextPtr context);
+    bool rewriteUpsertParts(const DataPartsVector & sources, const StorageMetadataPtr & metadata,
+        ContextPtr context, bool apply_ttl, const MutationCommands & commands = {});
+    bool upsertPartNeedsSchemaRewrite(const DataPartPtr & part, const StorageMetadataPtr & metadata, ContextPtr context) const;
+    void reconcileUpsertParts(const StorageMetadataPtr & metadata, ContextPtr context);
+    /// Serialize part rewrites and schema changes; inserts still prepare and commit concurrently.
+    std::mutex upsert_operation_mutex;
+    RWLock upsert_schema_lock = RWLockImpl::create();
     /// Serialize policy publication with maintenance commit, without blocking part preparation or readers.
     std::mutex upsert_ttl_mutex;
 
