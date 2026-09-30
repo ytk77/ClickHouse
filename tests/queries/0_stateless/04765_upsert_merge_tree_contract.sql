@@ -37,7 +37,6 @@ CREATE TABLE upsert_bad (id UInt64, _upsert_delete UInt8) ENGINE = UpsertMergeTr
 
 ALTER TABLE upsert_contract MODIFY COLUMN ver UInt32; -- { serverError SUPPORT_IS_DISABLED }
 ALTER TABLE upsert_contract RENAME COLUMN ver TO version; -- { serverError SUPPORT_IS_DISABLED }
-CREATE MATERIALIZED VIEW upsert_mv ENGINE = Memory AS SELECT id, value FROM upsert_contract; -- { serverError QUERY_IS_NOT_SUPPORTED_IN_MATERIALIZED_VIEW }
 
 CREATE TABLE upsert_tuple (id Tuple(UInt64, String), v UInt8) ENGINE = UpsertMergeTree ORDER BY v UNIQUE KEY id;
 SELECT engine FROM system.tables WHERE database = currentDatabase() AND name = 'upsert_tuple';

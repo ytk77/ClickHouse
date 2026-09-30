@@ -1156,7 +1156,7 @@ void MergeTreeData::checkProperties(
         /// `checkAlterIsPossible`); reject CREATE-with-projection too so the
         /// combination cannot exist. CREATE only — ATTACH must still load.
         /// TODO(unique-key): support projections on UNIQUE KEY tables.
-        if (new_metadata.hasUniqueKey() && !attach)
+        if (new_metadata.hasUniqueKey() && !merging_params.upsert && !attach)
             throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
                 "Projections are not supported on tables with UNIQUE KEY");
 
@@ -4845,10 +4845,11 @@ void MergeTreeData::checkAlterIsPossible(const AlterCommands & commands, Context
         {
             if ((command.type != AlterCommand::MODIFY_TTL && command.type != AlterCommand::REMOVE_TTL
                 && command.type != AlterCommand::ADD_COLUMN && command.type != AlterCommand::DROP_COLUMN
-                && command.type != AlterCommand::ADD_INDEX && command.type != AlterCommand::DROP_INDEX)
+                && command.type != AlterCommand::ADD_INDEX && command.type != AlterCommand::DROP_INDEX
+                && command.type != AlterCommand::ADD_PROJECTION && command.type != AlterCommand::DROP_PROJECTION)
                 || command.clear || command.partition)
                 throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
-                    "UpsertMergeTree supports ADD/DROP COLUMN, ADD/DROP INDEX, MODIFY TTL and REMOVE TTL alters");
+                    "UpsertMergeTree supports ADD/DROP COLUMN, INDEX and PROJECTION, MODIFY TTL and REMOVE TTL alters");
             if (command.type == AlterCommand::DROP_COLUMN && command.column_name == merging_params.upsert_version_column)
                 throw Exception(ErrorCodes::ALTER_OF_COLUMN_IS_FORBIDDEN, "Cannot drop the UpsertMergeTree version column");
         }
@@ -4908,7 +4909,7 @@ void MergeTreeData::checkAlterIsPossible(const AlterCommands & commands, Context
                 "Please set setting 'deduplicate_merge_projection_mode' to 'drop' or 'rebuild'",
                 getName());
 
-        if (old_metadata.hasUniqueKey())
+        if (old_metadata.hasUniqueKey() && !merging_params.upsert)
             throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
                 "ADD PROJECTION is not supported on tables with UNIQUE KEY");
     }
@@ -5679,8 +5680,9 @@ void MergeTreeData::checkMutationIsPossible(const MutationCommands & commands, c
     if (merging_params.upsert)
     {
         for (const auto & command : commands)
-            if (command.type != MutationCommand::DELETE && command.type != MutationCommand::MATERIALIZE_INDEX)
-                throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree supports only DELETE and MATERIALIZE INDEX mutations");
+            if (command.type != MutationCommand::DELETE && command.type != MutationCommand::MATERIALIZE_INDEX
+                && command.type != MutationCommand::MATERIALIZE_PROJECTION)
+                throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree supports only DELETE, MATERIALIZE INDEX and MATERIALIZE PROJECTION mutations");
         return;
     }
 
@@ -10846,23 +10848,26 @@ PartitionCommandsResultInfo MergeTreeData::freezePartition(
     const ASTPtr & partition_ast,
     const String & with_name,
     ContextPtr local_context,
-    TableLockHolder &)
+    TableLockHolder &,
+    const DataPartsVector * snapshot_parts)
 {
-    return freezePartitionsByMatcher(getPartitionMatcher(partition_ast, local_context), with_name, local_context);
+    return freezePartitionsByMatcher(getPartitionMatcher(partition_ast, local_context), with_name, local_context, snapshot_parts);
 }
 
 PartitionCommandsResultInfo MergeTreeData::freezeAll(
     const String & with_name,
     ContextPtr local_context,
-    TableLockHolder &)
+    TableLockHolder &,
+    const DataPartsVector * snapshot_parts)
 {
-    return freezePartitionsByMatcher([] (const String &) { return true; }, with_name, local_context);
+    return freezePartitionsByMatcher([] (const String &) { return true; }, with_name, local_context, snapshot_parts);
 }
 
 PartitionCommandsResultInfo MergeTreeData::freezePartitionsByMatcher(
     MatcherFn matcher,
     const String & with_name,
-    ContextPtr local_context)
+    ContextPtr local_context,
+    const DataPartsVector * snapshot_parts)
 {
     auto settings = getSettings();
 
@@ -10874,7 +10879,7 @@ PartitionCommandsResultInfo MergeTreeData::freezePartitionsByMatcher(
     const String shadow_path = "shadow/";
 
     /// Acquire a snapshot of active data parts to prevent removing while doing backup.
-    const auto data_parts = getVisibleDataPartsVector(local_context);
+    const auto data_parts = snapshot_parts ? *snapshot_parts : getVisibleDataPartsVector(local_context);
 
     bool has_zero_copy_part = false;
     for (const auto & part : data_parts)
@@ -12130,14 +12135,14 @@ StorageMetadataHandle MergeTreeData::getInMemoryMetadataPtr(ContextPtr query_con
 }
 
 MergeTreeData::UpsertReadSnapshotPtr MergeTreeData::prepareUpsertReadSnapshot(
-    Upsert::SnapshotPtr visibility, const DataPartPtr & added_part, const DataPartsVector & removed_parts, DataPartsLock & lock) const
+    Upsert::SnapshotPtr visibility, const DataPartPtr & added_part, const DataPartsVector & removed_parts, DataPartsLock & lock, const DataPartsVector & added_parts) const
 {
     auto result = std::make_shared<UpsertReadSnapshot>();
     const auto current = getUpsertReadSnapshot();
     if (current)
         *result = *current;
     result->visibility = std::move(visibility);
-    if (current && !added_part && removed_parts.empty())
+    if (current && !added_part && added_parts.empty() && removed_parts.empty())
         return result;
 
     auto parts = getDataPartsVectorForInternalUsage({DataPartState::Active}, lock);
@@ -12185,19 +12190,39 @@ MergeTreeData::UpsertReadSnapshotPtr MergeTreeData::prepareUpsertReadSnapshot(
         for (const auto & part : parts)
             update_sizes(part, true);
     }
+    std::unordered_set<const IMergeTreeDataPart *> removed;
+    for (const auto & part : removed_parts)
+        removed.insert(part.get());
     std::erase_if(parts, [&](const auto & part)
     {
-        return std::find(removed_parts.begin(), removed_parts.end(), part) != removed_parts.end();
+        return removed.contains(part.get());
     });
-    if (added_part)
+    auto add = [&](const DataPartPtr & part)
     {
-        update_sizes(added_part, true);
-        const auto position = std::lower_bound(parts.begin(), parts.end(), added_part,
-            [](const auto & lhs, const auto & rhs)
-            {
-                return lhs->info < rhs->info;
-            });
-        parts.insert(position, added_part);
+        update_sizes(part, true);
+        parts.push_back(part);
+    };
+    const auto less = [](const auto & lhs, const auto & rhs)
+    {
+        return lhs->info < rhs->info;
+    };
+    if (added_parts.empty())
+    {
+        if (added_part)
+        {
+            update_sizes(added_part, true);
+            parts.insert(std::lower_bound(parts.begin(), parts.end(), added_part, less), added_part);
+        }
+    }
+    else
+    {
+        const auto previous_size = parts.size();
+        if (added_part)
+            add(added_part);
+        for (const auto & part : added_parts)
+            add(part);
+        std::sort(parts.begin() + previous_size, parts.end(), less);
+        std::inplace_merge(parts.begin(), parts.begin() + previous_size, parts.end(), less);
     }
     result->parts = std::make_shared<const RangesInDataParts>(parts);
     result->parts_info = getPartsSnapshotInfo(parts);

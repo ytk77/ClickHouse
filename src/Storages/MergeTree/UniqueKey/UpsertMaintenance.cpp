@@ -110,10 +110,12 @@ void StorageMergeTree::alterUpsertMetadata(const AlterCommands & commands, Conte
     checkAlterIsPossible(commands, local_context);
     NameSet dropped_columns;
     NameSet dropped_indices;
+    NameSet dropped_projections;
     for (auto it = commands.begin(); it != commands.end(); ++it)
     {
         const bool reuses_name = (it->type == AlterCommand::ADD_COLUMN && dropped_columns.contains(it->column_name))
-            || (it->type == AlterCommand::ADD_INDEX && dropped_indices.contains(it->index_name));
+            || (it->type == AlterCommand::ADD_INDEX && dropped_indices.contains(it->index_name))
+            || (it->type == AlterCommand::ADD_PROJECTION && dropped_projections.contains(it->projection_name));
         if (reuses_name)
         {
             /// Commit removal and retire its payload before publishing a new definition of the same name.
@@ -135,6 +137,8 @@ void StorageMergeTree::alterUpsertMetadata(const AlterCommands & commands, Conte
             dropped_columns.insert(it->column_name);
         if (it->type == AlterCommand::DROP_INDEX)
             dropped_indices.insert(it->index_name);
+        if (it->type == AlterCommand::DROP_PROJECTION)
+            dropped_projections.insert(it->projection_name);
     }
     if (!upsert_store->usesDiskState())
         throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree alters require the disk_state_v2 protocol");
@@ -396,7 +400,7 @@ bool StorageMergeTree::rewriteUpsertParts(const DataPartsVector & sources, const
             BlockWithPartition block;
             block.block = std::make_shared<Block>(std::move(output));
             block.partition = sources.front()->partition;
-            temporary = writer.writeTempPart(block, metadata, context, false);
+            temporary = writer.writeTempPart(block, metadata, context, false, /*force_projections=*/true);
             temporary->finalize();
             auto & part = temporary->part;
             part->getDataPartStorage().commitTransaction();
@@ -650,6 +654,10 @@ bool StorageMergeTree::upsertPartNeedsSchemaRewrite(
     }))
         return true;
 
+    for (const auto & [name, projection] : part->getProjectionParts())
+        if (!metadata->getProjections().has(name))
+            return true;
+
     NameSet index_files;
     for (const auto & description : metadata->getSecondaryIndices())
     {
@@ -677,6 +685,8 @@ bool StorageMergeTree::upsertPartNeedsSchemaRewrite(
     };
     for (const auto & [name, checksum] : part->checksums.files)
     {
+        if (name.ends_with(".proj") && !metadata->getProjections().has(name.substr(0, name.size() - 5)))
+            return true;
         if (obsolete_index(name))
             return true;
         if (name == SKIP_INDICES_PACKED_FILENAME)
@@ -762,6 +772,8 @@ void StorageMergeTree::mutateUpsert(const MutationCommands & commands, ContextPt
         const auto partition = ast->partition ? std::optional<String>(getPartitionIDFromQuery(ast->partition->ptr(), query_context)) : std::nullopt;
         if (command.type == MutationCommand::MATERIALIZE_INDEX && !metadata->getSecondaryIndices().has(command.index_name))
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unknown index {}", command.index_name);
+        if (command.type == MutationCommand::MATERIALIZE_PROJECTION && !metadata->getProjections().has(command.projection_name))
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unknown projection {}", command.projection_name);
         MutationCommands deletions;
         if (command.type == MutationCommand::DELETE)
             deletions.push_back(command);

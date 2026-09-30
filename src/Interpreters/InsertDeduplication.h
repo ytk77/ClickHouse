@@ -105,6 +105,9 @@ public:
 
     std::vector<DeduplicationHash> getDeduplicationHashes(const std::string & partition_id, bool deduplication_enabled) const;
 
+    /// Preserve token identities while a source filters already committed rows before its views.
+    Ptr filterSourceRows(const PaddedPODArray<UInt8> & filter) const;
+
     void prewarmDataHashes() const;
 
     size_t getCount() const;

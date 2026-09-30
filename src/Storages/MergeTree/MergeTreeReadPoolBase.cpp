@@ -32,6 +32,7 @@ namespace Setting
 namespace ErrorCodes
 {
     extern const int LOGICAL_ERROR;
+    extern const int SUPPORT_IS_DISABLED;
 }
 
 
@@ -236,9 +237,13 @@ MergeTreeReadPoolBase::buildReadTaskInfo(const RangesInDataPart & part_with_rang
         throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree reader requires a pinned visibility snapshot");
     if (snapshot_data && snapshot_data->upsert_snapshot)
     {
-        auto mask = snapshot_data->upsert_snapshot->getMask(data_part->getDeleteBitmapCacheIdentity());
+        const auto * parent = data_part->getParentPart();
+        auto mask = snapshot_data->upsert_snapshot->getMask((parent ? parent : data_part.get())->getDeleteBitmapCacheIdentity());
         if (!mask)
             throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree snapshot lacks the mask for part {}", data_part->name);
+        if (parent && !mask->empty())
+            throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
+                "UpsertMergeTree cannot read a projection whose parent has hidden rows; materialize the projection again");
         read_task_info.upsert_mask = std::move(mask);
     }
     const auto & part_info = *data_part_info;

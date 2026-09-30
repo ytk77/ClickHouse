@@ -78,11 +78,130 @@ record. The record is synchronized before part rename, directory synchronization
 The table manifest must exist during attachment and must match the schema and disk.
 An existing data directory cannot be imported as a new `UpsertMergeTree` table.
 
-Partition operations other than the mutation partition filters described below, projections, sampling definitions,
-streaming, backup, restore, `CHECK TABLE`, background moves, and incremental materialized views are gated.
+Sampling definitions, streaming, `BACKUP`/`RESTORE`, `CHECK TABLE`, and background disk moves remain gated.
+The supported partition, projection and incremental materialized-view operations are described below.
 The `_upsert_` prefix is reserved; the input-only delete flag is not connected yet.
 Partial-column updates remain unsupported; replace a row by inserting a new version.
 
+
+## Incremental materialized views {#upsert-incremental-materialized-views}
+
+An `UpsertMergeTree` table can be the source of an incremental materialized view:
+
+```sql
+CREATE TABLE events (id UInt64, ver UInt64, value String)
+ENGINE = UpsertMergeTree(ver) ORDER BY id UNIQUE KEY id;
+
+CREATE TABLE event_history (id UInt64, ver UInt64, value String)
+ENGINE = MergeTree ORDER BY (id, ver);
+
+CREATE MATERIALIZED VIEW events_mv TO event_history AS SELECT * FROM events;
+```
+
+The view processes incoming `INSERT` blocks, as with `ReplacingMergeTree`. It receives
+submitted rows even when a version loses the source's winner comparison. Subsequent
+upserts, `DELETE`, expiration, `TRUNCATE` and partition operations do not retract or
+replay rows in the view target. An aggregate over this event stream therefore does not
+automatically represent the source's current winners. Source and view targets do not
+form a cross-table transaction. The standard
+`wait_for_part_commit_in_dependent_materialized_views` setting is honored.
+
+An explicit `insert_deduplication_token` replay does not forward previously committed
+source units to dependent views. A partially replayed input forwards only newly
+committed units, preserving their original deduplication identities. This also applies
+when asynchronous insertion settings route the request to synchronous execution.
+Source deduplication does not repair a view target after a failure between the source
+commit and the target commit; such a target may need reconciliation or rebuilding.
+
+## Partition management {#upsert-partition-management}
+
+Tables using `disk_state_v2` support these operations:
+
+```sql
+ALTER TABLE partitioned DROP PARTITION 202609;
+ALTER TABLE partitioned DETACH PARTITION 202609;
+ALTER TABLE partitioned ATTACH PARTITION 202609;
+ALTER TABLE partitioned ATTACH PARTITION 202609 FROM archive;
+ALTER TABLE partitioned REPLACE PARTITION 202609 FROM archive;
+ALTER TABLE partitioned MOVE PARTITION 202609 TO TABLE archive;
+ALTER TABLE partitioned FREEZE PARTITION 202609 WITH NAME 'snapshot';
+ALTER TABLE partitioned UNFREEZE PARTITION 202609 WITH NAME 'snapshot';
+```
+
+`DROP PART`, `DETACH PART`, `ATTACH PART`, `DROP DETACHED PARTITION/PART`, and the
+`FREEZE`/`UNFREEZE` whole-table forms are also supported. Cross-table transfers require
+two different `UpsertMergeTree` tables with matching physical columns, partition,
+sorting and unique keys, and version column. Disk and volume moves remain unsupported
+because this engine requires one local disk.
+
+Imports read only visible source rows, prepare fresh immutable parts, and compare
+imported versions with destination winners. Without a version column, imported rows
+are newer writes. `REPLACE PARTITION` removes destination winners and retry tokens for
+that partition before admitting the imported rows in the same durable batch. An empty
+visible source is rejected unless `allow_replace_partition_from_empty_source=1` is set.
+`DROP PARTITION` and `DETACH PARTITION` also clear partition retry tokens; a single-part
+operation removes only winners belonging to that part and preserves partition tokens.
+No masked historical row becomes a winner when its replacement is removed.
+
+Each destination import or removal is published through one synchronized state batch.
+The retirement and import state must fit the existing 128-MiB batch budget; exceeding
+it rejects the operation before changing live data. Preparation pins a source snapshot
+and allows concurrent inserts. Only the publication phase excludes inserts. Schema
+changes and maintenance serialize with preparation on the participating tables;
+unrelated tables can perform partition operations concurrently.
+Removals retire the parts selected in that snapshot. Rows inserted afterward remain,
+and their winner identities are checked at publication. Partition retry tokens are
+cleared only if the removal table's published state has not changed since selection;
+otherwise existing tokens are retained to protect concurrent writes.
+`MOVE ... TO TABLE` commits the destination first, then removes the source. These are
+two table commits: interruption between them can leave visible copies in both tables.
+Inspect both tables before retrying an interrupted move, especially without versions.
+
+Detached and frozen parts include a checksummed `upsert_visibility.bin` containing the
+part identity, row count and visibility mask. Preserve this file when copying frozen
+parts into `detached`. An `UpsertMergeTree` payload without this visibility file is
+rejected on import. Ordinary native parts without Upsert lineage can be imported from
+`detached`; all their physical rows are candidates. Consumed detached inputs have a
+durable cleanup record, allowing restart to finish cleanup without importing them twice.
+Importing existing Upsert lineage preserves the encoded key sizes admitted by the
+source even when the current session has a smaller `unique_key_max_encoded_size`.
+
+An interrupted `DETACH` may leave both an active part and its detached copy. `ATTACH`
+rejects a detached identity that is still active. After the original identity has been
+retired, importing a historical backup still counts as a new write; without versions,
+inspect the backup before restoring it over newer data. If recovery finds both an
+uncommitted `attaching_` directory and its original detached name, it preserves the
+former under an `upsert_recovered_` name and logs a warning. This preserved copy
+requires inspection and is excluded from automatic partition attachment.
+
+The first partition operation adds `partition_policy=state_v1` to the table manifest.
+Older binaries reject this header; downgrade requires a compatible binary. These
+operations are unavailable inside explicit transactions or on `parts_sync_v1` tables.
+
+## Projections {#upsert-projections}
+
+Projections can be declared in `CREATE TABLE` and managed with standard syntax:
+
+```sql
+ALTER TABLE events ADD PROJECTION by_value (SELECT * ORDER BY value);
+ALTER TABLE events MATERIALIZE PROJECTION by_value;
+ALTER TABLE events DROP PROJECTION by_value;
+```
+
+Both ordinary and aggregate projections are supported. `ADD PROJECTION` changes
+metadata; subsequent inserts create the projection according to the normal
+`materialize_projections_on_insert` policy. `MATERIALIZE PROJECTION`, optionally
+`IN PARTITION`, rewrites existing visible rows and explicitly creates projections.
+`DROP PROJECTION` retires obsolete projection payloads through immutable part rewrites.
+
+A projection can reorder or aggregate rows, so parent row masks cannot be applied to
+its output offsets. The optimizer uses projections for parent parts that are fully
+visible in the query's pinned snapshot, and reads base data for parts with hidden rows
+in the same query. Implicit count/minmax shortcuts require all selected parts to be
+fully visible. Materialization or maintenance can make a parent eligible again by
+removing hidden rows.
+Explicit projection introspection rejects parent parts with hidden rows. Projections
+that require commit-order block numbers are currently unsupported.
 
 ## Truncating a table {#upsert-truncate}
 
@@ -94,7 +213,7 @@ TRUNCATE TABLE IF EXISTS current_state;
 ```
 
 `TRUNCATE` removes all rows across all partitions and preserves the table definition,
-including defaults, keys, indexes and `TTL`. It waits for active insert pipelines and
+including defaults, keys, indexes, projections and `TTL`. It waits for active insert pipelines and
 serializes with deletion, schema cleanup and maintenance. A single synchronized state
 batch retires all active parts and clears winners, visibility masks, version floors and
 insert deduplication tokens. Subsequent inserts can reuse previous keys and tokens,

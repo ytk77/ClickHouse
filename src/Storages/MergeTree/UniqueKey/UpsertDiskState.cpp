@@ -5,6 +5,7 @@
 #include <IO/ReadBufferFromString.h>
 #include <IO/WriteBufferFromString.h>
 #include <Common/FailPoint.h>
+#include <Common/logger_useful.h>
 #include <Common/CurrentMemoryTracker.h>
 #include "config.h"
 #include <filesystem>
@@ -225,7 +226,8 @@ struct DiskPrepared
     std::shared_ptr<DiskMaskSnapshot> masks;
     UInt64 previous_csn = 0;
     bool durable = false;
-    bool truncate = false;
+    bool catalog_change = false;
+    UInt64 previous_part_count = 0;
 };
 
 struct DiskState::Impl
@@ -324,6 +326,59 @@ struct DiskState::Impl
             rocksdb::WriteOptions write;
             write.sync = true;
             check(database->db->Write(write, &batch));
+        }
+        /// Consumed detached inputs are reclaimed only after their import is durable.
+        bool consumed_detached = false;
+        const auto detached_path = fs::path(table_path) / "detached";
+        for (iterator->Seek("D"); iterator->Valid() && iterator->key().starts_with("D"); iterator->Next())
+        {
+            const auto name = iterator->key().ToString().substr(1);
+            if (!name.starts_with("attaching_")
+                || !MergeTreePartInfo::tryParsePartName(name.substr(10), MERGE_TREE_DATA_MIN_FORMAT_VERSION_WITH_CUSTOM_PARTITIONING)
+                || name.find('/') != String::npos || name.find('\\') != String::npos)
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "Invalid UpsertMergeTree consumed detached part");
+            const auto path = detached_path / name;
+            if (fs::is_symlink(path))
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "Symbolic link replaces an UpsertMergeTree detached part");
+            fs::remove_all(path);
+            consumed_detached = true;
+        }
+        check(iterator->status());
+        if (consumed_detached)
+        {
+            syncDirectory(detached_path);
+            rocksdb::WriteBatch batch;
+            check(batch.DeleteRange("D", "E"));
+            rocksdb::WriteOptions write;
+            write.sync = true;
+            check(database->db->Write(write, &batch));
+        }
+        /// A preparation without a durable import remains available for another attachment attempt.
+        if (fs::is_directory(detached_path))
+        {
+            for (const auto & entry : fs::directory_iterator(detached_path))
+            {
+                const auto name = entry.path().filename().string();
+                if (!name.starts_with("attaching_")
+                    || !MergeTreePartInfo::tryParsePartName(name.substr(10), MERGE_TREE_DATA_MIN_FORMAT_VERSION_WITH_CUSTOM_PARTITIONING))
+                    continue;
+                auto restored = detached_path / name.substr(10);
+                if (entry.is_symlink())
+                    throw Exception(ErrorCodes::CORRUPTED_DATA, "Symbolic link replaces an UpsertMergeTree detached preparation {}", name);
+                if (fs::exists(restored))
+                {
+                    do
+                    {
+                        restored = detached_path / ("upsert_recovered_" + objectName(newObjectID()) + "_" + name.substr(10));
+                    }
+                    while (fs::exists(restored));
+                    LOG_WARNING(getLogger("UpsertMergeTree"),
+                        "Preserving uncommitted detached preparation {} as {} because its original name already exists",
+                        name, restored.filename().string());
+                }
+                fs::rename(entry.path(), restored);
+            }
+            syncDirectory(detached_path);
         }
         auto masks = std::make_shared<DiskMaskSnapshot>(database);
         masks->bind();
@@ -430,6 +485,25 @@ void DiskState::pruneRetired()
     check(iterator->status());
     if (!iterator->Valid() || !iterator->key().starts_with("R"))
         impl->retirement_cursor = "R";
+    bool removed_detached = false;
+    const auto detached_path = std::filesystem::path(impl->table_path) / "detached";
+    for (iterator->Seek("D"), examined = 0; iterator->Valid() && iterator->key().starts_with("D") && examined < 128; iterator->Next(), ++examined)
+    {
+        const auto name = iterator->key().ToString().substr(1);
+        if (!name.starts_with("attaching_")
+            || !MergeTreePartInfo::tryParsePartName(name.substr(10), MERGE_TREE_DATA_MIN_FORMAT_VERSION_WITH_CUSTOM_PARTITIONING)
+            || name.find('/') != String::npos || name.find('\\') != String::npos)
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "Invalid UpsertMergeTree consumed detached part");
+        const auto path = detached_path / name;
+        if (std::filesystem::is_symlink(path))
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "Symbolic link replaces an UpsertMergeTree detached part");
+        std::filesystem::remove_all(path);
+        removed_detached = true;
+        batch.Delete(iterator->key());
+    }
+    check(iterator->status());
+    if (removed_detached)
+        syncDirectory(detached_path);
     const auto now = impl->clock();
     auto retry_bytes = impl->database->integer("retry_bytes");
     for (iterator->Seek("E"), examined = 0; iterator->Valid() && iterator->key().starts_with("E") && examined < 128; iterator->Next(), ++examined)
@@ -816,7 +890,8 @@ StateStore::Prepared DiskState::prepareTruncate()
 {
     StateStore::Prepared result;
     result.disk = std::make_shared<DiskPrepared>();
-    result.disk->truncate = true;
+    result.disk->catalog_change = true;
+    result.disk->previous_part_count = impl->part_count;
     auto & batch = result.disk->batch;
     rocksdb::ReadOptions options;
     options.fill_cache = false;
@@ -854,14 +929,210 @@ StateStore::Prepared DiskState::prepareTruncate()
     return result;
 }
 
+StateStore::Prepared DiskState::preparePartition(
+    std::vector<PartCommit> additions, const std::vector<ValidatedPartRows> & rows,
+    const std::vector<String> & removed, const std::vector<String> & reset_partitions, const std::vector<String> & detached)
+{
+    if (additions.size() != rows.size())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree partition import row count mismatch");
+    StateStore::Prepared result;
+    result.disk = std::make_shared<DiskPrepared>();
+    result.disk->catalog_change = true;
+    result.disk->previous_part_count = impl->part_count;
+    auto & batch = result.disk->batch;
+    const std::set<String> reset(reset_partitions.begin(), reset_partitions.end());
+    std::set<ObjectID> retired_ids;
+    std::set<String> retired_names;
+    for (const auto & name : removed)
+    {
+        const auto value = impl->database->get("A" + name);
+        if (!value || !retired_names.insert(name).second)
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "Invalid UpsertMergeTree partition removal source {}", name);
+        auto source = decodePartCommit(*value);
+        if (source.final_name != name || !source.rows || impl->database->get("R" + name))
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "Invalid UpsertMergeTree partition source authorization");
+        retired_ids.insert(source.part);
+        const auto partition = MergeTreePartInfo::fromPartName(name, MERGE_TREE_DATA_MIN_FORMAT_VERSION_WITH_CUSTOM_PARTITIONING).getPartitionId();
+        if (!reset.contains(partition))
+        {
+            const auto source_rows = loadPartRows(name);
+            impl->database->forEachWinner(partition, source_rows, [&](const PartRow & row, const String & key, std::optional<std::string_view> winner)
+            {
+                if (!winner)
+                    return;
+                BinaryReader in{*winner};
+                const auto part_id = in.id();
+                const auto value_row = decodeIndexValue(in.string());
+                in.end();
+                if (part_id == source.part && value_row.row_offset == row.value.row_offset)
+                    batch.Delete(key);
+                checkBatchBudget(batch);
+            });
+        }
+        source.dead.clear();
+        source.kills.clear();
+        source.token = {};
+        source.token.accepted = source.rows;
+        batch.Put("R" + name, encodePartCommit(source));
+        batch.Delete("A" + name);
+        batch.Delete("M" + objectName(source.part));
+        batch.Delete("O" + objectName(source.part));
+        result.retired_parts.push_back(name);
+        checkBatchBudget(batch);
+    }
+    for (const auto & name : detached)
+    {
+        if (!name.starts_with("attaching_")
+            || !MergeTreePartInfo::tryParsePartName(name.substr(10), MERGE_TREE_DATA_MIN_FORMAT_VERSION_WITH_CUSTOM_PARTITIONING)
+            || name.find('/') != String::npos || name.find('\\') != String::npos)
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "Invalid UpsertMergeTree detached import name");
+        if (impl->database->get("D" + name))
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree detached name still has a pending cleanup");
+        batch.Put("D" + name, "");
+        checkBatchBudget(batch);
+    }
+    auto retry_bytes = impl->database->integer("retry_bytes");
+    for (const auto & partition : reset)
+    {
+        const auto winner_prefix = prefix('W', partition);
+        auto upper = winner_prefix;
+        while (!upper.empty() && static_cast<unsigned char>(upper.back()) == 255)
+            upper.pop_back();
+        if (upper.empty())
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Invalid UpsertMergeTree partition prefix");
+        upper.back() = static_cast<char>(static_cast<unsigned char>(upper.back()) + 1);
+        check(batch.DeleteRange(winner_prefix, upper));
+        batch.Delete(prefix('C', partition));
+        const auto token_prefix = prefix('T', partition);
+        rocksdb::ReadOptions options;
+        options.fill_cache = false;
+        std::unique_ptr<rocksdb::Iterator> iterator(impl->database->db->NewIterator(options));
+        for (iterator->Seek(token_prefix); iterator->Valid() && iterator->key().starts_with(token_prefix); iterator->Next())
+        {
+            const auto key = iterator->key().ToString();
+            const auto cost = tokenCost(key);
+            if (retry_bytes < cost)
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree partition retry byte counter underflow");
+            retry_bytes -= cost;
+            batch.Delete(expiryKey(tokenExpiry(iterator->value().ToString()), key));
+            batch.Delete(key);
+            checkBatchBudget(batch);
+        }
+        check(iterator->status());
+    }
+    batch.Put("retry_bytes", number(retry_bytes));
+
+    std::map<ObjectID, std::shared_ptr<DeleteBitmap>> masks;
+    std::map<String, std::pair<ObjectID, IndexValue>> winners;
+    std::map<String, UInt64> sequences;
+    for (size_t i = 0; i < additions.size(); ++i)
+    {
+        auto & part = additions[i];
+        if (part.part != rows[i].getPart() || part.rows != rows[i].getRows().size()
+            || authorizedPart(part.final_name) || impl->database->get("O" + objectName(part.part)) || masks.contains(part.part))
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "Invalid UpsertMergeTree partition import identity");
+        const auto partition = MergeTreePartInfo::fromPartName(part.final_name, MERGE_TREE_DATA_MIN_FORMAT_VERSION_WITH_CUSTOM_PARTITIONING).getPartitionId();
+        auto [sequence, inserted] = sequences.try_emplace(partition, 0);
+        if (inserted && impl->database->get(prefix('C', partition)))
+            sequence->second = impl->database->integer(prefix('C', partition));
+        if (sequence->second == std::numeric_limits<UInt64>::max())
+            throw Exception(ErrorCodes::LIMIT_EXCEEDED, "UpsertMergeTree partition commit sequence exhausted");
+        const auto csn = ++sequence->second;
+        masks.emplace(part.part, std::make_shared<DeleteBitmap>());
+        for (const auto & row : rows[i].getRows())
+        {
+            const auto key = prefix('W', partition) + row.key;
+            auto candidate = row.value;
+            candidate.row = candidate.row.resolve(csn);
+            auto incumbent = winners.find(key);
+            if (incumbent == winners.end() && !reset.contains(partition))
+            {
+                if (const auto value = impl->database->get(key))
+                {
+                    BinaryReader in{*value};
+                    const auto id = in.id();
+                    auto winner = decodeIndexValue(in.string());
+                    in.end();
+                    if (!retired_ids.contains(id))
+                        incumbent = winners.emplace(key, std::make_pair(id, winner)).first;
+                }
+            }
+            if (incumbent != winners.end())
+            {
+                if (candidate.row.compareWinner(incumbent->second.second.row) < 0)
+                {
+                    masks.at(part.part)->add(candidate.row_offset);
+                    continue;
+                }
+                const auto id = incumbent->second.first;
+                auto [mask, new_mask] = masks.try_emplace(id, nullptr);
+                if (new_mask)
+                {
+                    const auto previous = impl->current->getMask(objectName(id));
+                    if (!previous)
+                        throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree partition winner has no mask");
+                    mask->second = std::make_shared<DeleteBitmap>();
+                    mask->second->merge(*previous);
+                }
+                if (mask->second->contains(incumbent->second.second.row_offset))
+                    throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree partition winner is already masked");
+                mask->second->add(incumbent->second.second.row_offset);
+            }
+            winners.insert_or_assign(key, std::make_pair(part.part, candidate));
+            BinaryWriter value;
+            value.id(part.part);
+            value.string(encodeIndexValue(candidate));
+            batch.Put(key, value.bytes);
+            checkBatchBudget(batch);
+            CurrentMemoryTracker::check();
+        }
+        batch.Put("O" + objectName(part.part), number(csn));
+    }
+    for (auto & part : additions)
+    {
+        const auto & mask = masks.at(part.part);
+        const auto dead = mask->toVector();
+        part.dead.assign(dead.begin(), dead.end());
+        part.kills.clear();
+        part.token = {};
+        part.token.accepted = part.rows - part.dead.size();
+        if (!part.token.accepted)
+        {
+            batch.Delete("O" + objectName(part.part));
+            masks.erase(part.part);
+            continue;
+        }
+        const auto payload = encodePartCommit(part);
+        decodePartCommit(payload);
+        batch.Put("A" + part.final_name, payload);
+        result.added_parts.push_back(std::move(part));
+        checkBatchBudget(batch);
+    }
+    for (const auto & [id, mask] : masks)
+    {
+        batch.Put("M" + objectName(id), encodeMask(*mask));
+        checkBatchBudget(batch);
+    }
+    for (const auto & [partition, csn] : sequences)
+        batch.Put(prefix('C', partition), number(csn));
+    if (result.retired_parts.size() > impl->part_count
+        || result.added_parts.size() > std::numeric_limits<UInt64>::max() - (impl->part_count - result.retired_parts.size()))
+        throw Exception(ErrorCodes::LIMIT_EXCEEDED, "UpsertMergeTree partition part counter overflow");
+    batch.Put("part_count", number(impl->part_count - result.retired_parts.size() + result.added_parts.size()));
+    checkBatchBudget(batch);
+    result.disk->masks = std::make_shared<DiskMaskSnapshot>(impl->database);
+    result.snapshot = impl->newSnapshot(result.disk->masks);
+    return result;
+}
+
 void DiskState::append(const StateStore::Prepared & prepared)
 {
     if (!prepared.disk || prepared.disk->durable)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Invalid or already committed UpsertMergeTree disk preparation");
-    if (prepared.disk->truncate)
+    if (prepared.disk->catalog_change)
     {
-        if (prepared.retired_parts.size() != impl->part_count)
-            throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree truncate catalog changed under the commit lock");
+        if (prepared.disk->previous_part_count != impl->part_count)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree partition catalog changed under the commit lock");
     }
     else
     {
@@ -890,7 +1161,7 @@ void DiskState::append(const StateStore::Prepared & prepared)
 void DiskState::publish(StateStore::Prepared & prepared) noexcept
 {
     impl->current.swap(prepared.snapshot);
-    impl->part_count = impl->part_count - prepared.retired_parts.size() + prepared.produces_part;
+    impl->part_count = impl->part_count - prepared.retired_parts.size() + prepared.produces_part + prepared.added_parts.size();
 }
 #else
 struct DiskState::Impl
@@ -941,6 +1212,11 @@ PartRows DiskState::loadPartRows(const String &) const
     std::unreachable();
 }
 void DiskState::pruneRetired()
+{
+    std::unreachable();
+}
+StateStore::Prepared DiskState::preparePartition(std::vector<PartCommit>, const std::vector<ValidatedPartRows> &,
+    const std::vector<String> &, const std::vector<String> &, const std::vector<String> &)
 {
     std::unreachable();
 }

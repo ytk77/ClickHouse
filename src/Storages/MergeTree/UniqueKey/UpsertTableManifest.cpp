@@ -23,6 +23,7 @@ const String legacy_prefix = "UpsertMergeTree\nrow_metadata=1\nkey_encoding=1\nc
 const String disk_prefix = "UpsertMergeTree\nrow_metadata=1\nkey_encoding=1\ncommit_protocol=disk_state_v2\n";
 const String mutable_ttl_prefix = disk_prefix + "ttl_policy=metadata_v1\n";
 const String mutable_schema_prefix = mutable_ttl_prefix + "schema_policy=metadata_v1\n";
+const String partition_prefix = mutable_schema_prefix + "partition_policy=state_v1\n";
 
 String schemaFingerprint(const String & disk_name, const StorageInMemoryMetadata & metadata, const String & version_column,
     bool include_ttl, bool include_columns = true)
@@ -74,7 +75,7 @@ ObjectID initializeTableManifest(
         use_disk_state = record.payload.starts_with(disk_prefix);
         const bool mutable_ttl = record.payload.starts_with(mutable_ttl_prefix);
         const bool mutable_schema = record.payload.starts_with(mutable_schema_prefix);
-        const auto & protocol_prefix = mutable_schema ? mutable_schema_prefix
+        const auto & protocol_prefix = record.payload.starts_with(partition_prefix) ? partition_prefix : mutable_schema ? mutable_schema_prefix
             : (mutable_ttl ? mutable_ttl_prefix : (use_disk_state ? disk_prefix : legacy_prefix));
         if (record.payload != protocol_prefix + schemaFingerprint(disk_name, metadata, version_column, !mutable_ttl, !mutable_schema))
             throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree table manifest does not match its schema or disk");
@@ -99,7 +100,8 @@ void enableMutableTTL(
     auto record = readManifest(path);
     const auto target = mutable_ttl_prefix + schemaFingerprint(disk_name, metadata, version_column, false);
     if (record.payload == target
-        || record.payload == mutable_schema_prefix + schemaFingerprint(disk_name, metadata, version_column, false, false))
+        || record.payload == mutable_schema_prefix + schemaFingerprint(disk_name, metadata, version_column, false, false)
+        || record.payload == partition_prefix + schemaFingerprint(disk_name, metadata, version_column, false, false))
     {
         /// A previous upgrade may have replaced the file but failed its directory barrier.
         syncDirectory(table_path);
@@ -124,6 +126,23 @@ void enableMutableSchema(
     const auto path = (std::filesystem::path(table_path) / "upsert_manifest.bin").string();
     auto record = readManifest(path);
     const auto target = mutable_schema_prefix + schemaFingerprint(disk_name, metadata, version_column, false, false);
+    if (record.payload == target
+        || record.payload == partition_prefix + schemaFingerprint(disk_name, metadata, version_column, false, false))
+        return;
+    record.payload = target;
+    const auto temporary = path + "." + toString(UUIDHelpers::generateV4()) + ".tmp";
+    createDurableFile(temporary, encodeLogRecord(record));
+    std::filesystem::rename(temporary, path);
+    syncDirectory(table_path);
+}
+
+void enablePartitionOperations(
+    const String & table_path, const String & disk_name, const StorageInMemoryMetadata & metadata, const String & version_column)
+{
+    enableMutableSchema(table_path, disk_name, metadata, version_column);
+    const auto path = (std::filesystem::path(table_path) / "upsert_manifest.bin").string();
+    auto record = readManifest(path);
+    const auto target = partition_prefix + schemaFingerprint(disk_name, metadata, version_column, false, false);
     if (record.payload == target)
         return;
     record.payload = target;

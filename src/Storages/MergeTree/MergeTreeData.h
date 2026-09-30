@@ -696,6 +696,16 @@ public:
 
         MutationsSnapshotPtr mutations_snapshot;
         Upsert::SnapshotPtr upsert_snapshot;
+
+        std::unique_ptr<SnapshotData> clone() const
+        {
+            auto result = std::make_unique<SnapshotData>();
+            result->storage = storage;
+            result->parts = parts;
+            result->mutations_snapshot = mutations_snapshot;
+            result->upsert_snapshot = upsert_snapshot;
+            return result;
+        }
     };
 
     StorageSnapshotPtr getStorageSnapshot(const StorageMetadataPtr & metadata_snapshot, ContextPtr query_context) const override;
@@ -705,6 +715,7 @@ public:
 
     /// Preallocate native part publication before the durable authorization callback.
     void commitUpsertPart(MutableDataPartPtr & part, const std::function<void()> & persist, DataPartsLock & lock);
+    void commitUpsertParts(const MutableDataPartsVector & parts, const std::function<void()> & persist, DataPartsLock & lock);
 
     /// Load the set of data parts from disk. Call once - immediately after the object is created.
     void loadDataParts(bool skip_sanity_checks, std::optional<std::unordered_set<std::string>> expected_parts);
@@ -1099,13 +1110,15 @@ public:
         const ASTPtr & partition,
         const String & with_name,
         ContextPtr context,
-        TableLockHolder & table_lock_holder);
+        TableLockHolder & table_lock_holder,
+        const DataPartsVector * snapshot_parts = nullptr);
 
     /// Freezes all parts.
     PartitionCommandsResultInfo freezeAll(
         const String & with_name,
         ContextPtr context,
-        TableLockHolder & table_lock_holder);
+        TableLockHolder & table_lock_holder,
+        const DataPartsVector * snapshot_parts = nullptr);
 
     /// Unfreezes particular partition.
     PartitionCommandsResultInfo unfreezePartition(
@@ -1594,7 +1607,7 @@ protected:
     using UpsertReadSnapshotPtr = std::shared_ptr<const UpsertReadSnapshot>;
 
     UpsertReadSnapshotPtr prepareUpsertReadSnapshot(
-        Upsert::SnapshotPtr visibility, const DataPartPtr & added_part, const DataPartsVector & removed_parts, DataPartsLock & lock) const;
+        Upsert::SnapshotPtr visibility, const DataPartPtr & added_part, const DataPartsVector & removed_parts, DataPartsLock & lock, const DataPartsVector & added_parts = {}) const;
     UpsertReadSnapshotPtr getUpsertReadSnapshot() const;
     UpsertReadSnapshotPtr getUpsertReadSnapshotForQuery() const;
     void publishUpsertReadSnapshot(UpsertReadSnapshotPtr snapshot);
@@ -1901,7 +1914,7 @@ protected:
     bool isPrimaryOrMinMaxKeyColumnPossiblyWrappedInFunctions(const ASTPtr & node, const StorageMetadataPtr & metadata_snapshot) const;
 
     /// Common part for |freezePartition()| and |freezeAll()|.
-    PartitionCommandsResultInfo freezePartitionsByMatcher(MatcherFn matcher, const String & with_name, ContextPtr context);
+    PartitionCommandsResultInfo freezePartitionsByMatcher(MatcherFn matcher, const String & with_name, ContextPtr context, const DataPartsVector * snapshot_parts = nullptr);
     PartitionCommandsResultInfo unfreezePartitionsByMatcher(MatcherFn matcher, const String & backup_name, ContextPtr context);
 
     // Partition helpers

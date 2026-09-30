@@ -194,6 +194,34 @@ DeduplicationInfo::Ptr DeduplicationInfo::filterToPartition(const PaddedPODArray
 }
 
 
+DeduplicationInfo::Ptr DeduplicationInfo::filterSourceRows(const IColumn::Filter & filter) const
+{
+    cacheDataHashes();
+    if (disabled || level == Level::VIEW)
+        return cloneSelf();
+    if (filter.size() != getRows() || !original_block || original_block->rows() != filter.size())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Source deduplication row filter does not match its input");
+    auto result = cloneSelfFilterImpl();
+    size_t kept = 0;
+    for (size_t token = 0; token < offsets.size(); ++token)
+    {
+        const auto previous = kept;
+        for (size_t row = getTokenBegin(token); row < getTokenEnd(token); ++row)
+            kept += filter[row] != 0;
+        if (kept != previous)
+        {
+            result->tokens.push_back(tokens[token]);
+            result->offsets.push_back(kept);
+        }
+    }
+    Columns columns;
+    for (const auto & column : *original_block)
+        columns.push_back(column.column->filter(filter, kept));
+    result->original_block = std::make_shared<Block>(original_block->cloneWithColumns(columns));
+    return result;
+}
+
+
 DeduplicationInfo::FilterResult DeduplicationInfo::recalculateBlock(DeduplicationInfo::FilterResult && filtered, const std::string & partition_id, ContextPtr context) const
 {
     if (filtered.removed_rows == 0)

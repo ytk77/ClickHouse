@@ -76,8 +76,12 @@ void validateUpsertMergeTreeMetadata(
         throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree supports only DELETE TTL, optionally with WHERE");
     if (metadata.hasAnyTTL() && settings[MergeTreeSetting::ttl_only_drop_parts])
         throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree TTL requires ttl_only_drop_parts = 0");
-    if (metadata.hasProjections() || !metadata.sampling_key.column_names.empty())
-        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree does not support projections or SAMPLE BY");
+    if (!metadata.sampling_key.column_names.empty())
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree does not support SAMPLE BY");
+
+    for (const auto & projection : metadata.getProjections())
+        if (projection.with_block_number)
+            throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree does not support commit-order projections");
 
     /// Synchronous execution preserves per-request deduplication and acknowledges durable commits.
     settings.set("async_insert", false);

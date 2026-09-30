@@ -16,7 +16,7 @@ One local `RocksDB` database in `upsert_state_v2` holds the table's durable deci
 
 The table incarnation and protocol are persisted inside both the authenticated table manifest and the state database. `CREATE` synchronizes the table directory and its ancestors through the configured disk root, including a newly created `store` prefix directory. `ATTACH` requires both identities and never creates a replacement state database. Recovery uses `kTolerateCorruptedTailRecords` to discard an incomplete trailing `WAL` batch. Complete records with checksum errors still prevent recovery. `track_and_verify_wals` checks predecessor logs so a missing or shortened older log cannot be mistaken for an interrupted current append. Existing state created without tracking remains attachable.
 
-New manifests include `ttl_policy=metadata_v1` after the disk-state protocol header. A column or index alteration adds `schema_policy=metadata_v1` by atomically upgrading the manifest before committing SQL metadata. Upgraded manifests authenticate the disk, key expressions and types, version type and incarnation while database SQL metadata owns mutable columns, indexes and expiration policy. Before a column name can be reused, interrupted removals are completed by replacing authenticated parts under the current schema. Older manifests remain readable; the first `MODIFY TTL` or `REMOVE TTL` validates and atomically upgrades the manifest before modifying SQL metadata. Either manifest version accepts the pre-alter policy, so interruption during upgrade requires no cross-file rollback. Older binaries reject the upgraded header.
+New manifests include `ttl_policy=metadata_v1` after the disk-state protocol header. A column, index or projection alteration adds `schema_policy=metadata_v1` by atomically upgrading the manifest before committing SQL metadata. Upgraded manifests authenticate the disk, key expressions and types, version type and incarnation while database SQL metadata owns mutable columns, indexes, projections and expiration policy. Before a column name can be reused, interrupted removals are completed by replacing authenticated parts under the current schema. Older manifests remain readable; the first `MODIFY TTL` or `REMOVE TTL` validates and atomically upgrades the manifest before modifying SQL metadata. Either manifest version accepts the pre-alter policy, so interruption during upgrade requires no cross-file rollback. Older binaries reject the upgraded header.
 
 Policy alteration validates the new definition, serializes against maintenance commit, replaces the SQL metadata through the database, and explicitly synchronizes the metadata file and containing directory before publishing the in-memory policy. A failure after attempting the metadata commit fences the table until restart. Recovery loads the committed SQL definition. This path supports local `Atomic` and `Ordinary` database metadata and does not create native mutations.
 
@@ -27,6 +27,39 @@ Policy alteration validates the new definition, serializes against maintenance c
 5. Acknowledge only after publication. An ambiguous state write or failure after authorization fences new reads and writes until restart and recovery. Already acquired read versions remain consistent.
 
 While fenced, temporary-directory cleanup preserves `tmp_upsert_` payloads after their preparation guards are released. A durable decision may still refer to one of these directories. Recovery authenticates and rolls forward that payload before removing uncommitted preparations. Renames that move the data directory are rejected before the move, including ordinary-database table renames and moves between `Ordinary` and `Atomic` databases; metadata-only renames in `Atomic` databases remain supported.
+
+### Partition publication and detached inputs {#disk-state-partition-publication}
+
+Partition operations upgrade the manifest with `partition_policy=state_v1`. An import
+prepares fresh immutable payloads with new physical identities and self-bound lineage.
+One state batch retires removed parts, installs imported part authorizations, moves
+winners, updates masks and operation bindings, and accounts for partition retry-token
+removal. A multi-part read snapshot is allocated before this batch is committed. Fully
+masked import parts are discarded before publication. Imports and removals retain the
+128-MiB pending-state budget. Per-table operation locks serialize preparation against
+schema changes and maintenance. Cross-table operations acquire these locks together;
+there is no global partition-operation lock. Preparation pins native parts and masks
+without excluding inserts. Publication takes only one table's schema write lock,
+expiration lock and parts lock at a time. Removals retire the selected parts and check
+current winner identities; later inserts survive. Partition counters and retry tokens
+are reset only if that table's published snapshot still matches the removal snapshot.
+
+`DETACH` and `FREEZE` synchronize a checksummed visibility record and each copied
+payload through the containing disk root before source removal or success. `ATTACH`
+synchronizes input renames in the detached directory, then records consumed `attaching_` directories in namespace `D` in the same
+batch as their new payload authorization. Recovery first validates and completes the
+active catalog, then deletes consumed detached inputs and synchronizes the detached
+directory before forgetting their `D` entries. Uncommitted attaching directories are
+restored for a later attempt. This prevents a committed import from leaving a reusable
+input after interruption. Normal maintenance also reclaims committed detached inputs.
+If the original detached name already exists, recovery preserves the uncommitted
+directory under a unique `upsert_recovered_` name and logs the conflict. It never
+overwrites either payload. Attachment rejects an input UUID still present in the
+active snapshot, including a clone left by an interrupted `DETACH`. Frozen payloads
+and their visibility sidecars are selected from the same pinned snapshot.
+
+Cross-table `MOVE` uses a destination import followed by a source removal. There is no
+cross-database atomic batch; interruption between these steps can leave both copies.
 
 ### Grouped payload synchronization {#disk-state-grouped-payload-synchronization}
 
@@ -171,7 +204,8 @@ All integer fields are unsigned little-endian. Length-delimited strings use a fo
 | `M`, printable part identity | Checksummed serialized `DeleteBitmap` |
 | `T`, partition, token, unit | Payload hash, original accepted-row count (including zero), and eight-byte expiration time |
 | `O`, printable operation identity | Original commit sequence |
-| `R`, retired part name | Payload authorization, optionally compacted by `TRUNCATE`, permitting physical removal once native reader pins are released |
+| `D`, consumed detached name | Pending deletion of an `attaching_` input after a durable import |
+| `R`, retired part name | Payload authorization, optionally compacted by `TRUNCATE` or partition removal, permitting physical removal once native reader pins are released |
 | `E`, big-endian expiration time, token key | Ordered retry expiration entry |
 | `retry_bytes` | Accounted retry-state bytes |
 

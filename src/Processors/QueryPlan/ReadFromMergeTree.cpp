@@ -4464,12 +4464,15 @@ void ReadFromMergeTree::initializePipeline(QueryPipelineBuilder & pipeline, [[ma
         /// Create a reader for each projection index based on its metadata and prewhere info.
         for (const auto & read_info : projection_index_read_desc.read_infos)
         {
+            StorageSnapshot::DataPtr projection_data;
+            if (const auto * snapshot_data = dynamic_cast<const MergeTreeData::SnapshotData *>(storage_snapshot->data.get()))
+                projection_data = snapshot_data->clone();
             readers.emplace(
                 read_info.projection->name,
                 SingleProjectionIndexReader(
                     std::make_shared<MergeTreeReadPoolProjectionIndex>(
                         empty_mutations_snapshot,
-                        std::make_shared<StorageSnapshot>(storage_snapshot->storage, read_info.projection->metadata),
+                        std::make_shared<StorageSnapshot>(storage_snapshot->storage, read_info.projection->metadata, std::move(projection_data)),
                         read_info.prewhere_info,
                         actions_settings,
                         reader_settings,
@@ -5228,7 +5231,10 @@ void ReadFromMergeTree::createReadTasksForTextIndex(const UsefulSkipIndexes & sk
         }
     }
 
-    storage_snapshot = std::make_shared<StorageSnapshot>(storage_snapshot->storage, std::move(new_metadata));
+    StorageSnapshot::DataPtr updated_data;
+    if (const auto * snapshot_data = dynamic_cast<const MergeTreeData::SnapshotData *>(storage_snapshot->data.get()))
+        updated_data = snapshot_data->clone();
+    storage_snapshot = std::make_shared<StorageSnapshot>(storage_snapshot->storage, std::move(new_metadata), std::move(updated_data));
 
     if (output_header != nullptr)
     {

@@ -6,9 +6,15 @@
 #include <Processors/QueryPlan/ReadNothingStep.h>
 #include <Processors/Sources/NullSource.h>
 #include <Storages/MergeTree/MergeTreeDataSelectExecutor.h>
+#include <Storages/MergeTree/UniqueKey/UpsertSnapshot.h>
 
 namespace DB
 {
+namespace ErrorCodes
+{
+extern const int SUPPORT_IS_DISABLED;
+}
+
 
 StorageFromMergeTreeProjection::StorageFromMergeTreeProjection(
     StorageID storage_id_, StoragePtr parent_storage_, StorageMetadataPtr parent_metadata_, ProjectionDescriptionRawPtr projection_)
@@ -33,16 +39,20 @@ void StorageFromMergeTreeProjection::read(
 {
     context->checkAccess(AccessType::SELECT, parent_storage->getStorageID());
 
-    /// A UNIQUE KEY parent rejects projection reads in the MergeTreeDataSelectExecutor
-    /// constructor below (the universal projection-read chokepoint), since reading a
-    /// projection part bypasses the parent's delete-bitmap filter.
-
     const auto & snapshot_data = assert_cast<const MergeTreeData::SnapshotData &>(*storage_snapshot->data);
     const auto & parts = snapshot_data.parts;
 
     RangesInDataParts projection_parts;
     for (const auto & part : *parts)
     {
+        if (merge_tree.merging_params.upsert)
+        {
+            const auto mask = snapshot_data.upsert_snapshot
+                ? snapshot_data.upsert_snapshot->getMask(part.data_part->getDeleteBitmapCacheIdentity()) : nullptr;
+            if (!mask || !mask->empty())
+                throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
+                    "UpsertMergeTree projection introspection requires fully visible parent parts");
+        }
         const auto & created_projections = part.data_part->getProjectionParts();
         auto it = created_projections.find(projection->name);
         if (it != created_projections.end())
@@ -84,6 +94,7 @@ StorageFromMergeTreeProjection::getStorageSnapshot(const StorageMetadataPtr & me
     auto data = std::make_unique<MergeTreeData::SnapshotData>();
     data->storage = parent_snapshot_data.storage;
     data->parts = parent_snapshot_data.parts;
+    data->upsert_snapshot = parent_snapshot_data.upsert_snapshot;
     data->mutations_snapshot = parent_snapshot_data.mutations_snapshot;
 
     return std::make_shared<StorageSnapshot>(*this, metadata_snapshot, std::move(data));

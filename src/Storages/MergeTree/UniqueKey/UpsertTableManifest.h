@@ -18,5 +18,8 @@ void enableMutableTTL(
 /// Keep immutable key bindings in the manifest while SQL metadata owns columns and indexes.
 void enableMutableSchema(
     const String & table_path, const String & disk_name, const StorageInMemoryMetadata & metadata, const String & version_column);
+/// Enable durable detached-input cleanup; older binaries must reject this manifest.
+void enablePartitionOperations(
+    const String & table_path, const String & disk_name, const StorageInMemoryMetadata & metadata, const String & version_column);
 }
 }

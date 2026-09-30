@@ -15,6 +15,7 @@
 #include <Interpreters/InterpreterSelectQuery.h>
 #include <Interpreters/Context.h>
 #include <Storages/StorageReplicatedMergeTree.h>
+#include <Storages/MergeTree/UniqueKey/UpsertSnapshot.h>
 
 
 namespace DB
@@ -43,26 +44,28 @@ namespace ErrorCodes
 namespace QueryPlanOptimizations
 {
 
+bool canUseProjectionForPart(const StorageSnapshotPtr & snapshot, const IMergeTreeDataPart & parent)
+{
+    const auto * data = dynamic_cast<const MergeTreeData::SnapshotData *>(snapshot->data.get());
+    if (data && data->upsert_snapshot)
+    {
+        const auto mask = data->upsert_snapshot->getMask(parent.getDeleteBitmapCacheIdentity());
+        return mask && mask->empty();
+    }
+    return snapshot->storage.getName() != "UpsertMergeTree";
+}
+
 bool canUseProjectionForReadingStep(ReadFromMergeTree * reading)
 {
-    /// Reading through a projection part bypasses the parent table's
-    /// delete-bitmap filter, so logically-deleted rows would resurface. Decline
-    /// the projection for a unique-key table that carries one (CREATE/ALTER
-    /// reject the combination, but SECONDARY_CREATE/ATTACH load it); the
-    /// optimizer then falls back to the correctly-filtered base-table read, and
-    /// an actual projection-part read is hard-rejected downstream in
-    /// MergeTreeDataSelectExecutor. A unique-key table with no projection is
-    /// unaffected.
-    /// TODO(unique-key): support reading via projections on UNIQUE KEY tables.
-    /// TODO(unique-key): count shortcuts that bypass the delete bitmap — the
-    /// implicit _minmax_count_projection here and the trivial-count path
-    /// (supportsTrivialCountOptimization -> totalRows) — are deferred to the
-    /// read+delete work, which makes count() delete-bitmap-aware.
+    const auto metadata = reading->getStorageMetadata();
+    if (reading->getMergeTreeData().merging_params.upsert)
     {
-        const auto metadata = reading->getStorageMetadata();
-        if (reading->getMergeTreeData().merging_params.upsert || (metadata->hasUniqueKey() && metadata->hasProjections()))
+        const auto * snapshot = dynamic_cast<const MergeTreeData::SnapshotData *>(reading->getStorageSnapshot()->data.get());
+        if (!snapshot || !snapshot->upsert_snapshot)
             return false;
     }
+    else if (metadata->hasUniqueKey() && metadata->hasProjections())
+        return false;
 
     if (reading->getAnalyzedResult() && reading->getAnalyzedResult()->readFromProjection())
         return false;
@@ -368,7 +371,8 @@ bool analyzeProjectionCandidate(
     ReadFromMergeTree::AnalysisResult & parent_reading_select_result,
     const SelectQueryInfo & projection_query_info,
     const std::optional<TopKFilterInfo> & top_k_filter_info,
-    const ContextPtr & context)
+    const ContextPtr & context,
+    const StorageSnapshotPtr & storage_snapshot)
 {
     RangesInDataParts projection_parts;
     size_t parent_parts_sum_marks = 0;
@@ -376,7 +380,8 @@ bool analyzeProjectionCandidate(
     {
         const auto & created_projections = part_with_ranges.data_part->getProjectionParts();
         auto it = created_projections.find(candidate.projection->name);
-        if (it != created_projections.end() && !it->second->is_broken
+        if (canUseProjectionForPart(storage_snapshot, *part_with_ranges.data_part)
+            && it != created_projections.end() && !it->second->is_broken
             && projectionPartHasRequiredColumns(
                 *it->second, *part_with_ranges.data_part, *candidate.projection, parent_metadata, required_column_names))
         {
@@ -462,7 +467,8 @@ void filterPartsAndCollectProjectionCandidates(
     {
         const auto & created_projections = part_with_ranges.data_part->getProjectionParts();
         auto it = created_projections.find(projection.name);
-        if (it != created_projections.end() && !it->second->is_broken
+        if (canUseProjectionForPart(reading.getStorageSnapshot(), *part_with_ranges.data_part)
+            && it != created_projections.end() && !it->second->is_broken
             && projectionPartHasRequiredColumns(
                 *it->second, *part_with_ranges.data_part, projection, parent_metadata, filter_required_columns))
         {

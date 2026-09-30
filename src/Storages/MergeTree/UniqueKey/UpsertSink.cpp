@@ -4,6 +4,7 @@
 #include <Storages/StorageMergeTree.h>
 #include <Storages/MergeTree/MergeTreeDataWriter.h>
 #include <Interpreters/Context.h>
+#include <Interpreters/InsertDeduplication.h>
 #include <Interpreters/ProcessList.h>
 #include <Columns/ColumnsNumber.h>
 #include <DataTypes/DataTypesNumber.h>
@@ -28,6 +29,7 @@ extern const Metric LocalThreadScheduled;
 namespace DB::Setting
 {
 extern const SettingsSeconds lock_acquire_timeout;
+extern const SettingsBool wait_for_part_commit_in_dependent_materialized_views;
 extern const SettingsUInt64 max_partitions_per_insert_block;
 extern const SettingsUInt64 unique_key_max_encoded_size;
 extern const SettingsString insert_deduplication_token;
@@ -109,13 +111,21 @@ Sink::Sink(StorageMergeTree & storage_, StorageMetadataPtr metadata_, ContextPtr
 {
     const auto current_metadata = storage.getInMemoryMetadataPtr(context, true);
     if (metadata->getColumns().toString(false) != current_metadata->getColumns().toString(false)
-        || metadata->getSecondaryIndices().allToString() != current_metadata->getSecondaryIndices().allToString())
+        || metadata->getSecondaryIndices().allToString() != current_metadata->getSecondaryIndices().allToString()
+        || metadata->getProjections().toString() != current_metadata->getProjections().toString())
         throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree schema changed before insert; retry the query");
     if (context->getSettingsRef()[Setting::input_format_max_block_wait_ms])
         throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree does not support streaming inserts");
 }
 
 Sink::~Sink() = default;
+
+void Sink::setHasDependentMaterializedViews(bool has_views)
+{
+    has_dependent_views = has_views;
+    synchronously_commit_for_views = has_views
+        && context->getSettingsRef()[Setting::wait_for_part_commit_in_dependent_materialized_views];
+}
 
 void Sink::onStart()
 {
@@ -159,12 +169,6 @@ String Sink::getName() const
     return "UpsertMergeTreeSink";
 }
 
-void Sink::setHasDependentMaterializedViews(bool has_views)
-{
-    if (has_views)
-        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree incremental materialized views require retractions");
-}
-
 void Sink::consume(Chunk & chunk)
 {
     if (!chunk.getNumRows())
@@ -173,6 +177,9 @@ void Sink::consume(Chunk & chunk)
     if (client_token.size() > 1024)
         throw Exception(ErrorCodes::LIMIT_EXCEEDED, "UpsertMergeTree deduplication token exceeds 1024 bytes");
     const auto input = getHeader().cloneWithColumns(chunk.getColumns());
+    IColumn::Filter forwarded;
+    if (has_dependent_views && !client_token.empty())
+        forwarded.resize_fill(input.rows(), 0);
     size_t offset = 0;
     size_t max_rows = MAX_UNIT_ROWS;
     while (offset < input.rows() && !isCancelled())
@@ -182,7 +189,7 @@ void Sink::consume(Chunk & chunk)
         CurrentMemoryTracker::check();
         auto block = cutInputBlock(input, offset, max_rows);
         const size_t rows = block.rows();
-        if (!consumeBlock(std::move(block), offset, client_token))
+        if (!consumeBlock(std::move(block), offset, client_token, forwarded.empty() ? nullptr : &forwarded))
         {
             /// A wide encoded key can exhaust the independent lineage budget even when the columns fit.
             if (rows == 1)
@@ -194,14 +201,33 @@ void Sink::consume(Chunk & chunk)
         offset += rows;
         max_rows = MAX_UNIT_ROWS;
     }
+    if (synchronously_commit_for_views)
+        while (!impl->pending.empty() && !isCancelled())
+            finishFront();
+    if (!forwarded.empty())
+    {
+        const size_t kept = std::count(forwarded.begin(), forwarded.end(), UInt8{1});
+        if (!kept)
+            chunk.clear();
+        else if (kept != input.rows())
+        {
+            if (auto info = chunk.getChunkInfos().extract<DeduplicationInfo>())
+                chunk.getChunkInfos().add(info->filterSourceRows(forwarded));
+            Columns columns;
+            for (const auto & column : input)
+                columns.push_back(column.column->filter(forwarded, kept));
+            chunk.setColumns(std::move(columns), kept);
+        }
+    }
 }
 
-bool Sink::consumeBlock(Block block, size_t first_row, const String & client_token)
+bool Sink::consumeBlock(Block block, size_t first_row, const String & client_token, IColumn::Filter * forwarded)
 {
     auto ordinals = ColumnUInt64::create();
     for (size_t row = 0; row < block.rows(); ++row)
         ordinals->insertValue(first_row + row);
     const auto & settings = context->getSettingsRef();
+    const size_t input_rows = block.rows();
     IColumn::Selector selector;
     auto partitions = MergeTreeDataWriter::splitBlockIntoParts(
         std::move(block), settings[Setting::max_partitions_per_insert_block], metadata, context, &selector);
@@ -253,14 +279,18 @@ bool Sink::consumeBlock(Block block, size_t first_row, const String & client_tok
             return true;
         if (auto process = context->getProcessListElement())
             process->checkTimeLimit();
-        if (!impl->pool)
+        if (!impl->pool || forwarded)
         {
             auto prepared = storage.prepareUpsertBlock(partitions[i], metadata, context, std::move(tokens[i]));
             if (prepared && !isCancelled())
             {
                 if (auto process = context->getProcessListElement())
                     process->checkTimeLimit();
-                storage.commitUpsertBlock(*prepared);
+                const bool committed = storage.commitUpsertBlock(*prepared);
+                if (forwarded && committed)
+                    for (size_t row = 0; row < input_rows; ++row)
+                        if (selector.empty() || selector[row] == i)
+                            (*forwarded)[first_row + row] = 1;
             }
             continue;
         }
@@ -339,7 +369,7 @@ std::unique_ptr<Upsert::PreparedInsert> StorageMergeTree::prepareUpsertBlock(
         std::move(temporary), partition_id, std::move(authorization), std::move(validated));
 }
 
-void StorageMergeTree::commitUpsertBlock(Upsert::PreparedInsert & input)
+bool StorageMergeTree::commitUpsertBlock(Upsert::PreparedInsert & input)
 {
     auto & part = input.temporary->part;
     auto & authorization = input.authorization;
@@ -360,7 +390,7 @@ void StorageMergeTree::commitUpsertBlock(Upsert::PreparedInsert & input)
         throw;
     }
     if (prepared.replayed_token)
-        return;
+        return false;
     /// Allocate the complete next read version before any ambiguous durable operation.
     auto read_snapshot = prepareUpsertReadSnapshot(prepared.snapshot, prepared.produces_part ? part : nullptr, {}, lock);
     try
@@ -380,21 +410,30 @@ void StorageMergeTree::commitUpsertBlock(Upsert::PreparedInsert & input)
         upsert_fenced = true;
         throw;
     }
+    return true;
 }
 
 void MergeTreeData::commitUpsertPart(MutableDataPartPtr & part, const std::function<void()> & persist, DataPartsLock & lock)
 {
+    commitUpsertParts({part}, persist, lock);
+}
+
+void MergeTreeData::commitUpsertParts(const MutableDataPartsVector & parts, const std::function<void()> & persist, DataPartsLock & lock)
+{
     Transaction transaction(*this, nullptr);
     try
     {
-        /// Allocate the index node, transaction bookkeeping and column counters before authorization.
-        if (!renameTempPartAndAdd(part, transaction, lock, true))
-            throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree part could not be prepared");
-        part->assertHasVersionMetadata(nullptr);
-        addPartContributionToColumnAndSecondaryIndexSizes(part);
+        /// Allocate index nodes, transaction bookkeeping and column counters before authorization.
+        for (auto part : parts)
+        {
+            if (!renameTempPartAndAdd(part, transaction, lock, true))
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree part could not be prepared");
+            part->assertHasVersionMetadata(nullptr);
+            addPartContributionToColumnAndSecondaryIndexSizes(part);
+        }
         persist();
         transaction.renameParts();
-        Upsert::syncDirectory(std::filesystem::path(part->getDataPartStorage().getFullPath()) / "..");
+        Upsert::syncDirectory(std::filesystem::path(getDisks().front()->getPath()) / getRelativeDataPath());
         fiu_do_on(FailPoints::upsert_throw_after_rename,
         {
             throw Exception(ErrorCodes::FAULT_INJECTED, "Injected UpsertMergeTree failure after durable rename");
@@ -404,15 +443,19 @@ void MergeTreeData::commitUpsertPart(MutableDataPartPtr & part, const std::funct
             throw Exception(ErrorCodes::FAULT_INJECTED, "Injected UpsertMergeTree failure before publication");
         });
         /// The caller publishes the preallocated read version after all native part changes complete.
-        modifyPartState(part, DataPartState::Active, lock);
-        increaseDataVolume(static_cast<ssize_t>(part->getBytesOnDisk()), static_cast<ssize_t>(part->rows_count), 1);
+        for (const auto & part : parts)
+        {
+            modifyPartState(part, DataPartState::Active, lock);
+            increaseDataVolume(static_cast<ssize_t>(part->getBytesOnDisk()), static_cast<ssize_t>(part->rows_count), 1);
+        }
         transaction.clear();
     }
     catch (...)
     {
         /// Neither rollback nor temporary-part destruction may remove ambiguously committed payloads.
         transaction.clear();
-        part->is_temp = false;
+        for (const auto & part : parts)
+            part->is_temp = false;
         upsert_fenced = true;
         throw;
     }

@@ -16,6 +16,7 @@ namespace DB::QueryPlanOptimizations
 
 /// Common checks that projection can be used for this step.
 bool canUseProjectionForReadingStep(ReadFromMergeTree * reading);
+bool canUseProjectionForPart(const StorageSnapshotPtr & snapshot, const IMergeTreeDataPart & parent);
 
 /// Max blocks for sequential consistency reading from replicated table.
 PartitionIdToMaxBlockPtr getMaxAddedBlocks(ReadFromMergeTree * reading);
@@ -81,7 +82,8 @@ bool analyzeProjectionCandidate(
     ReadFromMergeTree::AnalysisResult & parent_reading_select_result,
     const SelectQueryInfo & projection_query_info,
     const std::optional<TopKFilterInfo> & top_k_filter_info,
-    const ContextPtr & context);
+    const ContextPtr & context,
+    const StorageSnapshotPtr & storage_snapshot);
 
 /// Performs part-level filtering using projection to skip irrelevant data parts.
 /// Also collects projections to build filters that will be applied during MergeTree reading for fine-grained row-level filtering.

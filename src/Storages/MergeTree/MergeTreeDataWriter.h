@@ -92,7 +92,8 @@ public:
         BlockWithPartition & block,
         StorageMetadataPtr metadata_snapshot,
         ContextPtr context,
-        bool may_exist = true);
+        bool may_exist = true,
+        bool force_projections = false);
 
     MergeTreeTemporaryPartPtr writeTempPatchPart(
         BlockWithPartition & block,
@@ -142,7 +143,8 @@ private:
         SourcePartsSetForPatch source_parts_set,
         ContextPtr context,
         UInt64 block_number,
-        bool may_exist = true);
+        bool may_exist = true,
+        bool force_projections = false);
 
     static MergeTreeTemporaryPartPtr writeProjectionPartImpl(
         const String & part_name,

@@ -123,6 +123,7 @@ public:
 
     void drop() override;
     void truncate(const ASTPtr &, const StorageMetadataPtr &, ContextPtr, TableExclusiveLockHolder &) override;
+    Pipe alterPartition(const StorageMetadataPtr &, const PartitionCommands &, ContextPtr) override;
 
     void alter(const AlterCommands & commands, ContextPtr context, AlterLockHolder & table_lock_holder) override;
 
@@ -141,7 +142,7 @@ public:
 
     std::unique_ptr<Upsert::PreparedInsert> prepareUpsertBlock(
         BlockWithPartition & block, const StorageMetadataPtr & metadata, ContextPtr context, Upsert::Token token);
-    void commitUpsertBlock(Upsert::PreparedInsert & prepared);
+    bool commitUpsertBlock(Upsert::PreparedInsert & prepared);
     bool isUpsertTokenCommitted(const String & partition, const Upsert::Token & token) const;
 
 private:

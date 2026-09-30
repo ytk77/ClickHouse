@@ -585,7 +585,7 @@ std::optional<String> optimizeUseNormalProjections(
             *parent_reading_select_result,
             projection_query_info,
             reading->getTopKFilterInfo(),
-            context);
+            context, reading->getStorageSnapshot());
 
         if (!analyzed)
             continue;
@@ -676,7 +676,11 @@ std::optional<String> optimizeUseNormalProjections(
     }
 
     auto storage_snapshot = reading->getStorageSnapshot();
-    auto proj_snapshot = std::make_shared<StorageSnapshot>(storage_snapshot->storage, best_candidate->projection->metadata);
+    StorageSnapshot::DataPtr projection_data;
+    if (const auto * snapshot_data = dynamic_cast<const MergeTreeData::SnapshotData *>(storage_snapshot->data.get()))
+        projection_data = snapshot_data->clone();
+    auto proj_snapshot = std::make_shared<StorageSnapshot>(
+        storage_snapshot->storage, best_candidate->projection->metadata, std::move(projection_data));
 
     /// Enables PREWHERE on projections to improve read efficiency and leverage query condition cache.
     if (query.dag && query.filter_node)

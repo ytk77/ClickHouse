@@ -848,7 +848,11 @@ std::optional<String> optimizeUseAggregateProjections(
                           *aggregating,
                           *reading,
                           max_added_blocks,
-                          optimization_settings.optimize_use_implicit_projections,
+                          optimization_settings.optimize_use_implicit_projections
+                              && std::ranges::all_of(reading->getParts(), [&](const auto & part)
+                              {
+                                  return canUseProjectionForPart(reading->getStorageSnapshot(), *part.data_part);
+                              }),
                           max_set_size_for_match));
 
     auto logger = getLogger("optimizeUseAggregateProjections");
@@ -1010,7 +1014,7 @@ std::optional<String> optimizeUseAggregateProjections(
                     *parent_reading_select_result,
                     projection_query_info,
                     reading->getTopKFilterInfo(),
-                    context);
+                    context, reading->getStorageSnapshot());
 
                 if (!analyzed)
                     continue;
@@ -1167,7 +1171,11 @@ std::optional<String> optimizeUseAggregateProjections(
     {
         chassert(parent_reading_select_result);
         auto storage_snapshot = reading->getStorageSnapshot();
-        auto proj_snapshot = std::make_shared<StorageSnapshot>(storage_snapshot->storage, best_candidate->projection->metadata);
+        StorageSnapshot::DataPtr projection_data;
+        if (const auto * snapshot_data = dynamic_cast<const MergeTreeData::SnapshotData *>(storage_snapshot->data.get()))
+            projection_data = snapshot_data->clone();
+        auto proj_snapshot = std::make_shared<StorageSnapshot>(
+            storage_snapshot->storage, best_candidate->projection->metadata, std::move(projection_data));
         auto projection_query_info = query_info;
         projection_query_info.prewhere_info = nullptr;
         projection_query_info.row_level_filter = nullptr;
