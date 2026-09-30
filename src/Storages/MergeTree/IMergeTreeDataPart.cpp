@@ -2290,7 +2290,8 @@ UInt64 IMergeTreeDataPart::readExistingRowsCount()
 void IMergeTreeDataPart::loadTTLInfos()
 {
     auto metadata_snapshot = getMetadataSnapshot();
-    if (metadata_snapshot->hasAnyTTL())
+    /// `UpsertMergeTree` can restore an unchanged policy after `REMOVE TTL` without rewriting its parts.
+    if (metadata_snapshot->hasAnyTTL() || storage.merging_params.upsert)
     {
         if (auto in = readFileIfExists("ttl.txt"))
         {

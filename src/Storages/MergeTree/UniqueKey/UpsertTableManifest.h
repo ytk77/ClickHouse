@@ -12,5 +12,8 @@ namespace Upsert
 ObjectID initializeTableManifest(
     const String & table_path, const String & disk_name, const String & disk_path,
     const StorageInMemoryMetadata & metadata, const String & version_column, bool attach, bool & use_disk_state);
+/// Atomically upgrade old disk-state manifests before allowing mutable `TTL` metadata.
+void enableMutableTTL(
+    const String & table_path, const String & disk_name, const StorageInMemoryMetadata & metadata, const String & version_column);
 }
 }

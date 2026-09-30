@@ -89,7 +89,9 @@ public:
     UInt64 authorizedPartCount() const;
     Prepared prepare(const String & partition, PartCommit part, const PartRows & rows);
     Prepared prepare(const String & partition, PartCommit part, const ValidatedPartRows & rows);
-    Prepared prepareMerge(const String & partition, PartCommit part, const PartRows & rows, const std::vector<String> & sources);
+    Prepared prepareMerge(
+        const String & partition, PartCommit part, const PartRows & rows, const std::vector<String> & sources,
+        const PartRows & expired = {});
     PartRows loadPartRows(const String & name) const;
     void pruneRetired();
     void append(const Prepared & prepared);

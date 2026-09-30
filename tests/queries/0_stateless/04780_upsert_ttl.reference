@@ -1,0 +1,20 @@
+3
+1	2	10	retained
+2	1	10	other partition
+1	2	10	retained
+2	1	10	other partition
+1	1	1	reinserted
+1	2	10	retained
+2	1	10	other partition
+3
+1	2	10	retained
+2	1	10	other partition
+1	2	10	retained
+2	1	10	other partition
+1	1	1	reinserted
+1	2	10	retained
+2	1	10	other partition
+3	3
+4	1
+5	1
+0

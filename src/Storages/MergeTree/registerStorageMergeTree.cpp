@@ -1224,7 +1224,6 @@ void registerStorageMergeTree(StorageFactory & factory)
 
     auto upsert_features = features;
     upsert_features.supports_projections = false;
-    upsert_features.supports_ttl = false;
     factory.registerStorage("UpsertMergeTree", create, upsert_features);
 
     factory.registerStorage("MergeTree", create, features, Documentation{

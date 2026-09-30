@@ -1,9 +1,15 @@
 #include <Storages/MergeTree/UniqueKey/UpsertLogRecord.h>
 #include <Storages/MergeTree/UniqueKey/UpsertRowMetadata.h>
 #include <Storages/MergeTree/UniqueKey/UpsertPartData.h>
+#include <Storages/MergeTree/UniqueKey/UpsertTableManifest.h>
+#include <Storages/MergeTree/UniqueKey/UpsertDurableFile.h>
+#include <Storages/StorageInMemoryMetadata.h>
+#include <DataTypes/DataTypesNumber.h>
+#include <Parsers/ASTIdentifier.h>
 #include <Common/Exception.h>
 #include <gtest/gtest.h>
 #include <limits>
+#include <filesystem>
 
 using namespace DB;
 using namespace DB::Upsert;
@@ -233,4 +239,94 @@ TEST(UpsertPartRows, PrevalidationRejectsInvalidImmutableInput)
     bad = rows;
     bad[1].value.row.write_csn = 1;
     EXPECT_THROW((ValidatedPartRows(bad, id)), Exception);
+}
+
+class UpsertTTLManifestTest : public ::testing::Test
+{
+protected:
+    std::filesystem::path directory;
+    StorageInMemoryMetadata metadata;
+
+    void SetUp() override
+    {
+        directory = std::filesystem::path("tmp") / ("upsert_ttl_manifest_" + objectName(newObjectID()));
+        std::filesystem::create_directories(directory);
+        ColumnsDescription columns;
+        columns.add(ColumnDescription("id", std::make_shared<DataTypeUInt64>()));
+        metadata.setColumns(columns);
+    }
+    void TearDown() override
+    {
+        std::filesystem::remove_all(directory);
+    }
+    ObjectID initialize(bool attach, bool & disk_state)
+    {
+        return initializeTableManifest(directory, "default", directory, metadata, "", attach, disk_state);
+    }
+    void makeLegacyManifest(bool disk_state, bool with_ttl)
+    {
+        bool protocol;
+        initialize(false, protocol);
+        const auto path = directory / "upsert_manifest.bin";
+        auto record = decodeLogRecord(readBoundedFile(path, MAX_RECORD_BYTES), false)->record;
+        const String marker = "ttl_policy=metadata_v1\n";
+        record.payload.erase(record.payload.find(marker), marker.size());
+        if (!disk_state)
+            record.payload.replace(record.payload.find("disk_state_v2"), String("disk_state_v2").size(), "parts_sync_v1");
+        if (with_ttl)
+        {
+            const auto ttl = metadata.table_ttl.definition_ast->formatWithSecretsOneLine();
+            record.payload += std::to_string(ttl.size()) + ":" + ttl;
+        }
+        std::filesystem::remove(path);
+        createDurableFile(path, encodeLogRecord(record));
+    }
+};
+
+TEST_F(UpsertTTLManifestTest, MutablePolicyKeepsStructuralAuthentication)
+{
+    bool disk_state;
+    const auto incarnation = initialize(false, disk_state);
+    metadata.table_ttl.definition_ast = make_intrusive<ASTIdentifier>("expires");
+    EXPECT_EQ(initialize(true, disk_state), incarnation);
+    EXPECT_TRUE(disk_state);
+    metadata.table_ttl = {};
+    EXPECT_EQ(initialize(true, disk_state), incarnation);
+    auto columns = metadata.getColumns();
+    columns.add(ColumnDescription("extra", std::make_shared<DataTypeUInt64>()));
+    metadata.setColumns(columns);
+    EXPECT_THROW(initialize(true, disk_state), Exception);
+}
+
+TEST_F(UpsertTTLManifestTest, UpgradeOldManifestWithoutTTLIsIdempotent)
+{
+    makeLegacyManifest(true, false);
+    bool disk_state;
+    const auto incarnation = initialize(true, disk_state);
+    enableMutableTTL(directory, "default", metadata, "");
+    EXPECT_EQ(initialize(true, disk_state), incarnation);
+    enableMutableTTL(directory, "default", metadata, "");
+    metadata.table_ttl.definition_ast = make_intrusive<ASTIdentifier>("expires");
+    EXPECT_EQ(initialize(true, disk_state), incarnation);
+}
+
+TEST_F(UpsertTTLManifestTest, UpgradeOldFixedTTLManifestPreservesIncarnation)
+{
+    metadata.table_ttl.definition_ast = make_intrusive<ASTIdentifier>("expires");
+    makeLegacyManifest(true, true);
+    bool disk_state;
+    const auto incarnation = initialize(true, disk_state);
+    enableMutableTTL(directory, "default", metadata, "");
+    metadata.table_ttl = {};
+    EXPECT_EQ(initialize(true, disk_state), incarnation);
+}
+
+TEST_F(UpsertTTLManifestTest, MismatchingSchemaAndLegacyProtocolCannotUpgrade)
+{
+    makeLegacyManifest(false, false);
+    bool disk_state;
+    initialize(true, disk_state);
+    EXPECT_FALSE(disk_state);
+    EXPECT_THROW(enableMutableTTL(directory, "default", metadata, ""), Exception);
+    EXPECT_THROW(enableMutableTTL(directory, "other_disk", metadata, ""), Exception);
 }

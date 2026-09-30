@@ -19,7 +19,8 @@ public:
     void checkAdmission() const;
     bool tokenAlreadyCommitted(const String & partition, const Token & token, bool throw_on_mismatch = true) const;
     StateStore::Prepared prepare(const String & partition, PartCommit part, const ValidatedPartRows & rows);
-    StateStore::Prepared prepareMerge(const String & partition, PartCommit part, const PartRows & rows, const std::vector<String> & sources);
+    StateStore::Prepared prepareMerge(
+        const String & partition, PartCommit part, const PartRows & rows, const std::vector<String> & sources, const PartRows & expired);
     PartRows loadPartRows(const String & name) const;
     void pruneRetired();
     void append(const StateStore::Prepared & prepared);

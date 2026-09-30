@@ -160,7 +160,7 @@ checkpoint 捕捉同一 `cut_csn` 的索引 root、活動 parts、精確 journal
 
 月份是候選方案而非已驗證的最佳值。需以每月資料量、保留期限、晚到更新範圍與實際查詢比較日／月粒度；不要直接把 512 hash buckets 再乘上所有月份。每批資料跨越多少 SQL partitions，會直接影響 parts 生成與合併機會。[ClickHouse 官方 partition 說明](https://clickhouse.com/docs/concepts/best-practices/partitioning-keys)
 
-永久保留且持續新增的交易仍需容量擴充與穩定 key routing 的分片策略。若使用保留／歸檔政策，必須一併定義過期月份的晚到資料處置，避免已刪除資料因重送被重新建立。目前 `TTL`、partition 操作、複寫與共享儲存仍被 gate；本提案不把原生其他引擎支援的功能視為 `UpsertMergeTree` 已可用。
+永久保留且持續新增的交易仍需容量擴充與穩定 key routing 的分片策略。若使用保留／歸檔政策，必須一併定義過期月份的晚到資料處置，避免已刪除資料因重送被重新建立。`disk_state_v2` 表支援資料列 `TTL DELETE`；位於本機 `Atomic` 或 `Ordinary` 資料庫的既有表也可使用 `MODIFY TTL`／`REMOVE TTL` 調整規則。過期後不保留版本下限；詳見[資料列過期契約](/development/upsert-merge-tree#upsert-row-expiration)。其他 `TTL` 動作、partition 操作、複寫與共享儲存仍被 gate；本提案不把原生其他引擎支援的功能視為 `UpsertMergeTree` 已可用。
 
 ## 實作順序與生產驗收 {#implementation-and-production-gates}
 

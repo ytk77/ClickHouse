@@ -365,11 +365,11 @@ void StateStore::append(const Prepared & prepared)
 }
 
 StateStore::Prepared StateStore::prepareMerge(
-    const String & partition, PartCommit part, const PartRows & rows, const std::vector<String> & sources)
+    const String & partition, PartCommit part, const PartRows & rows, const std::vector<String> & sources, const PartRows & expired)
 {
     if (!disk)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Legacy UpsertMergeTree does not authorize reclamation");
-    return disk->prepareMerge(partition, std::move(part), rows, sources);
+    return disk->prepareMerge(partition, std::move(part), rows, sources, expired);
 }
 
 PartRows StateStore::loadPartRows(const String & name) const

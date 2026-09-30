@@ -12,6 +12,7 @@ namespace DB
 namespace MergeTreeSetting
 {
     extern const MergeTreeSettingsBool async_insert;
+    extern const MergeTreeSettingsBool ttl_only_drop_parts;
 }
 
 namespace ErrorCodes
@@ -74,8 +75,13 @@ void validateUpsertMergeTreeMetadata(
         if (key->expression)
             key->expression->getActionsDAG().assertDeterministic();
 
-    if (metadata.hasAnyTTL() || metadata.hasProjections() || !metadata.sampling_key.column_names.empty())
-        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree does not support TTL, projections or SAMPLE BY");
+    if (metadata.hasAnyColumnTTL() || !metadata.getMoveTTLs().empty()
+        || !metadata.getRecompressionTTLs().empty() || !metadata.getGroupByTTLs().empty())
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree supports only DELETE TTL, optionally with WHERE");
+    if (metadata.hasAnyTTL() && settings[MergeTreeSetting::ttl_only_drop_parts])
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree TTL requires ttl_only_drop_parts = 0");
+    if (metadata.hasProjections() || !metadata.sampling_key.column_names.empty())
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree does not support projections or SAMPLE BY");
 
     /// These settings are format invariants, including when configuration defaults change.
     settings.set("assign_part_uuids", true);

@@ -40,6 +40,9 @@ static struct InitFiu
     ONCE(upsert_throw_before_publish) \
     PAUSEABLE_ONCE(upsert_pause_after_read_snapshot) \
     PAUSEABLE_ONCE(upsert_pause_before_merge_commit) \
+    PAUSEABLE_ONCE(upsert_ttl_pause_after_manifest_upgrade) \
+    PAUSEABLE_ONCE(upsert_ttl_pause_after_metadata_commit) \
+    ONCE(upsert_ttl_throw_after_metadata_commit) \
     PAUSEABLE_ONCE(upsert_pause_first_preparation) \
     PAUSEABLE_ONCE(upsert_pause_ready_preparation) \
     ONCE(upsert_throw_during_preparation) \

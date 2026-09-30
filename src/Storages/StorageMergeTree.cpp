@@ -534,6 +534,12 @@ void StorageMergeTree::alter(
     if (local_context->getCurrentTransaction() && local_context->getSettingsRef()[Setting::throw_on_unsupported_query_inside_transaction])
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "ALTER METADATA is not supported inside transactions");
 
+    if (merging_params.upsert)
+    {
+        alterUpsertTTL(commands, local_context);
+        return;
+    }
+
     auto table_id = getStorageID();
     auto old_storage_settings = getSettings();
     const auto & query_settings = local_context->getSettingsRef();

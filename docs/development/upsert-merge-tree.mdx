@@ -70,10 +70,78 @@ record. The record is synchronized before part rename, directory synchronization
 The table manifest must exist during attachment and must match the schema and disk.
 An existing data directory cannot be imported as a new `UpsertMergeTree` table.
 
-`ALTER`, `TRUNCATE`, mutations, partition operations, projections, sampling definitions,
+`ALTER` other than `MODIFY TTL` and `REMOVE TTL`, `TRUNCATE`, mutations, partition operations, projections, sampling definitions,
 streaming, backup, restore, `CHECK TABLE`, background moves, and incremental materialized views are gated.
 The `_upsert_` prefix is reserved; the input-only delete flag is not connected yet.
 General `DELETE WHERE` and partial-column updates are not part of the initial contract.
+
+## Row expiration {#upsert-row-expiration}
+
+New `disk_state_v2` tables support table-level `TTL ... DELETE`, including `DELETE WHERE`:
+
+```sql
+CREATE TABLE expiring_state
+(
+    id UInt64,
+    ver UInt64,
+    updated_at DateTime,
+    value String
+)
+ENGINE = UpsertMergeTree(ver)
+ORDER BY id
+UNIQUE KEY id
+TTL updated_at + INTERVAL 30 DAY DELETE;
+```
+
+Expiration runs asynchronously in bounded background maintenance, including when the table has
+only one part and no new inserts arrive. A row can remain visible after its deadline until
+maintenance commits. `Date`, `Date32`, `DateTime` and `DateTime64` expressions use the standard
+`MergeTree` expiration semantics. `SYSTEM STOP TTL MERGES` pauses expiration;
+`SYSTEM START TTL MERGES` resumes it. The native `merge_with_ttl_timeout` setting does not
+control this engine's dedicated maintenance task.
+
+Expiration applies to the current winning row. If another insert replaces that row while maintenance
+is preparing, the new winner survives and is evaluated by subsequent maintenance. Readers already
+holding a snapshot keep their original rows. The winner-index deletion and part retirement commit
+atomically and survive restart; superseded physical rows cannot reappear.
+
+Once a winner expires, its key has no retained version floor: a subsequent insert can create it again,
+even with a lower version. Existing deduplication tokens still suppress retries during their normal
+retention window. Retention policies must account for late arrivals and retries outside that window.
+
+### Changing expiration on existing tables {#upsert-alter-row-expiration}
+
+Existing `disk_state_v2` tables in local `Atomic` or `Ordinary` databases support adding, changing,
+and removing table expiration without recreating the table:
+
+```sql
+ALTER TABLE expiring_state MODIFY TTL updated_at + INTERVAL 7 DAY DELETE;
+ALTER TABLE expiring_state MODIFY TTL updated_at + INTERVAL 30 DAY DELETE WHERE value = 'inactive';
+ALTER TABLE expiring_state REMOVE TTL;
+```
+
+`MODIFY TTL` applies to existing rows and subsequent inserts. The statement commits the new policy;
+bounded background maintenance then recalculates existing parts and deletes eligible winners.
+It does not wait for all expired rows to disappear. This uses the engine's maintenance protocol,
+independently of `materialize_ttl_after_modify`, and creates no native mutations. Changing only the
+`WHERE` condition also invalidates cached expiration information. Pausing `TTL` merges postpones
+this work until they resume.
+
+`REMOVE TTL` stops future expiration, including any maintenance prepared under the previous rule
+that has not committed when the policy changes. It cannot restore rows already deleted. Extending
+the retention period similarly protects remaining rows from pending work under the old rule.
+In-flight inserts retain their original metadata snapshot; maintenance detects their old policy and
+reevaluates them under the current rule.
+
+The first alteration atomically upgrades older disk-state manifests to support mutable policies.
+The database metadata file is then the durable authority for `TTL`; the manifest continues to
+authenticate the fixed column and key structure. Restart uses the committed SQL policy. An ambiguous
+metadata commit fences the table until restart. Binaries without mutable-policy support reject the
+upgraded manifest, so a downgrade requires a compatible binary. Editing metadata files directly is unsupported.
+
+`parts_sync_v1` tables and replicated database metadata are not supported by these alterations.
+`MATERIALIZE TTL`, column expiration, `TO DISK`, `TO VOLUME`, `RECOMPRESS`, `GROUP BY` and
+`ttl_only_drop_parts=1` remain unsupported. Other schema alterations remain gated.
 
 ## Row metadata version 1 {#row-metadata-version-1}
 

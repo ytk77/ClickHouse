@@ -60,7 +60,7 @@ protected:
         }
         store.publish(prepared);
     }
-    StateStore::Prepared merge(StateStore & store, PartRows rows, const std::vector<String> & sources)
+    StateStore::Prepared merge(StateStore & store, PartRows rows, const std::vector<String> & sources, const PartRows & expired = {})
     {
         PartCommit part;
         part.part = newObjectID();
@@ -77,7 +77,7 @@ protected:
             createDurableFile(path / ROWS_FILE, encodePartRows(rows));
             part.files_hash = hashPartDirectory(path, true);
         }
-        return store.prepareMerge("p", std::move(part), rows, sources);
+        return store.prepareMerge("p", std::move(part), rows, sources, expired);
     }
 
     std::pair<std::filesystem::path, size_t> appendUnpublishedBatch()
@@ -591,6 +591,101 @@ TEST_F(UpsertDiskStateTest, BatchedWinnersAndMergeAcrossLookupBoundaries)
     EXPECT_EQ(store.authorizedPartCount(), 1);
     EXPECT_EQ(store.snapshot()->getMask(objectName(merged.record.part))->cardinality(), 0);
     EXPECT_EQ(pinned->getMask(first_id)->cardinality(), 0);
+}
+
+TEST_F(UpsertDiskStateTest, ExpirationPreservesPinnedSnapshotAndRetryToken)
+{
+    Token token{"expired_retry", 1, {4, 5}, 0};
+    String source;
+    {
+        StateStore store(directory, incarnation, false, true);
+        auto first = prepare(store, {{"key", 10}}, "p", token);
+        source = first.record.final_name;
+        const auto id = objectName(first.record.part);
+        commit(store, first);
+        const auto pinned = store.snapshot();
+        auto expired = merge(store, {}, {source}, store.loadPartRows(source));
+        EXPECT_FALSE(expired.produces_part);
+        commit(store, expired);
+        EXPECT_EQ(store.authorizedPartCount(), 0);
+        EXPECT_FALSE(store.snapshot()->getMask(id));
+        ASSERT_TRUE(pinned->getMask(id));
+        EXPECT_EQ(pinned->getMask(id)->cardinality(), 0);
+        EXPECT_TRUE(store.tokenAlreadyCommitted("p", token));
+    }
+    StateStore reopened(directory, incarnation, true, true);
+    EXPECT_EQ(reopened.authorizedPartCount(), 0);
+    EXPECT_FALSE(std::filesystem::exists(directory / source));
+    EXPECT_TRUE(reopened.tokenAlreadyCommitted("p", token));
+    auto reinsert = prepare(reopened, {{"key", 1}});
+    EXPECT_TRUE(reinsert.produces_part);
+    EXPECT_TRUE(reinsert.record.kills.empty());
+    commit(reopened, reinsert);
+}
+
+TEST_F(UpsertDiskStateTest, ExpirationDoesNotDeleteConcurrentWinner)
+{
+    StateStore store(directory, incarnation, false, true);
+    auto first = prepare(store, {{"key", 10}, {"retained", 10}});
+    const auto source = first.record.final_name;
+    commit(store, first);
+    const auto rows = store.loadPartRows(source);
+    auto concurrent = prepare(store, {{"key", 11}});
+    const auto concurrent_id = objectName(concurrent.record.part);
+    commit(store, concurrent);
+    auto expired = merge(store, {rows[1]}, {source}, {rows[0]});
+    commit(store, expired);
+    EXPECT_EQ(store.authorizedPartCount(), 2);
+    EXPECT_EQ(store.snapshot()->getMask(concurrent_id)->cardinality(), 0);
+    EXPECT_FALSE(prepare(store, {{"key", 10}}).produces_part);
+    EXPECT_FALSE(prepare(store, {{"retained", 9}}).produces_part);
+}
+
+TEST_F(UpsertDiskStateTest, ExpirationBeforePublicationRecoversAndAllowsDeadSourceReclamation)
+{
+    String old_source;
+    {
+        StateStore store(directory, incarnation, false, true);
+        auto first = prepare(store, {{"key", 10}, {"retained", 10}});
+        old_source = first.record.final_name;
+        commit(store, first);
+        auto next = prepare(store, {{"key", 11}});
+        const auto source = next.record.final_name;
+        commit(store, next);
+        auto expired = merge(store, {}, {source}, store.loadPartRows(source));
+        store.append(expired);
+    }
+    StateStore reopened(directory, incarnation, true, true);
+    EXPECT_EQ(reopened.authorizedPartCount(), 1);
+    const auto rows = reopened.loadPartRows(old_source);
+    auto reclaimed = merge(reopened, {rows[1]}, {old_source});
+    commit(reopened, reclaimed);
+    EXPECT_EQ(reopened.authorizedPartCount(), 1);
+    EXPECT_FALSE(prepare(reopened, {{"retained", 9}}).produces_part);
+    EXPECT_TRUE(prepare(reopened, {{"key", 1}}).produces_part);
+}
+
+TEST_F(UpsertDiskStateTest, ExpirationRejectsInventedChangedAndDuplicatedIdentities)
+{
+    StateStore store(directory, incarnation, false, true);
+    auto first = prepare(store, {{"key", 10}});
+    const auto source = first.record.final_name;
+    commit(store, first);
+    auto rows = store.loadPartRows(source);
+    EXPECT_THROW(merge(store, {}, {source}), Exception);
+    EXPECT_THROW(merge(store, rows, {source}, rows), Exception);
+    EXPECT_THROW(merge(store, {}, {source}, {rows[0], rows[0]}), Exception);
+    auto changed = rows;
+    changed[0].value.row.version = 11;
+    EXPECT_THROW(merge(store, {}, {source}, changed), Exception);
+    changed = rows;
+    changed[0].value.row_offset = 1;
+    EXPECT_THROW(merge(store, {}, {source}, changed), Exception);
+    changed = rows;
+    changed[0].key = "invented";
+    EXPECT_THROW(merge(store, rows, {source}, changed), Exception);
+    EXPECT_EQ(store.authorizedPartCount(), 1);
+    EXPECT_FALSE(prepare(store, {{"key", 9}}).produces_part);
 }
 
 #endif

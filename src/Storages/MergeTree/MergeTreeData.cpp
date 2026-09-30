@@ -6,6 +6,7 @@
 #include <Storages/MergeTree/ConditionTemplate.h>
 #include <Storages/MergeTree/Compaction/MergeSelectors/ManualMergeSelector.h>
 #include <Storages/MergeTree/MergeTreeData.h>
+#include <Storages/MergeTree/UniqueKey/UpsertMergeTreeMetadata.h>
 #include <Storages/PartitionCommands.h>
 #include <Common/CurrentThread.h>
 #include <Common/threadPoolCallbackRunner.h>
@@ -1135,14 +1136,15 @@ void MergeTreeData::checkProperties(
         throw Exception(ErrorCodes::INVALID_SETTING_VALUE,
             "Vector similarity index can only be used with MergeTree setting 'index_granularity_bytes' != 0");
 
-    /// TTL on a UNIQUE KEY table cannot be honored: TTL delete / recompression /
-    /// GROUP BY are enforced during merges, and merges are disabled on UNIQUE KEY
-    /// tables until merge-side bitmap reconciliation lands. Reject at CREATE so the
+    /// `UpsertMergeTree` applies row expiration through its own durable maintenance protocol.
+    /// `TTL` on other `UNIQUE KEY` tables cannot be honored: deletion, recompression and
+    /// `GROUP BY` are enforced during merges, and merges are disabled on `UNIQUE KEY`
+    /// tables until merge-side bitmap reconciliation lands. Reject at `CREATE` so the
     /// combination cannot exist (`ALTER MODIFY TTL` is rejected in
-    /// `checkAlterIsPossible`); ATTACH must still load existing tables. Mirrors the
+    /// `checkAlterIsPossible`); `ATTACH` must still load existing tables. Mirrors the
     /// projection reject below.
-    /// TODO(unique-key): support TTL on UNIQUE KEY tables (lands with PR-14 merges).
-    if (new_metadata.hasAnyTTL() && new_metadata.hasUniqueKey() && !attach)
+    /// TODO(unique-key): support `TTL` on other `UNIQUE KEY` tables (lands with PR-14 merges).
+    if (new_metadata.hasAnyTTL() && new_metadata.hasUniqueKey() && !merging_params.upsert && !attach)
         throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
             "TTL is not supported on tables with UNIQUE KEY");
 
@@ -4837,8 +4839,19 @@ void checkVersionColumnTypesConversion(const IDataType * old_type, const IDataTy
 
 void MergeTreeData::checkAlterIsPossible(const AlterCommands & commands, ContextPtr local_context) const
 {
-    if (merging_params.upsert && !commands.empty())
-        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "ALTER is not supported for UpsertMergeTree until schema migration is implemented");
+    if (merging_params.upsert)
+    {
+        for (const auto & command : commands)
+            if (command.type != AlterCommand::MODIFY_TTL && command.type != AlterCommand::REMOVE_TTL)
+                throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree supports only MODIFY TTL and REMOVE TTL alters");
+        const auto old_metadata = getInMemoryMetadataPtr(local_context, false);
+        auto new_metadata = *old_metadata;
+        auto settings = *getSettings();
+        commands.apply(new_metadata, local_context, settings[MergeTreeSetting::share_nested_offsets]);
+        validateUpsertMergeTreeMetadata(new_metadata, merging_params.upsert_version_column, settings);
+        checkTTLExpressions(new_metadata, *old_metadata);
+        return;
+    }
 
     /// Reject schema-changing ALTER while a streaming query holds a subscription on this storage.
     if (subscription_manager.hasSome())

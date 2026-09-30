@@ -154,6 +154,9 @@ private:
     /// Accessed only by the single table maintenance task; resume after the previous selected unit.
     std::optional<MergeTreePartInfo> upsert_maintenance_cursor;
     void runUpsertMaintenance();
+    void alterUpsertTTL(const AlterCommands & commands, ContextPtr local_context);
+    /// Serialize policy publication with maintenance commit, without blocking part preparation or readers.
+    std::mutex upsert_ttl_mutex;
 
     /// For block numbers.
     SimpleIncrement increment;

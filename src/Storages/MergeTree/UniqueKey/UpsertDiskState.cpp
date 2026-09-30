@@ -626,9 +626,10 @@ StateStore::Prepared DiskState::prepare(const String & partition, PartCommit par
 }
 
 StateStore::Prepared DiskState::prepareMerge(
-    const String & partition, PartCommit part, const PartRows & rows, const std::vector<String> & sources)
+    const String & partition, PartCommit part, const PartRows & rows, const std::vector<String> & sources, const PartRows & expired)
 {
     if (sources.empty() || sources.size() > 32 || part.rows != rows.size() || rows.size() > MAX_UNIT_ROWS
+        || expired.size() > MAX_UNIT_ROWS - rows.size()
         || part.part == ObjectID{} || impl->database->get("O" + objectName(part.part)))
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid UpsertMergeTree maintenance unit");
     StateStore::Prepared result;
@@ -650,8 +651,15 @@ StateStore::Prepared DiskState::prepareMerge(
             throw Exception(ErrorCodes::CORRUPTED_DATA, "Invalid UpsertMergeTree merge output lineage or duplicate key");
     }
     auto dead = std::make_shared<DeleteBitmap>();
+    std::map<String, const PartRow *> expirations;
+    for (const auto & row : expired)
+    {
+        if (row.value.row.self_binding || output.contains(row.key) || !expirations.emplace(row.key, &row).second)
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "Invalid UpsertMergeTree expiration lineage or duplicate key");
+    }
     std::set<String> source_names;
     std::set<String> mapped_output;
+    std::set<String> mapped_expirations;
     for (const auto & name : sources)
     {
         if (!source_names.insert(name).second || name == part.final_name)
@@ -664,24 +672,43 @@ StateStore::Prepared DiskState::prepareMerge(
         if (info.getPartitionId() != partition)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree merge crosses SQL partitions");
         const auto source_rows = loadPartRows(name);
+        const auto source_mask = impl->current->getMask(objectName(source.part));
+        if (!source_mask)
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree merge source has no visibility mask");
         impl->database->forEachWinner(partition, source_rows, [&](const PartRow & row, const String & key, std::optional<std::string_view> value)
         {
+            auto it = output.find(row.key);
+            const bool maps_to_output = it != output.end() && it->second->value.row == row.value.row;
+            auto expiration = expirations.find(row.key);
+            const bool expires = expiration != expirations.end() && expiration->second->value == row.value;
+            if (maps_to_output && !mapped_output.insert(row.key).second)
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree merge maps an output identity twice");
+            if (expires && !mapped_expirations.insert(row.key).second)
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree merge maps an expiration identity twice");
             if (!value)
+            {
+                /// An earlier `TTL` commit can remove the winner while superseded physical rows still await reclamation.
+                if (source_mask->contains(row.value.row_offset) && !maps_to_output && !expires)
+                    return;
                 throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree merge source has no durable winner");
+            }
             BinaryReader in{*value};
             const auto winner_part = in.id();
             const auto winner = decodeIndexValue(in.string());
             in.end();
-            auto it = output.find(row.key);
-            const bool maps_to_output = it != output.end() && it->second->value.row == row.value.row;
             if (winner_part == source.part && winner.row_offset == row.value.row_offset)
             {
-                if (!maps_to_output || winner.row != row.value.row)
+                if ((!maps_to_output && !expires) || winner.row != row.value.row || source_mask->contains(row.value.row_offset))
                     throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree merge omitted or changed a live source identity");
-                BinaryWriter updated;
-                updated.id(part.part);
-                updated.string(encodeIndexValue(it->second->value));
-                batch.Put(key, updated.bytes);
+                if (expires)
+                    batch.Delete(key);
+                else
+                {
+                    BinaryWriter updated;
+                    updated.id(part.part);
+                    updated.string(encodeIndexValue(it->second->value));
+                    batch.Put(key, updated.bytes);
+                }
                 checkBatchBudget(batch);
             }
             else if (maps_to_output)
@@ -689,8 +716,6 @@ StateStore::Prepared DiskState::prepareMerge(
                 /// A concurrent upsert superseded this exact source row after the merge snapshot.
                 dead->add(it->second->value.row_offset);
             }
-            if (maps_to_output && !mapped_output.insert(row.key).second)
-                throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree merge maps an output identity twice");
         });
         batch.Put("R" + name, *authorization);
         batch.Delete("A" + name);
@@ -699,6 +724,8 @@ StateStore::Prepared DiskState::prepareMerge(
     }
     if (mapped_output.size() != output.size())
         throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree merge invented an output identity");
+    if (mapped_expirations.size() != expirations.size())
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree merge invented an expiration identity");
     part.dead.clear();
     for (const auto offset : dead->toVector())
     {
@@ -800,7 +827,7 @@ StateStore::Prepared DiskState::prepare(const String &, PartCommit, const Valida
 {
     std::unreachable();
 }
-StateStore::Prepared DiskState::prepareMerge(const String &, PartCommit, const PartRows &, const std::vector<String> &)
+StateStore::Prepared DiskState::prepareMerge(const String &, PartCommit, const PartRows &, const std::vector<String> &, const PartRows &)
 {
     std::unreachable();
 }

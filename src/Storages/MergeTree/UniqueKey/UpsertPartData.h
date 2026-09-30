@@ -11,12 +11,14 @@ namespace DB
 class IDataPartStorage;
 struct StorageInMemoryMetadata;
 struct MergeTreeDataPartChecksums;
+struct MergeTreeDataPartChecksum;
 
 namespace Upsert
 {
 inline constexpr auto ORDINAL_COLUMN = "_upsert_block_ordinal";
 inline constexpr auto LINEAGE_COLUMN = "_upsert_merge_lineage";
 inline constexpr auto ROWS_FILE = "upsert_rows.bin";
+inline constexpr auto TTL_FILE = "upsert_ttl.txt";
 /// Eight-byte magic, four-byte row count and four-byte checksum in `upsert_rows.bin`.
 inline constexpr size_t PART_ROWS_ENVELOPE_BYTES = 16;
 inline constexpr size_t MAX_UNIT_ROWS = 1U << 20;
@@ -65,6 +67,8 @@ size_t foldBlock(Block & block, const StorageInMemoryMetadata & metadata, const 
 /// Bound winner replacements, authorization and the new mask; existing source masks remain state-dependent.
 size_t estimateInsertStateBytes(size_t lineage_bytes, size_t rows, size_t partition_bytes, size_t token_bytes);
 ObjectID hashInputBlock(const Block & block);
+/// Identify the exact policy used to calculate a part's cached `TTL` information.
+MergeTreeDataPartChecksum ttlPolicyChecksum(const StorageInMemoryMetadata & metadata);
 
 void writePartIndex(
     IDataPartStorage & storage, const Block & block, const StorageInMemoryMetadata & metadata,

@@ -16,6 +16,8 @@
 #include <IO/ReadBufferFromFile.h>
 #include <IO/WriteBufferFromFileBase.h>
 #include <IO/WriteHelpers.h>
+#include <IO/WriteBufferFromString.h>
+#include <Parsers/IAST.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -263,6 +265,15 @@ ObjectID hashInputBlock(const Block & block)
     return result;
 }
 
+MergeTreeDataPartChecksum ttlPolicyChecksum(const StorageInMemoryMetadata & metadata)
+{
+    const auto policy = metadata.table_ttl.definition_ast ? metadata.table_ttl.definition_ast->formatWithSecretsOneLine() : String{};
+    WriteBufferFromOwnString out;
+    HashingWriteBuffer hashing(out);
+    hashing.write(policy.data(), policy.size());
+    return {policy.size(), hashing.getHash()};
+}
+
 void writePartIndex(
     IDataPartStorage & storage, const Block & block, const StorageInMemoryMetadata & metadata,
     const String & version_column, ObjectID operation_id, const IColumn::Permutation * permutation,
@@ -300,6 +311,18 @@ void writePartIndex(
     out->finalize();
     /// The coordinator synchronizes the complete finalized part before durable authorization.
     checksums.addFile(ROWS_FILE, bytes.size(), hash);
+
+    if (metadata.table_ttl.definition_ast)
+    {
+        const auto policy = metadata.table_ttl.definition_ast->formatWithSecretsOneLine();
+        auto ttl_out = storage.writeFile(TTL_FILE, DBMS_DEFAULT_BUFFER_SIZE, context->getWriteSettings());
+        HashingWriteBuffer ttl_hashing(*ttl_out);
+        ttl_hashing.write(policy.data(), policy.size());
+        const auto ttl_hash = ttl_hashing.getHash();
+        ttl_hashing.finalize();
+        ttl_out->finalize();
+        checksums.addFile(TTL_FILE, policy.size(), ttl_hash);
+    }
 
     std::vector<size_t> order(rows.size());
     std::iota(order.begin(), order.end(), 0);
