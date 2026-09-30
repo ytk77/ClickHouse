@@ -2723,7 +2723,10 @@ void StorageMergeTree::renameAndCommitEmptyParts(MutableDataPartsVector & new_pa
 void StorageMergeTree::truncate(const ASTPtr &, const StorageMetadataPtr &, ContextPtr query_context, TableExclusiveLockHolder &)
 {
     if (merging_params.upsert)
-        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "TRUNCATE is not supported for UpsertMergeTree");
+    {
+        truncateUpsert(query_context);
+        return;
+    }
 
     assertNotReadonly();
 

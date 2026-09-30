@@ -22,6 +22,7 @@ public:
     StateStore::Prepared prepareMerge(
         const String & partition, PartCommit part, const PartRows & rows, const std::vector<String> & sources,
         const PartRows & expired, bool retire_sources, const StateStore::MergeInput * input);
+    StateStore::Prepared prepareTruncate();
     PartRows loadPartRows(const String & name) const;
     void pruneRetired();
     void append(const StateStore::Prepared & prepared);

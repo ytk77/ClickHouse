@@ -100,6 +100,7 @@ public:
     Prepared prepareMerge(
         const String & partition, PartCommit part, const PartRows & rows, const std::vector<String> & sources,
         const PartRows & expired = {}, bool retire_sources = true, const MergeInput * input = nullptr);
+    Prepared prepareTruncate();
     PartRows loadPartRows(const String & name) const;
     void pruneRetired();
     void append(const Prepared & prepared);

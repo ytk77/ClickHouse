@@ -225,6 +225,7 @@ struct DiskPrepared
     std::shared_ptr<DiskMaskSnapshot> masks;
     UInt64 previous_csn = 0;
     bool durable = false;
+    bool truncate = false;
 };
 
 struct DiskState::Impl
@@ -281,6 +282,7 @@ struct DiskState::Impl
         check(iterator->status());
         if (found != part_count)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree durable part count differs from its catalog");
+        bool had_retired_parts = false;
         /// Validate the active recovery root before reclaiming anything it superseded.
         for (iterator->Seek("R"); iterator->Valid() && iterator->key().starts_with("R"); iterator->Next())
         {
@@ -292,6 +294,7 @@ struct DiskState::Impl
             if (fs::is_symlink(path))
                 throw Exception(ErrorCodes::CORRUPTED_DATA, "Symbolic link replaces a retired UpsertMergeTree part");
             fs::remove_all(path);
+            had_retired_parts = true;
         }
         check(iterator->status());
         syncDirectory(table_path);
@@ -313,6 +316,15 @@ struct DiskState::Impl
             fs::remove_all(entry.path());
         }
         syncDirectory(table_path);
+        if (had_retired_parts)
+        {
+            /// Part names may be reused after restarting an empty table. Forget retirement only after durable deletion.
+            rocksdb::WriteBatch batch;
+            check(batch.DeleteRange("R", "S"));
+            rocksdb::WriteOptions write;
+            write.sync = true;
+            check(database->db->Write(write, &batch));
+        }
         auto masks = std::make_shared<DiskMaskSnapshot>(database);
         masks->bind();
         current = newSnapshot(std::move(masks));
@@ -800,14 +812,64 @@ StateStore::Prepared DiskState::prepareMerge(
     return result;
 }
 
+StateStore::Prepared DiskState::prepareTruncate()
+{
+    StateStore::Prepared result;
+    result.disk = std::make_shared<DiskPrepared>();
+    result.disk->truncate = true;
+    auto & batch = result.disk->batch;
+    rocksdb::ReadOptions options;
+    options.fill_cache = false;
+    std::unique_ptr<rocksdb::Iterator> iterator(impl->database->db->NewIterator(options));
+    for (iterator->Seek("A"); iterator->Valid() && iterator->key().starts_with("A"); iterator->Next())
+    {
+        auto record = decodePartCommit(iterator->value().ToStringView());
+        if (!record.rows || iterator->key().ToString() != "A" + record.final_name)
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree truncate source identity mismatch");
+        if (impl->database->get("R" + record.final_name))
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree active part already has retirement authorization");
+        result.retired_parts.push_back(record.final_name);
+        /// Retirement needs the payload identity, not historical winner kills or retry tokens.
+        record.dead.clear();
+        record.kills.clear();
+        record.token = {};
+        record.token.accepted = record.rows;
+        batch.Put("R" + record.final_name, encodePartCommit(record));
+        checkBatchBudget(batch);
+        CurrentMemoryTracker::check();
+    }
+    check(iterator->status());
+    if (result.retired_parts.size() != impl->part_count)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree truncate source count differs from its catalog");
+
+    /// Clear active authorizations, sequence counters, token expiry, masks, operation bindings, tokens and winners.
+    /// Range tombstones preserve the old masks for readers holding a pre-truncate `RocksDB` snapshot.
+    for (const char space : {'A', 'C', 'E', 'M', 'O', 'T', 'W'})
+        check(batch.DeleteRange(String(1, space), String(1, space + 1)));
+    batch.Put("part_count", number(0));
+    batch.Put("retry_bytes", number(0));
+    checkBatchBudget(batch);
+    result.disk->masks = std::make_shared<DiskMaskSnapshot>(impl->database);
+    result.snapshot = impl->newSnapshot(result.disk->masks);
+    return result;
+}
+
 void DiskState::append(const StateStore::Prepared & prepared)
 {
     if (!prepared.disk || prepared.disk->durable)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Invalid or already committed UpsertMergeTree disk preparation");
-    const auto key = prefix('C', prepared.partition);
-    auto current = impl->database->get(key) ? impl->database->integer(key) : 0;
-    if (current != prepared.disk->previous_csn)
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree commit sequence changed under the commit lock");
+    if (prepared.disk->truncate)
+    {
+        if (prepared.retired_parts.size() != impl->part_count)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree truncate catalog changed under the commit lock");
+    }
+    else
+    {
+        const auto key = prefix('C', prepared.partition);
+        auto current = impl->database->get(key) ? impl->database->integer(key) : 0;
+        if (current != prepared.disk->previous_csn)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree commit sequence changed under the commit lock");
+    }
     rocksdb::WriteOptions options;
     options.sync = true;
     FailPointInjection::pauseFailPoint(FailPoints::upsert_pause_before_state_write);
@@ -867,6 +929,10 @@ StateStore::Prepared DiskState::prepare(const String &, PartCommit, const Valida
     std::unreachable();
 }
 StateStore::Prepared DiskState::prepareMerge(const String &, PartCommit, const PartRows &, const std::vector<String> &, const PartRows &, bool, const StateStore::MergeInput *)
+{
+    std::unreachable();
+}
+StateStore::Prepared DiskState::prepareTruncate()
 {
     std::unreachable();
 }

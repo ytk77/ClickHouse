@@ -698,6 +698,55 @@ void StorageMergeTree::reconcileUpsertParts(const StorageMetadataPtr & metadata,
             rewriteUpsertParts({part}, metadata, query_context, false);
 }
 
+void StorageMergeTree::truncateUpsert(ContextPtr query_context)
+{
+    assertNotReadonly();
+    if (!upsert_store->usesDiskState())
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree TRUNCATE requires the disk_state_v2 protocol");
+    if (query_context->getCurrentTransaction())
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree does not support explicit transactions");
+    std::lock_guard operation_lock(upsert_operation_mutex);
+    {
+        /// Wait for whole insert pipelines, including prepared parts and token admission checks.
+        auto schema_lock = tryLockTimed(upsert_schema_lock, RWLockImpl::Write,
+            query_context->getCurrentQueryId(), query_context->getSettingsRef()[Setting::lock_acquire_timeout]);
+        std::lock_guard ttl_lock(upsert_ttl_mutex);
+        auto lock = lockParts();
+        if (upsert_fenced)
+            throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree is fenced pending restart and recovery");
+        const auto parts = getDataPartsVectorForInternalUsage({DataPartState::Active}, lock);
+        auto prepared = upsert_store->prepareTruncate();
+        NameSet authorized(prepared.retired_parts.begin(), prepared.retired_parts.end());
+        if (parts.size() != authorized.size() || std::ranges::any_of(parts, [&](const auto & part)
+        {
+            return !authorized.contains(part->name);
+        }))
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree truncate catalog differs from active parts");
+        /// Build an empty version directly instead of subtracting every retired part from the old snapshot.
+        auto read_snapshot = std::make_shared<UpsertReadSnapshot>();
+        read_snapshot->visibility = prepared.snapshot;
+        read_snapshot->parts = std::make_shared<const RangesInDataParts>();
+        read_snapshot->parts_info = getPartsSnapshotInfo({});
+        try
+        {
+            upsert_store->append(prepared);
+            removePartsFromWorkingSet(nullptr, parts, true, lock);
+            upsert_store->publish(prepared);
+            publishUpsertReadSnapshot(std::move(read_snapshot));
+            upsert_maintenance_cursor.reset();
+        }
+        catch (...)
+        {
+            upsert_fenced = true;
+            throw;
+        }
+    }
+    /// Existing readers keep their parts and masks pinned until they finish.
+    clearOldPartsFromFilesystem(false, false);
+    if (upsert_maintenance_task)
+        upsert_maintenance_task->schedule();
+}
+
 void StorageMergeTree::mutateUpsert(const MutationCommands & commands, ContextPtr query_context)
 {
     checkMutationIsPossible(commands, query_context->getSettingsRef());

@@ -373,6 +373,13 @@ StateStore::Prepared StateStore::prepareMerge(
     return disk->prepareMerge(partition, std::move(part), rows, sources, expired, retire_sources, input);
 }
 
+StateStore::Prepared StateStore::prepareTruncate()
+{
+    if (!disk)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Legacy UpsertMergeTree does not authorize truncation");
+    return disk->prepareTruncate();
+}
+
 PartRows StateStore::loadPartRows(const String & name) const
 {
     if (!disk)

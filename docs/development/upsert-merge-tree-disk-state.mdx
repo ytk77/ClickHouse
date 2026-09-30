@@ -80,6 +80,20 @@ Original row ordinals survive slicing, and units commit in input order. Later eq
 
 Atomicity is per slice and partition. A later invalid row, cancellation, or write failure can leave earlier slices committed, including slices from the same original input block. Retrying an identical request with its original token reuses committed results within the existing retention window. Splitting bounds incremental preparation work; it does not remove the original incoming block from memory or cap the query's total allocations at 32 MiB.
 
+### Atomic truncation {#disk-state-truncate}
+
+`TRUNCATE TABLE` uses one synchronized `RocksDB` batch across all partitions. Each active
+`A` authorization becomes a compact `R` retirement record with its payload identity; historical
+kills, dead offsets and retry tokens are unnecessary for file reclamation. Range tombstones
+clear `A`, `C`, `E`, `M`, `O`, `T` and `W`, and reset `part_count` and `retry_bytes`. The table
+incarnation and existing retirement records remain intact. Snapshot readers retain their old
+masks and parts. The entire batch is checked against the state budget before committing.
+
+Recovery removes retired payloads and synchronizes the table directory before clearing their
+`R` records. This ordering also permits native part-name reuse after an empty table restarts,
+without leaving a stale retirement authorization that could conflict with a later insert.
+The disk-state format and table manifest are unchanged.
+
 ### Why retain a 32-MiB internal unit {#disk-state-input-unit-budget}
 
 64-MiB and larger client blocks are supported through automatic splitting. The internal target remains 32 MiB for these reasons:
@@ -157,7 +171,7 @@ All integer fields are unsigned little-endian. Length-delimited strings use a fo
 | `M`, printable part identity | Checksummed serialized `DeleteBitmap` |
 | `T`, partition, token, unit | Payload hash, original accepted-row count (including zero), and eight-byte expiration time |
 | `O`, printable operation identity | Original commit sequence |
-| `R`, retired part name | Original authorization, permitting physical removal once native reader pins are released |
+| `R`, retired part name | Payload authorization, optionally compacted by `TRUNCATE`, permitting physical removal once native reader pins are released |
 | `E`, big-endian expiration time, token key | Ordered retry expiration entry |
 | `retry_bytes` | Accounted retry-state bytes |
 

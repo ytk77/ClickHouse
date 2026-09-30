@@ -163,6 +163,7 @@ private:
     void runUpsertMaintenance();
     void alterUpsertMetadata(const AlterCommands & commands, ContextPtr local_context);
     void mutateUpsert(const MutationCommands & commands, ContextPtr context);
+    void truncateUpsert(ContextPtr context);
     bool rewriteUpsertParts(const DataPartsVector & sources, const StorageMetadataPtr & metadata,
         ContextPtr context, bool apply_ttl, const MutationCommands & commands = {});
     bool upsertPartNeedsSchemaRewrite(const DataPartPtr & part, const StorageMetadataPtr & metadata, ContextPtr context) const;

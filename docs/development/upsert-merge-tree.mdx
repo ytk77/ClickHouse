@@ -78,11 +78,38 @@ record. The record is synchronized before part rename, directory synchronization
 The table manifest must exist during attachment and must match the schema and disk.
 An existing data directory cannot be imported as a new `UpsertMergeTree` table.
 
-`TRUNCATE`, partition operations other than the mutation partition filters described below, projections, sampling definitions,
+Partition operations other than the mutation partition filters described below, projections, sampling definitions,
 streaming, backup, restore, `CHECK TABLE`, background moves, and incremental materialized views are gated.
 The `_upsert_` prefix is reserved; the input-only delete flag is not connected yet.
 Partial-column updates remain unsupported; replace a row by inserting a new version.
 
+
+## Truncating a table {#upsert-truncate}
+
+Tables using `disk_state_v2` support standard syntax without additional settings:
+
+```sql
+TRUNCATE TABLE current_state;
+TRUNCATE TABLE IF EXISTS current_state;
+```
+
+`TRUNCATE` removes all rows across all partitions and preserves the table definition,
+including defaults, keys, indexes and `TTL`. It waits for active insert pipelines and
+serializes with deletion, schema cleanup and maintenance. A single synchronized state
+batch retires all active parts and clears winners, visibility masks, version floors and
+insert deduplication tokens. Subsequent inserts can reuse previous keys and tokens,
+including versions lower than those stored before truncation. An empty table can also
+be truncated to reset retained tokens.
+
+Readers that already pinned a snapshot may finish reading the previous data. New readers
+see the empty state after publication; later inserts are processed normally. Part files
+are reclaimed once readers release them. Recovery completes a durable truncation after
+interruption, so retired rows do not reappear. If an exception occurs after the durable
+commit, the table is fenced until restart and recovery; retrying after recovery is safe.
+
+Truncation reads the part catalog without scanning row payloads. Retirement metadata must
+fit the existing 128-MiB state-batch budget; exceeding it rejects the operation before any
+data changes. Explicit transactions and the legacy `parts_sync_v1` protocol remain unsupported.
 
 ## Deletes, columns and indexes {#upsert-delete-columns-indexes}
 
