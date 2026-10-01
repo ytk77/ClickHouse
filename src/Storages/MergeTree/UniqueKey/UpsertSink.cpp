@@ -1,4 +1,5 @@
 #include <Storages/MergeTree/UniqueKey/UpsertSink.h>
+#include <Storages/MergeTree/UniqueKey/UpsertMetrics.h>
 #include <Storages/MergeTree/UniqueKey/UpsertStateStore.h>
 #include <Storages/MergeTree/UniqueKey/UpsertDurableFile.h>
 #include <Storages/StorageMergeTree.h>
@@ -375,7 +376,10 @@ bool StorageMergeTree::commitUpsertBlock(Upsert::PreparedInsert & input)
 {
     auto & part = input.temporary->part;
     auto & authorization = input.authorization;
+    Stopwatch lock_wait;
     auto lock = lockParts();
+    ProfileEvents::increment(ProfileEvents::UpsertCommitLockWaitMicroseconds, lock_wait.elapsedMicroseconds());
+    ProfileEventTimeIncrement<Microseconds> hold_timer(ProfileEvents::UpsertCommitLockHoldMicroseconds);
     if (upsert_fenced)
         throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree is fenced pending restart and recovery");
     auto block_holder = fillNewPartName(part, lock);

@@ -1,4 +1,7 @@
 #include <Storages/MergeTree/UniqueKey/UpsertDiskState.h>
+#include <Storages/MergeTree/UniqueKey/UpsertMetrics.h>
+#include <Storages/MergeTree/UniqueKey/UpsertMaskVersions.h>
+#include <Storages/MergeTree/UniqueKey/DeleteBitmapCache.h>
 #include <Storages/MergeTree/UniqueKey/UpsertBinary.h>
 #include <Storages/MergeTree/UniqueKey/UpsertDurableFile.h>
 #include <Storages/MergeTree/MergeTreePartInfo.h>
@@ -7,6 +10,8 @@
 #include <Common/FailPoint.h>
 #include <Common/logger_useful.h>
 #include <Common/CurrentMemoryTracker.h>
+#include <Common/threadPoolCallbackRunner.h>
+#include <deque>
 #include "config.h"
 #include <filesystem>
 #include <limits>
@@ -21,6 +26,15 @@
 #include <rocksdb/table.h>
 #include <rocksdb/write_batch.h>
 #endif
+
+namespace CurrentMetrics
+{
+extern const Metric DeleteBitmapCacheBytes;
+extern const Metric DeleteBitmapCacheEntries;
+extern const Metric LocalThread;
+extern const Metric LocalThreadActive;
+extern const Metric LocalThreadScheduled;
+}
 
 namespace DB::ErrorCodes
 {
@@ -41,6 +55,16 @@ extern const char upsert_pause_after_state_sync[];
 
 namespace DB::Upsert
 {
+void Resources::validate() const
+{
+    if (index_cache_bytes < (1ULL << 20) || write_buffer_bytes < (1ULL << 20)
+        || write_buffer_count < 2 || write_buffer_count > 64 || wal_bytes < write_buffer_bytes
+        || background_jobs < 1 || background_jobs > 128 || max_open_files < 20
+        || max_open_files > static_cast<UInt64>(std::numeric_limits<int>::max())
+        || recovery_threads < 1 || recovery_threads > 64)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid UpsertMergeTree resource budgets");
+}
+
 #if USE_ROCKSDB
 namespace
 {
@@ -111,12 +135,16 @@ String encodeMask(const DeleteBitmap & mask)
 {
     WriteBufferFromOwnString out;
     mask.serialize(out);
+    ProfileEvents::increment(ProfileEvents::UpsertMaskWriteBytes, out.count());
     return out.str();
 }
 
 struct Database
 {
     std::unique_ptr<rocksdb::DB> db;
+    std::unique_ptr<DeleteBitmapCache> mask_cache;
+    MaskVersions mask_versions;
+    UInt64 mask_generation = 0;
 
     std::optional<String> get(const String & key, const rocksdb::Snapshot * snapshot = nullptr) const
     {
@@ -157,7 +185,11 @@ struct Database
                 slices.emplace_back(key);
             std::vector<rocksdb::PinnableSlice> values(count);
             std::vector<rocksdb::Status> statuses(count);
-            db->MultiGet(rocksdb::ReadOptions{}, db->DefaultColumnFamily(), count, slices.data(), values.data(), statuses.data());
+            {
+                ProfileEventTimeIncrement<Microseconds> timer(ProfileEvents::UpsertWinnerLookupMicroseconds);
+                ProfileEvents::increment(ProfileEvents::UpsertWinnerLookupKeys, count);
+                db->MultiGet(rocksdb::ReadOptions{}, db->DefaultColumnFamily(), count, slices.data(), values.data(), statuses.data());
+            }
             for (size_t i = 0; i < count; ++i)
             {
                 std::optional<std::string_view> value;
@@ -199,6 +231,7 @@ public:
     {
         if (cut)
             throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree disk snapshot was bound twice");
+        versions = database->mask_versions;
         cut = database->db->GetSnapshot();
         if (!cut)
             throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree could not pin its disk snapshot");
@@ -219,16 +252,67 @@ public:
     {
         if (!cut)
             throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree disk snapshot was read before commit");
-        auto value = database->get("M" + part, cut);
-        if (!value)
+        const auto * version = versions.find(part);
+        if (!version)
             return nullptr;
-        ReadBufferFromString in(*value);
-        return DeleteBitmap::deserialize(in);
+        auto load = [&]() -> std::shared_ptr<DeleteBitmap>
+        {
+            ProfileEventTimeIncrement<Microseconds> timer(ProfileEvents::UpsertMaskReadMicroseconds);
+            auto value = database->get("M" + part, cut);
+            if (!value)
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree versioned mask is missing");
+            ProfileEvents::increment(ProfileEvents::UpsertMaskReadBytes, value->size());
+            ReadBufferFromString in(*value);
+            return DeleteBitmap::deserialize(in);
+        };
+        if (!database->mask_cache)
+            return load();
+        auto [mask, loaded] = database->mask_cache->getOrSet(DeleteBitmapCache::makeKey(part, *version), load);
+        ProfileEvents::increment(loaded ? ProfileEvents::UpsertMaskCacheMisses : ProfileEvents::UpsertMaskCacheHits);
+        return mask;
     }
 
 private:
     std::shared_ptr<Database> database;
     const rocksdb::Snapshot * cut = nullptr;
+    MaskVersions versions;
+};
+}
+
+namespace
+{
+class MaskVersionUpdates final : public rocksdb::WriteBatch::Handler
+{
+public:
+    MaskVersions versions;
+    explicit MaskVersionUpdates(const Database & database)
+        : versions(database.mask_versions), generation(database.mask_generation + 1)
+    {
+        if (!generation)
+            throw Exception(ErrorCodes::LIMIT_EXCEEDED, "UpsertMergeTree mask generation exhausted");
+    }
+    void Put(const rocksdb::Slice & key, const rocksdb::Slice &) override
+    {
+        if (key.starts_with("M"))
+            versions.set(key.ToString().substr(1), generation);
+    }
+    void Delete(const rocksdb::Slice & key) override
+    {
+        if (key.starts_with("M"))
+            versions.erase(key.ToString().substr(1));
+    }
+    rocksdb::Status DeleteRangeCF(uint32_t column_family, const rocksdb::Slice & begin, const rocksdb::Slice & end) override
+    {
+        if (column_family != 0)
+            return rocksdb::Status::InvalidArgument("Unexpected UpsertMergeTree column family");
+        if (begin.ToString() == "M" && end.ToString() == "N")
+            versions.clear();
+        else if (begin.ToString() < "N" && end.ToString() > "M")
+            return rocksdb::Status::InvalidArgument("Unsupported UpsertMergeTree mask range deletion");
+        return rocksdb::Status::OK();
+    }
+private:
+    UInt64 generation;
 };
 }
 
@@ -250,6 +334,7 @@ struct DiskState::Impl
     String retirement_cursor = "R";
     UInt64 part_count = 0;
     StateClock clock;
+    Resources resources;
 
     std::shared_ptr<SnapshotState> newSnapshot(std::shared_ptr<DiskMaskSnapshot> masks)
     {
@@ -260,17 +345,25 @@ struct DiskState::Impl
 
     void recover()
     {
+        ProfileEventTimeIncrement<Microseconds> timer(ProfileEvents::UpsertRecoveryMicroseconds);
         namespace fs = std::filesystem;
         part_count = database->integer("part_count");
         rocksdb::ReadOptions options;
         options.fill_cache = false;
         std::unique_ptr<rocksdb::Iterator> iterator(database->db->NewIterator(options));
         UInt64 found = 0;
-        for (iterator->Seek("A"); iterator->Valid() && iterator->key().starts_with("A"); iterator->Next())
+        /// Bound outstanding payloads, decoded masks and file descriptors independently of the catalog size.
+        ThreadPool pool(CurrentMetrics::LocalThread, CurrentMetrics::LocalThreadActive,
+            CurrentMetrics::LocalThreadScheduled, resources.recovery_threads, resources.recovery_threads, resources.recovery_threads);
+        std::deque<std::future<void>> pending;
+        auto finish_front = [&]
         {
-            auto record = decodePartCommit(iterator->value().ToStringView());
-            if (!record.rows || iterator->key().ToString() != "A" + record.final_name)
-                throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree catalog part identity mismatch");
+            pending.front().get();
+            pending.pop_front();
+        };
+        auto verify = [this](const PartCommit & record)
+        {
+            namespace fs = std::filesystem;
             const fs::path final = fs::path(table_path) / record.final_name;
             const fs::path temporary = fs::path(table_path) / record.temporary_name;
             const bool final_exists = fs::exists(final);
@@ -283,16 +376,30 @@ struct DiskState::Impl
                 throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree authorized part is missing its visibility mask");
             ReadBufferFromString mask_input(*encoded_mask);
             const auto mask = DeleteBitmap::deserialize(mask_input);
-            const auto offsets = mask->toVector();
-            if (!offsets.empty() && offsets.back() >= record.rows)
+            if (mask->rangeCardinality(0, record.rows) != mask->cardinality())
                 throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree recovered mask exceeds its part");
             if (!final_exists)
             {
                 fs::rename(temporary, final);
                 syncDirectory(table_path);
             }
+            ProfileEvents::increment(ProfileEvents::UpsertRecoveryParts);
+        };
+        for (iterator->Seek("A"); iterator->Valid() && iterator->key().starts_with("A"); iterator->Next())
+        {
+            auto record = decodePartCommit(iterator->value().ToStringView());
+            if (!record.rows || iterator->key().ToString() != "A" + record.final_name)
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree catalog part identity mismatch");
+            database->mask_versions.set(objectName(record.part), 0);
+            if (pending.size() == resources.recovery_threads)
+                finish_front();
+            pending.emplace_back();
+            pending.back() = scheduleFromThreadPoolUnsafe<void>(
+                [verify, payload = std::move(record)] { verify(payload); }, pool, ThreadName::DEFAULT_THREAD_POOL);
             ++found;
         }
+        while (!pending.empty())
+            finish_front();
         check(iterator->status());
         if (found != part_count)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree durable part count differs from its catalog");
@@ -398,10 +505,15 @@ struct DiskState::Impl
     }
 };
 
-DiskState::DiskState(const String & table_path, ObjectID incarnation, bool attach, StateClock clock) : impl(std::make_unique<Impl>())
+DiskState::DiskState(const String & table_path, ObjectID incarnation, bool attach, StateClock clock, const Resources & resources) : impl(std::make_unique<Impl>())
 {
     namespace fs = std::filesystem;
+    resources.validate();
     impl->table_path = table_path;
+    impl->resources = resources;
+    if (resources.mask_cache_bytes)
+        impl->database->mask_cache = std::make_unique<DeleteBitmapCache>("LRU", CurrentMetrics::DeleteBitmapCacheBytes,
+            CurrentMetrics::DeleteBitmapCacheEntries, resources.mask_cache_bytes, 0.5);
     impl->clock = clock ? std::move(clock) : StateClock([]
     {
         return static_cast<UInt64>(std::chrono::duration_cast<std::chrono::seconds>(
@@ -417,21 +529,26 @@ DiskState::DiskState(const String & table_path, ObjectID incarnation, bool attac
     options.wal_recovery_mode = rocksdb::WALRecoveryMode::kTolerateCorruptedTailRecords;
     options.track_and_verify_wals = true;
     options.use_fsync = true;
-    options.max_open_files = 128;
-    options.write_buffer_size = 16U << 20;
+    options.max_open_files = static_cast<int>(resources.max_open_files);
+    options.write_buffer_size = resources.write_buffer_bytes;
     /// Most initial-insert probes miss. Filter complete keys without changing winner equality or key routing.
     options.memtable_prefix_bloom_size_ratio = 0.1;
     options.memtable_whole_key_filtering = true;
-    options.max_write_buffer_number = 3;
-    options.max_total_wal_size = 64U << 20;
+    options.max_write_buffer_number = static_cast<int>(resources.write_buffer_count);
+    options.max_total_wal_size = resources.wal_bytes;
     options.max_manifest_file_size = 16U << 20;
     options.keep_log_file_num = 2;
-    options.max_background_jobs = 2;
+    options.max_background_jobs = static_cast<int>(resources.background_jobs);
     rocksdb::BlockBasedTableOptions table_options;
-    table_options.block_cache = rocksdb::NewLRUCache(64U << 20);
+    table_options.block_cache = rocksdb::NewLRUCache(resources.index_cache_bytes);
     table_options.cache_index_and_filter_blocks = true;
     table_options.filter_policy.reset(rocksdb::NewBloomFilterPolicy(10));
     table_options.whole_key_filtering = true;
+    if (resources.partitioned_filters)
+    {
+        table_options.index_type = rocksdb::BlockBasedTableOptions::kTwoLevelIndexSearch;
+        table_options.partition_filters = true;
+    }
     options.table_factory.reset(rocksdb::NewBlockBasedTableFactory(table_options));
     rocksdb::DB * database = nullptr;
     check(rocksdb::DB::Open(options, path.string(), &database));
@@ -601,6 +718,7 @@ bool DiskState::tokenAlreadyCommitted(const String & partition, const Token & to
 
 StateStore::Prepared DiskState::prepare(const String & partition, PartCommit part, const ValidatedPartRows & validated)
 {
+    ProfileEventTimeIncrement<Microseconds> timer(ProfileEvents::UpsertStatePrepareMicroseconds);
     if (part.part != validated.getPart())
         throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree input validation identity mismatch");
     const auto & rows = validated.getRows();
@@ -735,6 +853,7 @@ StateStore::Prepared DiskState::prepareMerge(
     const String & partition, PartCommit part, const PartRows & rows, const std::vector<String> & sources,
     const PartRows & expired, bool retire_sources, const StateStore::MergeInput * input)
 {
+    ProfileEventTimeIncrement<Microseconds> timer(ProfileEvents::UpsertStatePrepareMicroseconds);
     if ((!retire_sources && !input)
         || (input && (!input->snapshot || input->lineage.size() != sources.size() || input->offsets.size() != sources.size()))
         || sources.empty() || sources.size() > 32 || part.rows != rows.size() || rows.size() > MAX_UNIT_ROWS
@@ -900,6 +1019,7 @@ StateStore::Prepared DiskState::prepareMerge(
 
 StateStore::Prepared DiskState::prepareTruncate()
 {
+    ProfileEventTimeIncrement<Microseconds> timer(ProfileEvents::UpsertStatePrepareMicroseconds);
     StateStore::Prepared result;
     result.disk = std::make_shared<DiskPrepared>();
     result.disk->catalog_change = true;
@@ -946,6 +1066,7 @@ StateStore::Prepared DiskState::preparePartition(
     const std::vector<String> & removed, const std::vector<String> & reset_partitions, const std::vector<String> & detached,
     const std::vector<String> & cleared_partitions)
 {
+    ProfileEventTimeIncrement<Microseconds> timer(ProfileEvents::UpsertStatePrepareMicroseconds);
     if (additions.size() != rows.size())
         throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree partition import row count mismatch");
     StateStore::Prepared result;
@@ -1188,10 +1309,17 @@ void DiskState::append(const StateStore::Prepared & prepared)
         if (current != prepared.disk->previous_csn)
             throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree commit sequence changed under the commit lock");
     }
+    MaskVersionUpdates mask_updates(*impl->database);
+    check(prepared.disk->batch.Iterate(&mask_updates));
     rocksdb::WriteOptions options;
     options.sync = true;
     FailPointInjection::pauseFailPoint(FailPoints::upsert_pause_before_state_write);
-    check(impl->database->db->Write(options, &prepared.disk->batch));
+    {
+        ProfileEventTimeIncrement<Microseconds> timer(ProfileEvents::UpsertStateWriteMicroseconds);
+        check(impl->database->db->Write(options, &prepared.disk->batch));
+        ProfileEvents::increment(ProfileEvents::UpsertStateWrites);
+        ProfileEvents::increment(ProfileEvents::UpsertStateWriteBytes, prepared.disk->batch.GetDataSize());
+    }
     prepared.disk->durable = true;
     FailPointInjection::pauseFailPoint(FailPoints::upsert_pause_after_state_sync);
     fiu_do_on(FailPoints::upsert_log_throw_after_append,
@@ -1202,6 +1330,8 @@ void DiskState::append(const StateStore::Prepared & prepared)
     {
         throw Exception(ErrorCodes::FAULT_INJECTED, "Injected UpsertMergeTree failure after disk-state sync");
     });
+    impl->database->mask_versions = std::move(mask_updates.versions);
+    ++impl->database->mask_generation;
     prepared.disk->masks->bind();
 }
 
@@ -1217,7 +1347,7 @@ struct DiskState::Impl
 struct DiskPrepared
 {
 };
-DiskState::DiskState(const String &, ObjectID, bool, StateClock)
+DiskState::DiskState(const String &, ObjectID, bool, StateClock, const Resources &)
 {
     throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree disk state requires a build with RocksDB");
 }

@@ -1,3 +1,4 @@
+#include <Storages/MergeTree/UniqueKey/UpsertMetrics.h>
 #include <Storages/StorageMergeTree.h>
 #include <Storages/MergeTree/UniqueKey/UpsertStateStore.h>
 #include <Storages/MergeTree/UniqueKey/UpsertDurableFile.h>
@@ -221,6 +222,7 @@ void StorageMergeTree::runUpsertMaintenance()
     constexpr size_t max_sources = 16;
     constexpr size_t max_lineage_bytes = Upsert::MAX_RECORD_BYTES - Upsert::PART_ROWS_ENVELOPE_BYTES;
     bool did_work = false;
+    bool continue_scan = false;
     try
     {
         auto table_lock = lockForShare(RWLockImpl::NO_QUERY, Poco::Timespan(5, 0));
@@ -252,19 +254,30 @@ void StorageMergeTree::runUpsertMaintenance()
             size_t state_bytes = 0;
             bool needs_rewrite = false;
             auto worthy = [&] { return sources.size() >= 2 || needs_rewrite; };
-            auto candidates = getDataPartsVectorForInternalUsage({DataPartState::Active}, lock);
-            if (upsert_maintenance_cursor)
+            /// The native ordered index is maintained incrementally on publication. Visit a bounded slice
+            /// per tick; the cursor also advances over healthy parts instead of repeatedly rescanning them.
+            constexpr size_t max_candidates = 256;
+            const auto active = getDataPartsStateRange(DataPartState::Active);
+            auto next = upsert_maintenance_cursor
+                ? data_parts_by_state_and_info.upper_bound(DataPartStateAndInfo{DataPartState::Active, *upsert_maintenance_cursor})
+                : active.begin();
+            if (next == active.end())
             {
-                const auto next = std::upper_bound(candidates.begin(), candidates.end(), *upsert_maintenance_cursor,
-                    [](const auto & info, const auto & candidate)
-                    {
-                        return info < candidate->info;
-                    });
-                std::rotate(candidates.begin(), next, candidates.end());
+                next = active.begin();
+                upsert_maintenance_pending.reset();
             }
+            DataPartsVector candidates;
+            candidates.reserve(max_candidates + 1);
+            if (upsert_maintenance_pending && upsert_maintenance_pending->getState() == DataPartState::Active)
+                candidates.push_back(upsert_maintenance_pending);
+            upsert_maintenance_pending.reset();
+            for (size_t visited = 0; next != active.end() && visited < max_candidates; ++next, ++visited)
+                candidates.push_back(*next);
+            continue_scan = next != active.end();
             const auto snapshot = upsert_store->snapshot();
             for (const auto & candidate : candidates)
             {
+                ProfileEvents::increment(ProfileEvents::UpsertMaintenanceCandidates);
                 const auto & id = candidate->info.getPartitionId();
                 if (id != partition)
                 {
@@ -278,6 +291,7 @@ void StorageMergeTree::runUpsertMaintenance()
                     needs_rewrite = false;
                     partition = id;
                 }
+                upsert_maintenance_cursor = candidate->info;
                 const auto size = candidate->getBytesUncompressedOnDisk();
                 if (size > max_source_bytes || candidate->rows_count > Upsert::MAX_UNIT_ROWS)
                     continue;
@@ -329,9 +343,12 @@ void StorageMergeTree::runUpsertMaintenance()
                     break;
             }
             if (!worthy())
+            {
+                /// Preserve a lone small candidate across scan boundaries, without pinning an unbounded queue.
+                if (continue_scan && !sources.empty())
+                    upsert_maintenance_pending = sources.front();
                 sources.clear();
-            if (!sources.empty())
-                upsert_maintenance_cursor = sources.back()->info;
+            }
         }
 
         if (!sources.empty())
@@ -339,9 +356,10 @@ void StorageMergeTree::runUpsertMaintenance()
     }
     catch (...)
     {
+        continue_scan = false;
         tryLogCurrentException(log, "UpsertMergeTree maintenance failed");
     }
-    upsert_maintenance_task->scheduleAfter(did_work ? 100 : 1000);
+    upsert_maintenance_task->scheduleAfter(did_work || continue_scan ? 100 : 1000);
 }
 
 bool StorageMergeTree::rewriteUpsertParts(const DataPartsVector & sources, const StorageMetadataPtr & metadata,
@@ -739,7 +757,6 @@ void StorageMergeTree::truncateUpsert(ContextPtr query_context)
         /// Build an empty version directly instead of subtracting every retired part from the old snapshot.
         auto read_snapshot = std::make_shared<UpsertReadSnapshot>();
         read_snapshot->visibility = prepared.snapshot;
-        read_snapshot->parts = std::make_shared<const RangesInDataParts>();
         read_snapshot->parts_info = getPartsSnapshotInfo({});
         try
         {
@@ -748,6 +765,7 @@ void StorageMergeTree::truncateUpsert(ContextPtr query_context)
             upsert_store->publish(prepared);
             publishUpsertReadSnapshot(std::move(read_snapshot));
             upsert_maintenance_cursor.reset();
+            upsert_maintenance_pending.reset();
         }
         catch (...)
         {

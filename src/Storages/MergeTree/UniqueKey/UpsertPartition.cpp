@@ -130,7 +130,8 @@ Pipe StorageMergeTree::alterPartition(
     auto select_parts = [&](StorageMergeTree & table, const PartitionCommand & command, const UpsertReadSnapshotPtr & snapshot)
     {
         DataPartsVector parts;
-        for (const auto & range : *snapshot->parts)
+        const auto ranges = snapshot->catalog.ranges();
+        for (const auto & range : *ranges)
             parts.push_back(range.data_part);
         if (command.part)
         {
@@ -415,8 +416,9 @@ Pipe StorageMergeTree::alterPartition(
                 Upsert::syncDirectoryAncestors((table_path / DETACHED_DIR_NAME).string(), getDisks().front()->getPath());
             FailPointInjection::pauseFailPoint(FailPoints::upsert_partition_pause_after_attach_rename);
             DataPartsVector inputs(loaded.begin(), loaded.end());
+            const auto active_ranges = snapshot->catalog.ranges();
             for (const auto & input : inputs)
-                for (const auto & active : *snapshot->parts)
+                for (const auto & active : *active_ranges)
                     if (input->uuid != UUIDHelpers::Nil && input->uuid == active.data_part->uuid)
                         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Detached UpsertMergeTree part still has an active source identity");
             auto imported = prepare_import(*this, *this, inputs, metadata, metadata, {});

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <Storages/MergeTree/UniqueKey/UpsertResources.h>
+
 #include <Storages/MergeTree/UniqueKey/UpsertPartData.h>
 #include <Storages/MergeTree/UniqueKey/UpsertPartitionLog.h>
 #include <Storages/MergeTree/UniqueKey/UpsertSnapshot.h>
@@ -82,7 +84,7 @@ public:
         std::shared_ptr<PartitionState> state;
     };
 
-    StateStore(String table_path_, ObjectID incarnation_, bool attach, bool use_disk_state = false, StateClock clock = {});
+    StateStore(String table_path_, ObjectID incarnation_, bool attach, bool use_disk_state = false, StateClock clock = {}, const Resources & resources = {});
     ~StateStore();
     SnapshotPtr snapshot() const;
     const std::map<String, ObjectID> & authorizedParts() const;

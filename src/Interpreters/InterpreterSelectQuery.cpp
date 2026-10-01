@@ -890,7 +890,7 @@ InterpreterSelectQuery::InterpreterSelectQuery(
                 RangesInDataParts parts_for_estimator;
                 if (storage_snapshot->data)
                 {
-                    const auto & parts = assert_cast<const MergeTreeData::SnapshotData &>(*storage_snapshot->data).parts;
+                    const auto parts = assert_cast<const MergeTreeData::SnapshotData &>(*storage_snapshot->data).getParts(storage_snapshot->metadata);
                     if (parts)
                         parts_for_estimator = *parts;
                 }

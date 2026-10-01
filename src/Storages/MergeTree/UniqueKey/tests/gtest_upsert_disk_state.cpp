@@ -60,7 +60,8 @@ protected:
         }
         store.publish(prepared);
     }
-    StateStore::Prepared merge(StateStore & store, PartRows rows, const std::vector<String> & sources, const PartRows & expired = {})
+    StateStore::Prepared merge(StateStore & store, PartRows rows, const std::vector<String> & sources, const PartRows & expired = {},
+        bool retire_sources = true, const StateStore::MergeInput * input = nullptr)
     {
         PartCommit part;
         part.part = newObjectID();
@@ -77,7 +78,7 @@ protected:
             createDurableFile(path / ROWS_FILE, encodePartRows(rows));
             part.files_hash = hashPartDirectory(path, true);
         }
-        return store.prepareMerge("p", std::move(part), rows, sources, expired);
+        return store.prepareMerge("p", std::move(part), rows, sources, expired, retire_sources, input);
     }
 
     std::pair<std::filesystem::path, size_t> appendUnpublishedBatch()
@@ -688,4 +689,137 @@ TEST_F(UpsertDiskStateTest, ExpirationRejectsInventedChangedAndDuplicatedIdentit
     EXPECT_FALSE(prepare(store, {{"key", 9}}).produces_part);
 }
 
+TEST_F(UpsertDiskStateTest, MaskCacheKeepsPinnedVersionsAcrossOverwriteAndTruncate)
+{
+    Resources resources;
+    resources.mask_cache_bytes = 4096;
+    StateStore store(directory, incarnation, false, true, {}, resources);
+    auto first = prepare(store, {{"a", 1}, {"b", 1}});
+    commit(store, first);
+    const auto id = objectName(first.record.part);
+    const auto old = store.snapshot();
+    const auto old_mask = old->getMask(id);
+    ASSERT_TRUE(old_mask);
+    EXPECT_TRUE(old_mask->empty());
+    auto second = prepare(store, {{"a", 2}});
+    commit(store, second);
+    const auto updated = store.snapshot();
+    EXPECT_TRUE(updated->getMask(id)->contains(0));
+    EXPECT_FALSE(updated->getMask(id)->contains(1));
+    EXPECT_TRUE(old->getMask(id)->empty());
+    auto unrelated = prepare(store, {{"c", 1}});
+    commit(store, unrelated);
+    EXPECT_EQ(updated->getMask(id), store.snapshot()->getMask(id));
+    auto truncate = store.prepareTruncate();
+    store.append(truncate);
+    store.publish(truncate);
+    EXPECT_FALSE(store.snapshot()->getMask(id));
+    EXPECT_TRUE(updated->getMask(id)->contains(0));
+    EXPECT_TRUE(old->getMask(id)->empty());
+}
+
+TEST_F(UpsertDiskStateTest, MaskCacheTracksPartialRelocationExpirationAndRetirement)
+{
+    String source_id;
+    String relocated_id;
+    {
+        Resources resources;
+        resources.mask_cache_bytes = 128;
+        StateStore store(directory, incarnation, false, true, {}, resources);
+        auto first = prepare(store, {{"a", 1}, {"b", 1}, {"c", 1}});
+        source_id = objectName(first.record.part);
+        const auto source = first.record.final_name;
+        commit(store, first);
+        const auto initial = store.snapshot();
+        const std::vector<PartRows> lineage{store.loadPartRows(source)};
+        std::vector<std::vector<UInt32>> offsets{{0, 1}};
+        const StateStore::MergeInput input{initial, lineage, offsets};
+        auto partial = merge(store, {lineage[0][0]}, {source}, {lineage[0][1]}, false, &input);
+        relocated_id = objectName(partial.record.part);
+        commit(store, partial);
+        const auto pinned = store.snapshot();
+        EXPECT_EQ(pinned->getMask(source_id)->cardinality(), 2);
+        EXPECT_TRUE(pinned->getMask(relocated_id)->empty());
+        EXPECT_TRUE(initial->getMask(source_id)->empty());
+
+        auto concurrent = prepare(store, {{"a", 2}});
+        commit(store, concurrent);
+        EXPECT_TRUE(store.snapshot()->getMask(relocated_id)->contains(0));
+        EXPECT_TRUE(pinned->getMask(relocated_id)->empty());
+        offsets = {{2}};
+        auto last = merge(store, {lineage[0][2]}, {source}, {}, false, &input);
+        commit(store, last);
+        EXPECT_EQ(store.snapshot()->getMask(source_id)->cardinality(), 3);
+        EXPECT_EQ(pinned->getMask(source_id)->cardinality(), 2);
+        offsets = {{}};
+        auto retirement = merge(store, {}, {source}, {}, true, &input);
+        commit(store, retirement);
+        EXPECT_FALSE(store.snapshot()->getMask(source_id));
+        EXPECT_EQ(pinned->getMask(source_id)->cardinality(), 2);
+        EXPECT_TRUE(initial->getMask(source_id)->empty());
+        EXPECT_FALSE(prepare(store, {{"a", 1}}).produces_part);
+    }
+    StateStore reopened(directory, incarnation, true, true);
+    EXPECT_FALSE(reopened.snapshot()->getMask(source_id));
+    EXPECT_TRUE(reopened.snapshot()->getMask(relocated_id)->contains(0));
+    EXPECT_EQ(reopened.authorizedPartCount(), 3);
+    EXPECT_FALSE(prepare(reopened, {{"a", 1}}).produces_part);
+}
+
+TEST_F(UpsertDiskStateTest, ParallelRecoveryRejectsCorruptPayload)
+{
+    String part;
+    {
+        StateStore store(directory, incarnation, false, true);
+        for (size_t i = 0; i < 16; ++i)
+        {
+            auto prepared = prepare(store, {{std::to_string(i), 1}});
+            commit(store, prepared);
+            part = prepared.record.final_name;
+        }
+    }
+    {
+        std::ofstream output(directory / part / ROWS_FILE, std::ios::binary | std::ios::app);
+        output.put('x');
+    }
+    Resources resources;
+    resources.recovery_threads = 4;
+    EXPECT_THROW((StateStore(directory, incarnation, true, true, {}, resources)), Exception);
+}
+
+TEST_F(UpsertDiskStateTest, PartialRelocationRecoversAndMergesMaskedSourceCopy)
+{
+    String source;
+    String destination;
+    String source_id;
+    String destination_id;
+    {
+        StateStore store(directory, incarnation, false, true);
+        auto first = prepare(store, {{"a", 1}, {"b", 1}});
+        source = first.record.final_name;
+        source_id = objectName(first.record.part);
+        commit(store, first);
+        const std::vector<PartRows> lineage{store.loadPartRows(source)};
+        const std::vector<std::vector<UInt32>> offsets{{0}};
+        const StateStore::MergeInput input{store.snapshot(), lineage, offsets};
+        auto partial = merge(store, {lineage[0][0]}, {source}, {}, false, &input);
+        destination = partial.record.final_name;
+        destination_id = objectName(partial.record.part);
+        commit(store, partial);
+        EXPECT_EQ(store.authorizedPartCount(), 2);
+    }
+    StateStore reopened(directory, incarnation, true, true);
+    EXPECT_TRUE(reopened.snapshot()->getMask(source_id)->contains(0));
+    EXPECT_FALSE(reopened.snapshot()->getMask(source_id)->contains(1));
+    EXPECT_TRUE(reopened.snapshot()->getMask(destination_id)->empty());
+    const std::vector<PartRows> lineage{reopened.loadPartRows(source), reopened.loadPartRows(destination)};
+    const std::vector<std::vector<UInt32>> offsets(2);
+    const StateStore::MergeInput input{reopened.snapshot(), lineage, offsets};
+    auto joined = merge(reopened, {lineage[0][1], lineage[1][0]}, {source, destination}, {}, true, &input);
+    EXPECT_TRUE(joined.record.dead.empty());
+    commit(reopened, joined);
+    EXPECT_EQ(reopened.authorizedPartCount(), 1);
+    EXPECT_TRUE(reopened.snapshot()->getMask(objectName(joined.record.part))->empty());
+    EXPECT_EQ(reopened.loadPartRows(joined.record.final_name).size(), 2);
+}
 #endif

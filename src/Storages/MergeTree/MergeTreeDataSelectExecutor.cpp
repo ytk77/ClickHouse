@@ -235,7 +235,7 @@ QueryPlanPtr MergeTreeDataSelectExecutor::read(
     const auto & snapshot_data = assert_cast<const MergeTreeData::SnapshotData &>(*storage_snapshot->data);
 
     auto step = readFromParts(
-        snapshot_data.parts,
+        snapshot_data.getParts(storage_snapshot->metadata, &query_info, context),
         snapshot_data.mutations_snapshot,
         column_names_to_return,
         storage_snapshot,

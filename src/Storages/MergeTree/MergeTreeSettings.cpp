@@ -56,6 +56,43 @@ namespace ErrorCodes
   * and should not be changed by the user without a reason.
   */
 #define MERGE_TREE_SETTINGS(DECLARE, DECLARE_WITH_ALIAS) \
+    DECLARE(UInt64, upsert_index_cache_bytes, 64ULL << 20, R"(
+Resource limit for the 64 MiB block cache in `UpsertMergeTree`. Applied when the table opens.
+No query or database setting is required. `ALTER` of this setting is not supported.
+)", 0) \
+    DECLARE(UInt64, upsert_write_buffer_bytes, 16ULL << 20, R"(
+Resource limit for the 16 MiB write buffer in `UpsertMergeTree`. Applied when the table opens.
+No query or database setting is required. `ALTER` of this setting is not supported.
+)", 0) \
+    DECLARE(UInt64, upsert_write_buffer_count, 3, R"(
+Resource limit for the write buffer count in `UpsertMergeTree`. Applied when the table opens.
+No query or database setting is required. `ALTER` of this setting is not supported.
+)", 0) \
+    DECLARE(UInt64, upsert_wal_bytes, 64ULL << 20, R"(
+Resource limit for the WAL byte budget in `UpsertMergeTree`. Applied when the table opens.
+No query or database setting is required. `ALTER` of this setting is not supported.
+)", 0) \
+    DECLARE(UInt64, upsert_background_jobs, 2, R"(
+Resource limit for the background jobs in `UpsertMergeTree`. Applied when the table opens.
+No query or database setting is required. `ALTER` of this setting is not supported.
+)", 0) \
+    DECLARE(UInt64, upsert_max_open_files, 128, R"(
+Resource limit for the open file budget in `UpsertMergeTree`. Applied when the table opens.
+No query or database setting is required. `ALTER` of this setting is not supported.
+)", 0) \
+    DECLARE(UInt64, upsert_recovery_threads, 4, R"(
+Resource limit for the parallel recovery workers in `UpsertMergeTree`. Applied when the table opens.
+No query or database setting is required. `ALTER` of this setting is not supported.
+)", 0) \
+    DECLARE(UInt64, upsert_mask_cache_bytes, 32ULL << 20, R"(
+Maximum retained decoded visibility mask cache bytes per `UpsertMergeTree` table.
+Zero disables the cache. Readers can retain evicted immutable masks until their query finishes.
+Applied when the table opens.
+)", 0) \
+    DECLARE(Bool, upsert_partitioned_filters, true, R"(
+Use partitioned `RocksDB` index and Bloom filters in `UpsertMergeTree`.
+Applied when the table opens; this does not change the commit or durability protocol.
+)", 0) \
     DECLARE(UInt64, min_compress_block_size, 0, R"(
 Minimum size of blocks of uncompressed data required for compression when
 writing the next mark. You can also specify this setting in the global settings

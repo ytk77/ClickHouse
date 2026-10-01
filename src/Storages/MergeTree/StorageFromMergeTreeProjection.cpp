@@ -40,7 +40,7 @@ void StorageFromMergeTreeProjection::read(
     context->checkAccess(AccessType::SELECT, parent_storage->getStorageID());
 
     const auto & snapshot_data = assert_cast<const MergeTreeData::SnapshotData &>(*storage_snapshot->data);
-    const auto & parts = snapshot_data.parts;
+    const auto parts = snapshot_data.getParts(parent_metadata);
 
     RangesInDataParts projection_parts;
     for (const auto & part : *parts)
@@ -95,6 +95,7 @@ StorageFromMergeTreeProjection::getStorageSnapshot(const StorageMetadataPtr & me
     data->storage = parent_snapshot_data.storage;
     data->parts = parent_snapshot_data.parts;
     data->upsert_snapshot = parent_snapshot_data.upsert_snapshot;
+    data->upsert_catalog = parent_snapshot_data.upsert_catalog;
     data->mutations_snapshot = parent_snapshot_data.mutations_snapshot;
 
     return std::make_shared<StorageSnapshot>(*this, metadata_snapshot, std::move(data));

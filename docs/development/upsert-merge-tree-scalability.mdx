@@ -1,0 +1,125 @@
+---
+description: 'Implementation boundaries and bounded scalability evaluation for UpsertMergeTree.'
+sidebarTitle: 'UpsertMergeTree scalability'
+slug: /development/upsert-merge-tree-scalability
+title: 'UpsertMergeTree scalability'
+doc_type: 'reference'
+---
+
+# `UpsertMergeTree` scalability {#upsert-scalability}
+
+This work targets the overhead of retaining many live rows and parts. It does not establish a 10-billion-row capacity or latency guarantee. The evaluation uses a bounded wall-clock budget and independently varies live rows, active parts, update distribution, and concurrent readers.
+
+## Incremental publication {#incremental-publication}
+
+`PartCatalog` is an immutable AVL tree ordered by `MergeTreePartInfo`. Adding or retiring a part copies the affected search paths, rather than enumerating the native active-part set. Nodes aggregate the minimum metadata/data versions, partition boundaries, and lightweight-delete flag. Column and index sizes continue to use incremental accounting.
+
+A query owns the catalog root and its matching visibility snapshot. When a partition predicate is available before materialization, entire subtrees belonging to a pruned partition are skipped. Full materialization is cached per catalog root and reused by readers; it happens outside the writer's parts lock. A full-table query still enumerates its selected parts. Native `data_parts_indexes` and the catalog remain proportional to the active-part count; this is not disk-paged metadata.
+
+Maintenance traverses at most 256 new candidates per tick from the native ordered index, plus at most one small candidate carried across a scan boundary. Its cursor advances over healthy and oversized parts as well as candidates selected for rewriting. This removes full-table candidate copying and traverses a finite backlog in rounds. A continuously growing hot partition can still delay later partitions when ingestion outpaces maintenance. It does not provide a fixed TTL latency independent of the number of parts, nor a priority scheduler for compaction debt.
+
+## Visibility cache {#visibility-cache}
+
+The disk-state instance owns a byte-bounded cache of immutable decoded masks. Its keys contain the part object identity and an in-memory mask generation. An immutable version map is published with each pinned `RocksDB` snapshot; unchanged masks retain their generation across commits. The map is updated by observing mask operations in the actual state batch, including retirement and `TRUNCATE` range deletion.
+
+Recovery reconstructs the version map after validating the durable authority. Cache contents and generations are not persisted and cannot change winner decisions. Independent database instances have independent caches. Eviction releases the cache's reference; readers may retain an evicted bitmap until their query ends, so the configured cache size is not a total query-memory limit.
+
+## Resource settings and recovery {#resource-settings}
+
+All settings have defaults. Ordinary `CREATE TABLE`, `INSERT` and `SELECT` require no additional database or session settings. These resource settings are captured when a table opens; changing them with `ALTER` is not supported.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `upsert_index_cache_bytes` | 64 MiB | Per-table `RocksDB` block-cache capacity |
+| `upsert_mask_cache_bytes` | 32 MiB | Retained decoded-mask cache; zero disables it |
+| `upsert_write_buffer_bytes` | 16 MiB | Size of a write buffer |
+| `upsert_write_buffer_count` | 3 | Maximum write-buffer count |
+| `upsert_wal_bytes` | 64 MiB | WAL size threshold for flushing |
+| `upsert_background_jobs` | 2 | `RocksDB` background-job budget |
+| `upsert_max_open_files` | 128 | `RocksDB` open-file budget |
+| `upsert_partitioned_filters` | true | Partitioned index and Bloom-filter blocks |
+| `upsert_recovery_threads` | 4 | Maximum outstanding payload-verification workers |
+
+These are performance budgets, not changes to synchronous durability. WAL flushing thresholds and cache capacity are not hard limits on all process memory or disk use. Resources across multiple tables must still fit the server's capacity.
+
+Recovery verifies every authorized payload and visibility mask before publishing the table. Its queue is bounded by `upsert_recovery_threads`, and all workers finish before recovery can release database state or reclaim retired data. A verification exception fails recovery. Parallel verification is limited by aggregate storage bandwidth; it does not promise speedup proportional to thread count.
+
+## Measurements {#measurements}
+
+The `Upsert`-prefixed events in `system.events` and applicable query `ProfileEvents` distinguish winner lookup, mask loading/encoding, state preparation, synchronous state writes, insert commit-lock waiting/holding, snapshot construction, maintenance candidate visits, and recovery. `UpsertMaskCacheHits` and `UpsertMaskCacheMisses` describe decoded-mask reuse. `UpsertSnapshotPartsVisited` counts descriptors involved in tree construction, including balancing nodes; it is not the table's active-part count.
+
+Use a baseline binary and the candidate with the same SQL, data, and settings. Record active parts and physical rows as well as latency: background maintenance can change these between runs. Small sample counts and concurrent build activity are insufficient for production tail-latency claims.
+
+## Bounded acceptance stages {#bounded-acceptance-stages}
+
+1. Validate overwrite, pinned snapshots, `DELETE`, `TRUNCATE`, schema operations, partitions, projections, and interrupted recovery.
+2. Start with 1 million live rows. Increase to 10 million only while the time budget permits.
+3. Independently create thousands of small parts to expose metadata costs without generating billions of rows.
+4. Compare insert and overwrite duration, point/range queries, snapshot-work counters, physical/live row ratio, and recovery correctness.
+5. Reserve time for failures and regression tests. Report incomplete or timed-out cases rather than extrapolating them to 10 billion rows.
+
+Large physical parts, framed lineage, chunked durable masks, resumable many-to-one activation, group commit, disk-paged metadata, and deferred verification require separate protocol work. The current disk format and full startup verification remain in force. The larger architecture and migration requirements are described in [continuous ingestion](/development/upsert-merge-tree-continuous-ingestion).
+
+## Reproduce the local evaluation {#reproduce-local-evaluation}
+
+`tests/integration/test_upsert_scalability/benchmark.py` starts its own loopback server, creates a fresh data directory, checks row counts and query results, records per-query counters, and stops only that server. It refuses to reuse an existing work directory. Use different work directories for baseline and candidate runs, and run them sequentially without a concurrent build. Output and server logs belong in the build directory; runtime data and the detailed `results.json` belong under the repository's `tmp` directory.
+
+```bash
+python3 tests/integration/test_upsert_scalability/benchmark.py \
+  --binary build_release_concurrency_clang21_norust/programs/clickhouse \
+  --work-dir tmp/upsert-scale-candidate-1m \
+  --log-dir build_release_concurrency_clang21_norust \
+  --rows 1000000 --partitions 1024 --seconds 600 \
+  > build_release_concurrency_clang21_norust/test_upsert_scale_candidate_1m.log 2>&1
+```
+
+The default ports are `19197` and `19198`; they can be overridden. The deadline bounds individual HTTP requests by the remaining budget, followed by at most 30 seconds for graceful server shutdown. This benchmark keeps normal background maintenance enabled and reports its resulting active-part count. It is not a fixed-part-count comparison or a production workload simulator.
+
+Use `--restart` to compare row count and version sum after restarting. `--read-after-updates` also checks point and range query results against the generated update set. `--update-pattern hot` concentrates the overwrite workload on at most 1,000 keys; the default distributes it over the table's key range. This hot-key case is not a calibrated Zipf distribution.
+
+For binaries built with failpoint support, `--pause-maintenance` pauses publication of background rewrites. Running both binaries this way separates query/publication cost from different compaction progress; confirm that the reported part counts match. This mode measures a controlled backlog and does not measure sustainable ingestion or space reclamation.
+
+## Local acceptance results, 2026-10-01 {#local-acceptance-results}
+
+The evaluation used baseline commit `061c0f5e06e` and the working-tree candidate on `feat/upsert-scalability-20261001`. The evaluation ran from 01:41 to 03:03 UTC, approximately 82 minutes within the 90-minute budget. Performance runs used separate local data directories, the same host and binaries built with the same configuration, four query threads, and sequential baseline/candidate execution. The clean comparisons had no concurrent compilation or correctness suite.
+
+The final candidate passed **81 scoped C++ tests and 46 integration cases**. The integration cases ran against isolated local servers, covering the new scalability cases and existing materialized-view, partition, projection, mutation, and recovery cases. This was not the full Docker integration suite or an ASan/TSan run. The full unit-test executable could not start because an unrelated `Silk` initializer hit an `io_uring` assertion; the scoped runner linked the compiled `Upsert` test objects and product libraries and ran all 81 selected tests successfully.
+
+The new checks include immutable version-map updates against a reference map, old/new mask snapshots across overwrite and `TRUNCATE`, cache eviction, partial relocation followed by reopening and merging, payload-corruption rejection during parallel recovery, catalog pruning with both analyzers, and resource-setting validation. These are targeted checks, not exhaustive failure injection at every durable boundary.
+
+The 10-million-row comparison used one partition and normal background maintenance:
+
+| Measurement | Baseline | Candidate |
+| --- | ---: | ---: |
+| Insert 10 million rows | 203.502 s | 106.688 s |
+| Overwrite 100,000 input rows | 6.970 s | 3.151 s |
+| Point query p50 / p95 | 4.85 / 8.14 ms | 3.56 / 5.34 ms |
+| Range query p50 / p95 | 72.34 / 164.65 ms | 5.05 / 15.42 ms |
+| Restart and verify | 1.701 s | 1.265 s |
+| Active parts at measurement | 52 | 79 |
+
+Both runs retained 10 million live rows and the expected version sum after restart. The table uses the final candidate binary, including the multi-partition no-pruning reuse optimization. The different active-part counts reflect concurrent maintenance and limit causal attribution of the latency differences. An earlier candidate trial completed ingestion in 89.947 s with 67 parts; the final rerun took 106.688 s with 79 parts. This variation is another reason not to treat a single timing as a throughput guarantee.
+
+An earlier one-million-row, 1,024-partition comparison with maintenance enabled exposed a remaining tradeoff: the candidate finished ingestion faster but retained 14,842 parts versus 6,049 in the baseline. Post-update point-query p95 increased from 23.51 ms to 44.08 ms, while range-query p95 decreased from 2.162 s to 0.953 s. Profiling identified query planning and the larger selected-part inventory as contributors. The final candidate reuses materialized ranges when a partition predicate excludes no partition, but fresh catalog roots and compaction backlog still require attention. Faster commits alone do not establish faster reads under sustained ingestion.
+
+The final candidate was also compared with maintenance publication paused. Both binaries had exactly **20,480 active parts and 1.1 million physical rows**, containing one million live rows across 1,024 partitions:
+
+| Measurement | Baseline | Candidate |
+| --- | ---: | ---: |
+| Insert one million rows | 47.927 s | 27.435 s |
+| Overwrite 100,000 input rows | 151.684 s | 26.686 s |
+| Point query p50 / p95 before updates | 16.44 / 20.82 ms | 17.00 / 28.53 ms |
+| Point query p50 / p95 after updates | 27.72 / 43.41 ms | 28.69 / 48.62 ms |
+| Range query p50 / p95 before updates | 2.401 / 2.614 s | 0.185 / 0.282 s |
+| Range query p50 / p95 after updates | 0.873 / 1.386 s | 0.818 / 1.129 s |
+| Restart and verify | 36.008 s | 12.467 s |
+
+This controlled backlog shows substantially less write/publication overhead and faster restart, while point-query p95 remains worse. It does not validate long-term maintenance equilibrium.
+
+A separate one-million-row workload concentrated its 100,000 input updates on 1,000 keys. Both versions retained the expected one million live rows and version sum of 1,001,000 after restart. Initial insert time was **6.756 s versus 8.329 s**, and overwrite time was **0.181 s versus 0.215 s**, baseline versus candidate. Post-update point-query p95 was 12.14 ms versus 6.55 ms; range-query p95 was 27.58 ms versus 8.27 ms. Background maintenance left 6 versus 16 parts, respectively, so this comparison also includes differing compaction progress. The small hot-key workload did not demonstrate a throughput improvement. It must not be represented by the many-part workload's speedup.
+
+There were 30 samples per point/range phase and one timed trial per configuration. Restart measurements include process startup and verification queries and benefit from the host filesystem cache. These results do not establish production p99 latency, cold-start recovery time, sustainable compaction throughput, or capacity at 10 billion rows.
+
+## Remaining first-stage work {#remaining-first-stage-work}
+
+The current resource controls are per table. A server-wide shared block cache with per-table quotas, an explicit compression policy, and detailed `RocksDB` stall/cache statistics remain to be implemented. The maintenance cursor provides bounded candidate enumeration; the proposed generation-aware priority heap is still pending. Publication uses a balanced immutable tree with one part per node; grouping parts into larger bounded leaves remains a memory/CPU tradeoff to measure. The current metrics do not replace a dedicated `system.upsert_state` table.

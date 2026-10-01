@@ -161,6 +161,7 @@ private:
     BackgroundSchedulePoolTaskHolder upsert_maintenance_task;
     /// Accessed only by the single table maintenance task; resume after the previous selected unit.
     std::optional<MergeTreePartInfo> upsert_maintenance_cursor;
+    DataPartPtr upsert_maintenance_pending;
     void runUpsertMaintenance();
     void alterUpsertMetadata(const AlterCommands & commands, ContextPtr local_context);
     void mutateUpsert(const MutationCommands & commands, ContextPtr context);

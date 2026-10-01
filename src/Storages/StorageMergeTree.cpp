@@ -118,6 +118,15 @@ namespace Setting
 
 namespace MergeTreeSetting
 {
+    extern const MergeTreeSettingsUInt64 upsert_index_cache_bytes;
+    extern const MergeTreeSettingsUInt64 upsert_write_buffer_bytes;
+    extern const MergeTreeSettingsUInt64 upsert_write_buffer_count;
+    extern const MergeTreeSettingsUInt64 upsert_wal_bytes;
+    extern const MergeTreeSettingsUInt64 upsert_background_jobs;
+    extern const MergeTreeSettingsUInt64 upsert_max_open_files;
+    extern const MergeTreeSettingsUInt64 upsert_recovery_threads;
+    extern const MergeTreeSettingsBool upsert_partitioned_filters;
+    extern const MergeTreeSettingsUInt64 upsert_mask_cache_bytes;
     extern const MergeTreeSettingsBool allow_experimental_replacing_merge_with_cleanup;
     extern const MergeTreeSettingsBool always_use_copy_instead_of_hardlinks;
     extern const MergeTreeSettingsBool assign_part_uuids;
@@ -231,8 +240,19 @@ StorageMergeTree::StorageMergeTree(
             fs::path(disks.front()->getPath()) / relative_data_path_, disks.front()->getName(), disks.front()->getPath(),
             metadata_, merging_params.upsert_version_column, LoadingStrictnessLevel::ATTACH <= mode, use_disk_state);
 
+        const auto upsert_settings = getSettings();
+        Upsert::Resources resources;
+        resources.index_cache_bytes = (*upsert_settings)[MergeTreeSetting::upsert_index_cache_bytes];
+        resources.write_buffer_bytes = (*upsert_settings)[MergeTreeSetting::upsert_write_buffer_bytes];
+        resources.write_buffer_count = (*upsert_settings)[MergeTreeSetting::upsert_write_buffer_count];
+        resources.wal_bytes = (*upsert_settings)[MergeTreeSetting::upsert_wal_bytes];
+        resources.background_jobs = (*upsert_settings)[MergeTreeSetting::upsert_background_jobs];
+        resources.max_open_files = (*upsert_settings)[MergeTreeSetting::upsert_max_open_files];
+        resources.recovery_threads = (*upsert_settings)[MergeTreeSetting::upsert_recovery_threads];
+        resources.mask_cache_bytes = (*upsert_settings)[MergeTreeSetting::upsert_mask_cache_bytes];
+        resources.partitioned_filters = (*upsert_settings)[MergeTreeSetting::upsert_partitioned_filters];
         upsert_store = std::make_unique<Upsert::StateStore>(fs::path(disks.front()->getPath()) / relative_data_path_,
-            incarnation, LoadingStrictnessLevel::ATTACH <= mode, use_disk_state);
+            incarnation, LoadingStrictnessLevel::ATTACH <= mode, use_disk_state, Upsert::StateClock{}, resources);
     }
 
     loadDataParts(LoadingStrictnessLevel::FORCE_RESTORE <= mode, std::nullopt);

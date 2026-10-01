@@ -1,4 +1,5 @@
 #pragma once
+#include <Storages/MergeTree/UniqueKey/UpsertPartCatalog.h>
 #include <Storages/MergeTree/UniqueKey/UpsertSnapshot.h>
 
 #include <atomic>
@@ -696,6 +697,9 @@ public:
 
         MutationsSnapshotPtr mutations_snapshot;
         Upsert::SnapshotPtr upsert_snapshot;
+        std::shared_ptr<const Upsert::PartCatalog> upsert_catalog;
+
+        RangesInDataPartsPtr getParts(const StorageMetadataPtr & metadata, const SelectQueryInfo * query_info = nullptr, ContextPtr context = {}) const;
 
         std::unique_ptr<SnapshotData> clone() const
         {
@@ -704,6 +708,7 @@ public:
             result->parts = parts;
             result->mutations_snapshot = mutations_snapshot;
             result->upsert_snapshot = upsert_snapshot;
+            result->upsert_catalog = upsert_catalog;
             return result;
         }
     };
@@ -1596,7 +1601,7 @@ protected:
     /// Readers never acquire the parts mutex used for durable writer serialization.
     struct UpsertReadSnapshot
     {
-        RangesInDataPartsPtr parts;
+        Upsert::PartCatalog catalog;
         Upsert::SnapshotPtr visibility;
         PartsSnapshotInfo parts_info;
         ColumnSizeByName column_sizes;

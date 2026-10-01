@@ -1,3 +1,4 @@
+#include <Storages/MergeTree/UniqueKey/UpsertMetrics.h>
 #include <DataTypes/DataTypeString.h>
 #include <Disks/DiskType.h>
 #include <Disks/DiskObjectStorage/DiskObjectStorage.h>
@@ -7531,11 +7532,14 @@ IStorage::ColumnSizeByName MergeTreeData::getColumnSizes(const Names & columns) 
     {
         const auto snapshot = getUpsertReadSnapshotForQuery();
         auto result = snapshot->column_sizes;
+        RangesInDataPartsPtr subcolumn_parts;
         for (const auto & name : columns)
         {
             if (result.contains(name))
                 continue;
-            for (const auto & range : *snapshot->parts)
+            if (!subcolumn_parts)
+                subcolumn_parts = snapshot->catalog.ranges();
+            for (const auto & range : *subcolumn_parts)
             {
                 const auto column = range.data_part->tryGetColumn(name);
                 if (column && column->isSubcolumn())
@@ -10406,7 +10410,7 @@ UInt64 MergeTreeData::estimateNumberOfRowsToRead(
 
     MergeTreeDataSelectExecutor reader(*this);
     auto result_ptr = reader.estimateNumMarksToRead(
-        *snapshot_data.parts,
+        *snapshot_data.getParts(storage_snapshot->metadata, &query_info, query_context),
         snapshot_data.mutations_snapshot,
         storage_snapshot->metadata->getColumns().getAll().getNames(),
         storage_snapshot->metadata,
@@ -12134,9 +12138,28 @@ StorageMetadataHandle MergeTreeData::getInMemoryMetadataPtr(ContextPtr query_con
 #endif
 }
 
+RangesInDataPartsPtr MergeTreeData::SnapshotData::getParts(
+    const StorageMetadataPtr & metadata, const SelectQueryInfo * query_info, ContextPtr context) const
+{
+    if (!upsert_catalog)
+        return parts;
+    if (query_info && query_info->filter_actions_dag && context && metadata->hasPartitionKey()
+        && context->getSettingsRef()[Setting::use_partition_pruning])
+    {
+        ActionsDAGWithInversionPushDown predicate(query_info->filter_actions_dag->getOutputs().front(), context, true);
+        PartitionPruner pruner(metadata, predicate, context);
+        if (pruner.isUseless())
+            return upsert_catalog->ranges();
+        /// `PartitionPruner` also rejects empty parts; that alone cannot exclude their entire partition.
+        return upsert_catalog->ranges([&](const IMergeTreeDataPart & part) { return !part.isEmpty() && pruner.canBePruned(part); });
+    }
+    return upsert_catalog->ranges();
+}
+
 MergeTreeData::UpsertReadSnapshotPtr MergeTreeData::prepareUpsertReadSnapshot(
     Upsert::SnapshotPtr visibility, const DataPartPtr & added_part, const DataPartsVector & removed_parts, DataPartsLock & lock, const DataPartsVector & added_parts) const
 {
+    ProfileEventTimeIncrement<Microseconds> timer(ProfileEvents::UpsertSnapshotBuildMicroseconds);
     auto result = std::make_shared<UpsertReadSnapshot>();
     const auto current = getUpsertReadSnapshot();
     if (current)
@@ -12145,7 +12168,9 @@ MergeTreeData::UpsertReadSnapshotPtr MergeTreeData::prepareUpsertReadSnapshot(
     if (current && !added_part && added_parts.empty() && removed_parts.empty())
         return result;
 
-    auto parts = getDataPartsVectorForInternalUsage({DataPartState::Active}, lock);
+    DataPartsVector initial_parts;
+    if (!current)
+        initial_parts = getDataPartsVectorForInternalUsage({DataPartState::Active}, lock);
 
     /// Planner statistics must use the same publication mechanism rather than reacquiring the writer's mutex.
     const auto metadata = getInMemoryMetadataPtr(getContext(), true);
@@ -12183,49 +12208,50 @@ MergeTreeData::UpsertReadSnapshotPtr MergeTreeData::prepareUpsertReadSnapshot(
     if (current)
     {
         for (const auto & part : removed_parts)
-            update_sizes(part, false);
-    }
-    else
-    {
-        for (const auto & part : parts)
-            update_sizes(part, true);
-    }
-    std::unordered_set<const IMergeTreeDataPart *> removed;
-    for (const auto & part : removed_parts)
-        removed.insert(part.get());
-    std::erase_if(parts, [&](const auto & part)
-    {
-        return removed.contains(part.get());
-    });
-    auto add = [&](const DataPartPtr & part)
-    {
-        update_sizes(part, true);
-        parts.push_back(part);
-    };
-    const auto less = [](const auto & lhs, const auto & rhs)
-    {
-        return lhs->info < rhs->info;
-    };
-    if (added_parts.empty())
-    {
-        if (added_part)
         {
-            update_sizes(added_part, true);
-            parts.insert(std::lower_bound(parts.begin(), parts.end(), added_part, less), added_part);
+            update_sizes(part, false);
+            result->catalog = result->catalog.withoutPart(part->info);
         }
     }
     else
     {
-        const auto previous_size = parts.size();
-        if (added_part)
-            add(added_part);
-        for (const auto & part : added_parts)
-            add(part);
-        std::sort(parts.begin() + previous_size, parts.end(), less);
-        std::inplace_merge(parts.begin(), parts.begin() + previous_size, parts.end(), less);
+        for (const auto & part : initial_parts)
+        {
+            update_sizes(part, true);
+            result->catalog = result->catalog.withPart(part);
+        }
     }
-    result->parts = std::make_shared<const RangesInDataParts>(parts);
-    result->parts_info = getPartsSnapshotInfo(parts);
+    auto add = [&](const DataPartPtr & part)
+    {
+        update_sizes(part, true);
+        result->catalog = result->catalog.withPart(part);
+    };
+    if (added_part)
+        add(added_part);
+    for (const auto & part : added_parts)
+        add(part);
+    result->parts_info.min_metadata_version = result->catalog.minMetadataVersion();
+    result->parts_info.has_lightweight_delete_parts = result->catalog.hasLightweightDelete();
+#ifndef NDEBUG
+    /// Validate the incremental catalog against native ownership, including pending publication changes.
+    auto expected_parts = getDataPartsVectorForInternalUsage({DataPartState::Active}, lock);
+    std::unordered_set<const IMergeTreeDataPart *> removed;
+    for (const auto & part : removed_parts)
+        removed.insert(part.get());
+    std::erase_if(expected_parts, [&](const auto & part) { return removed.contains(part.get()); });
+    if (added_part)
+        expected_parts.push_back(added_part);
+    expected_parts.insert(expected_parts.end(), added_parts.begin(), added_parts.end());
+    std::sort(expected_parts.begin(), expected_parts.end(), [](const auto & lhs, const auto & rhs) { return lhs->info < rhs->info; });
+    const auto actual_parts = result->catalog.ranges();
+    chassert(actual_parts->size() == expected_parts.size());
+    for (size_t i = 0; i < expected_parts.size(); ++i)
+        chassert((*actual_parts)[i].data_part == expected_parts[i]);
+    const auto expected_info = getPartsSnapshotInfo(expected_parts);
+    chassert(result->catalog.minDataVersions() == *expected_info.min_data_versions);
+    chassert(result->parts_info.min_metadata_version == expected_info.min_metadata_version);
+    chassert(result->parts_info.has_lightweight_delete_parts == expected_info.has_lightweight_delete_parts);
+#endif
     return result;
 }
 
@@ -12267,9 +12293,10 @@ MergeTreeData::createStorageSnapshot(const StorageMetadataPtr & metadata_snapsho
         const auto published = getUpsertReadSnapshotForQuery();
         if (query_context->getCurrentTransaction())
             throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree does not support explicit transactions");
-        snapshot_data->parts = published->parts;
+        snapshot_data->upsert_catalog = std::make_shared<const Upsert::PartCatalog>(published->catalog);
         snapshot_data->upsert_snapshot = published->visibility;
         parts_info = published->parts_info;
+        parts_info.min_data_versions = std::make_shared<const PartitionIdToMinBlock>(published->catalog.minDataVersions());
     }
     else
     {

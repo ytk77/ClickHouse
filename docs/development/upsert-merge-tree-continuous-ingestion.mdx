@@ -164,6 +164,8 @@ checkpoint 捕捉同一 `cut_csn` 的索引 root、活動 parts、精確 journal
 
 ## 實作順序與生產驗收 {#implementation-and-production-gates}
 
+2026-10-01 的首輪效能改良與有時限的本機驗收，另記於 [scalability implementation and evaluation](/development/upsert-merge-tree-scalability)。該輪保留現行磁碟格式，先處理增量 catalog、mask cache、資源設定與平行完整驗證；不代表下表所有階段已完成。
+
 | 階段 | 工作 | 開啟下一階段前的證據 |
 | --- | --- | --- |
 | 1 | durable checkpoint／root 切換、token 保留窗口、精確 merge forwarding、安全回收 | 在目前有界資料模型中跨多輪合併與重啟仍維持唯一性、持久性與舊快照 |

@@ -96,6 +96,24 @@
     M(DefaultImplementationForNullsRowsWithNulls, "Number of rows which contain null values processed by default implementation for nulls in function execution", ValueType::Number) \
     M(MarkCacheHits, "Number of times an entry has been found in the mark cache, so we didn't have to load a mark file.", ValueType::Number) \
     M(MarkCacheMisses, "Number of times an entry has not been found in the mark cache, so we had to load a mark file in memory, which is a costly operation, adding to query latency.", ValueType::Number) \
+    M(UpsertMaskCacheHits, "Decoded `UpsertMergeTree` visibility masks reused from the cache.", ValueType::Number) \
+    M(UpsertMaskCacheMisses, "Decoded `UpsertMergeTree` visibility masks loaded into the cache.", ValueType::Number) \
+    M(UpsertWinnerLookupMicroseconds, "Time spent looking up `UpsertMergeTree` winners in `RocksDB`.", ValueType::Microseconds) \
+    M(UpsertWinnerLookupKeys, "Number of keys probed in `UpsertMergeTree` winner lookups.", ValueType::Number) \
+    M(UpsertMaskReadMicroseconds, "Time spent loading and decoding `UpsertMergeTree` visibility masks.", ValueType::Microseconds) \
+    M(UpsertMaskReadBytes, "Encoded bytes loaded for `UpsertMergeTree` visibility masks.", ValueType::Bytes) \
+    M(UpsertMaskWriteBytes, "Encoded visibility mask bytes prepared by `UpsertMergeTree`.", ValueType::Bytes) \
+    M(UpsertStatePrepareMicroseconds, "Time spent preparing `UpsertMergeTree` state batches.", ValueType::Microseconds) \
+    M(UpsertStateWriteMicroseconds, "Time spent synchronously persisting `UpsertMergeTree` state batches.", ValueType::Microseconds) \
+    M(UpsertStateWriteBytes, "Bytes in durable `UpsertMergeTree` state batches.", ValueType::Bytes) \
+    M(UpsertStateWrites, "Number of durable `UpsertMergeTree` state batches.", ValueType::Number) \
+    M(UpsertCommitLockWaitMicroseconds, "Time waiting for the `UpsertMergeTree` insert commit lock.", ValueType::Microseconds) \
+    M(UpsertCommitLockHoldMicroseconds, "Time holding the `UpsertMergeTree` insert commit lock.", ValueType::Microseconds) \
+    M(UpsertSnapshotBuildMicroseconds, "Time spent constructing `UpsertMergeTree` read snapshots.", ValueType::Microseconds) \
+    M(UpsertSnapshotPartsVisited, "Part descriptors visited while updating `UpsertMergeTree` snapshots.", ValueType::Number) \
+    M(UpsertMaintenanceCandidates, "Part candidates inspected by `UpsertMergeTree` maintenance.", ValueType::Number) \
+    M(UpsertRecoveryMicroseconds, "Time spent recovering and verifying `UpsertMergeTree` disk state.", ValueType::Microseconds) \
+    M(UpsertRecoveryParts, "Authorized parts fully verified during `UpsertMergeTree` recovery.", ValueType::Number) \
     M(UniqueKeyBitmapLoadMicroseconds, "Time spent reading and deserializing UNIQUE KEY delete-bitmap sidecar files on a DeleteBitmapCache miss.", ValueType::Microseconds) \
     M(UniqueKeyBitmapUpdates, "Number of UNIQUE KEY delete-bitmap sidecar files written (one per supersession / DELETE commit).", ValueType::Number) \
     M(PrimaryIndexCacheHits, "Number of times an entry has been found in the primary index cache, so we didn't have to load a index file.", ValueType::Number) \

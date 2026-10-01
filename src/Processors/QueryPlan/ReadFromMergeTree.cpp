@@ -5872,7 +5872,7 @@ std::unique_ptr<IQueryPlanStep> ReadFromMergeTree::deserialize(Deserialization &
     const auto & snapshot_data = assert_cast<const MergeTreeData::SnapshotData &>(*storage_snapshot->data);
 
     auto step = executor.readFromParts(
-        snapshot_data.parts,
+        snapshot_data.getParts(metadata_snapshot, &query_info, ctx.context),
         snapshot_data.mutations_snapshot,
         column_names,
         storage_snapshot,

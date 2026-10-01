@@ -108,12 +108,12 @@ PartCommit decodePartCommit(std::string_view bytes)
     return result;
 }
 
-StateStore::StateStore(String table_path_, ObjectID incarnation_, bool attach, bool use_disk_state, StateClock clock)
+StateStore::StateStore(String table_path_, ObjectID incarnation_, bool attach, bool use_disk_state, StateClock clock, const Resources & resources)
     : table_path(std::move(table_path_)), state_path((std::filesystem::path(table_path) / "upsert_state").string()), incarnation(incarnation_)
 {
     if (use_disk_state)
     {
-        disk = std::make_unique<DiskState>(table_path, incarnation, attach, std::move(clock));
+        disk = std::make_unique<DiskState>(table_path, incarnation, attach, std::move(clock), resources);
         return;
     }
     namespace fs = std::filesystem;

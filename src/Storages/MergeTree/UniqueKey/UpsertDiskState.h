@@ -1,5 +1,7 @@
 #pragma once
 
+#include <Storages/MergeTree/UniqueKey/UpsertResources.h>
+
 #include <Storages/MergeTree/UniqueKey/UpsertStateStore.h>
 
 namespace DB::Upsert
@@ -11,7 +13,7 @@ struct DiskPrepared;
 class DiskState
 {
 public:
-    DiskState(const String & table_path, ObjectID incarnation, bool attach, StateClock clock = {});
+    DiskState(const String & table_path, ObjectID incarnation, bool attach, StateClock clock = {}, const Resources & resources = {});
     ~DiskState();
     SnapshotPtr snapshot() const;
     std::optional<ObjectID> authorizedPart(const String & name) const;

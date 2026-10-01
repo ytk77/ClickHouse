@@ -137,7 +137,10 @@ BlockIO InterpreterOptimizeQuery::execute()
     }
 
     if (auto * snapshot_data = dynamic_cast<MergeTreeData::SnapshotData *>(storage_snapshot->data.get()))
+    {
         snapshot_data->parts = {};
+        snapshot_data->upsert_catalog.reset();
+    }
 
     table->optimize(query_ptr, metadata_snapshot, ast.partition, ast.final, ast.deduplicate, column_names, ast.cleanup, getContext());
     return {};
