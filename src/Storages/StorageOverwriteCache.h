@@ -345,7 +345,7 @@ private:
     /// Removes the keys of `block` from the cache. The rows to remove are produced by the read path,
     /// so a `DELETE` accepts exactly the predicates a `SELECT` accepts.
     void deleteBlock(const Block & block);
-    size_t deleteKeys(const std::vector<String> & serialized_keys);
+    size_t deleteKeys(const std::vector<String> & serialized_keys, const std::unordered_map<String, String> * expected_rows = nullptr, bool replaying = false);
 
     /// Replays the persisted log, then starts persisting. Runs from the constructor, so an `ATTACH` that
     /// cannot restore the table fails instead of exposing an incomplete cache.
@@ -722,6 +722,20 @@ public:
                 {
                     if (values.empty())
                         return;
+                    if (values.size() < count / 8)
+                    {
+                        const EntryId * candidate = entry_ids;
+                        const EntryId * end = entry_ids + count;
+                        for (const auto value : values)
+                        {
+                            candidate = std::lower_bound(candidate, end, static_cast<EntryId>(value));
+                            if (candidate == end)
+                                break;
+                            if (*candidate == static_cast<EntryId>(value))
+                                mark(static_cast<size_t>(candidate - entry_ids));
+                        }
+                        return;
+                    }
                     const auto less = [](auto value, EntryId bound) { return static_cast<EntryId>(value) < bound; };
                     size_t position = 0;
                     for (size_t probe = 0; probe < count; ++probe)
@@ -1035,7 +1049,8 @@ private:
     BackgroundSchedulePoolTaskHolder small_segment_compaction_task;
     /// Set while the log is being replayed. Segment compaction is left alone during replay, so that the
     /// segments in memory keep mirroring the files one to one and no rewritten segment goes unrecorded.
-    bool loading = false;
+    std::atomic<bool> loading{false};
+    std::atomic<bool> restoring{false};
     /// Files whose every row lost during replay. They are retired once persistence has started.
     std::vector<UInt64> retired_during_load;
 };

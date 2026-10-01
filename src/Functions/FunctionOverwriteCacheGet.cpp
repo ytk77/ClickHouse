@@ -1,4 +1,6 @@
 #include <Access/Common/AccessFlags.h>
+#include <Access/RowPolicy.h>
+#include <Access/EnabledRowPolicies.h>
 #include <Access/Common/AccessType.h>
 #include <Columns/ColumnNullable.h>
 #include <Columns/ColumnString.h>
@@ -32,6 +34,7 @@ namespace ErrorCodes
 extern const int ILLEGAL_TYPE_OF_ARGUMENT;
 extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
 extern const int TYPE_MISMATCH;
+extern const int SUPPORT_IS_DISABLED;
 }
 
 namespace
@@ -147,6 +150,10 @@ public:
         Names columns = storage->getPrimaryKey();
         columns.push_back(attribute);
         context->checkAccess(AccessType::SELECT, storage->getStorageID(), columns);
+        const auto id = storage->getStorageID();
+        const auto policy = context->getRowPolicyFilter(id.database_name, id.table_name, RowPolicyFilterType::SELECT_FILTER);
+        if (policy && !policy->isAlwaysTrue())
+            throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "`overwriteCacheGet` does not support row policies; use SELECT instead");
         return std::make_unique<ExecutableOverwriteCacheGet>(function_name, table_lock, storage, attribute, or_null, key_types);
     }
 

@@ -116,7 +116,7 @@ A clean shutdown drains the queue, so restarting the server loses nothing even i
 
 If persisting fails, the error is not swallowed - the table stops accepting publications and reports the failure, instead of continuing as an in-memory table whose disk copy has silently stopped advancing.
 
-`BACKUP` copies the immutable segment files together with a self-contained `manifest`, and holds back segment retirement while it does, so a concurrent publication cannot delete a file the backup was told to copy. `RESTORE` replaces the table's files and replays them; it refuses a table that already holds rows unless `allow_non_empty_tables` is set. A table created with `persist_mode = 'none'` cannot be backed up, because it keeps nothing on disk.
+`BACKUP` copies the immutable segment files together with a self-contained `manifest`, and holds back segment retirement while it does, so a concurrent publication cannot delete a file the backup was told to copy. `RESTORE` replaces the table's files and replays them; it requires an empty table, including when `allow_non_empty_tables` is set. A table created with `persist_mode = 'none'` cannot be backed up, because it keeps nothing on disk.
 
 ## Settings {#settings}
 
@@ -197,4 +197,26 @@ SELECT overwriteCacheGetOrNull(
 );
 ```
 
-`overwriteCacheGet` returns the column default for a missing key. `overwriteCacheGetOrNull` returns `NULL`.
+`overwriteCacheGet` returns the type's default value for a missing key; it does not evaluate a column `DEFAULT` expression. `overwriteCacheGetOrNull` returns `NULL`.
+
+## Recovery and concurrent maintenance {#recovery-and-concurrent-maintenance}
+
+Recovery repairs an incomplete frame or payload at the physical end of the manifest before allowing further appends. An all-zero suffix at a record boundary is also repaired. A checksum mismatch in a complete nonzero record is an error, including at the end of the file: the engine cannot distinguish a torn write from corruption of an acknowledged publication. Recovery stops before orphan cleanup in that case. Repair does not suppress filesystem read errors.
+
+`BACKUP` captures the manifest bytes while holding the persistence state lock and pins its referenced segment files. Later appends and checkpoints cannot change those captured bytes. `TRUNCATE`, file removal and path-changing `RENAME` are rejected while a backup pin exists. A checkpoint failure poisons the writer instead of allowing later publications to append to a temporary manifest.
+
+`RESTORE` requires an empty table, even with `allow_non_empty_tables=1`. Existing nonempty contents are preserved and the operation is rejected. Restore validates the fingerprint and decodes staged segments before replacing the empty table. During restore, new data reads and writes fail explicitly. Restore waits for existing readers without a cancellation check in that wait; a long-running reader can delay it. Segment files are installed before the manifest, which is replaced through a temporary file. If installation fails after replacement begins, the table remains blocked until `DETACH`/`ATTACH` or restart; it does not acknowledge writes that bypass persistence. An interrupted restore can leave a staging directory requiring cleanup.
+
+A `DELETE` collects the matching keys and serialized rows before one publication. At publication it deletes only rows that still match those selected contents, preserving concurrent replacements. Collecting those contents consumes memory proportional to the selected data and is subject to query memory limits. `DROP INDEX` detaches the index from the catalog; existing readers retain their own index references without blocking the writer on a reader drain.
+
+`overwriteCacheGet` and `overwriteCacheGetOrNull` reject execution when an effective row policy applies. Use `SELECT` to evaluate the policy. Missing keys in `overwriteCacheGet` return the type's default value, rather than evaluating a column `DEFAULT` expression. Mixed constant and nonconstant key arguments are supported.
+
+The memory limit uses engine accounting, not process resident memory. Retired segments pinned by readers, retained version chains and recycling pools can make actual memory usage exceed that accounting. Index-build catch-up still scans entries under the writer lock; this change does not make that pause independent of table size. Directory sync through the disk abstraction remains best effort; this change does not strengthen every disk backend's durability guarantees.
+
+### Review validation {#review-validation}
+
+The review fixes passed a Release build, 98 scoped C++ tests (10 persistence and queue tests plus 88 Upsert regressions), six targeted cases including the new SQL regression, and all 19 existing `OverwriteCache` stateless tests. Tests used an isolated local server; the full Docker integration suite and ASan/TSan were not run.
+
+The concurrent deletion regression pauses after selecting 70,000 rows, replaces a matching key, drops the index while the mutation retains its snapshot, resumes deletion, and verifies the surviving replacement after restart. This test found an intermediate defect where the log still recorded every selected key; the final implementation records only keys actually deleted. Other targeted cases cover row policies, restore admission, invalid backup fingerprints, and persistence of altered memory settings. The persistence tests cover truncated and zero-filled tails, middle-record corruption, captured backup manifests, failed checkpoint replacement, and queued writes during rename.
+
+Follow-up work includes incremental index-build catch-up, bounded accounting for retained versions, floating-point key normalization, and cleanup of interrupted restore staging directories. Restore installation is tested functionally, but process termination at every manifest-replacement boundary remains untested.
