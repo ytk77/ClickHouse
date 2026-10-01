@@ -170,7 +170,8 @@ void OverwriteCachePersistence::load(const std::function<void(LoadedRecord &&)> 
     }
 
     std::unordered_set<UInt64> removed_segments;
-    const auto records = readManifest(removed_segments);
+    UInt64 valid_bytes = 0;
+    const auto records = readManifest(removed_segments, &valid_bytes);
 
     UInt64 max_segment_id = 0;
     size_t applied_rows = 0;
@@ -227,6 +228,13 @@ void OverwriteCachePersistence::load(const std::function<void(LoadedRecord &&)> 
         }
     }
 
+    if (valid_bytes != disk->getFileSize(manifest_path))
+    {
+        std::lock_guard state_lock(state_mutex);
+        writeManifest(records);
+        closeManifest();
+    }
+
     next_segment_id.store(max_segment_id + 1, std::memory_order_relaxed);
 
     /// A crash between writing a segment and recording it, or between recording a retirement and
@@ -265,7 +273,7 @@ void OverwriteCachePersistence::load(const std::function<void(LoadedRecord &&)> 
 }
 
 std::vector<OverwriteCachePersistence::Record>
-OverwriteCachePersistence::readManifest(std::unordered_set<UInt64> & removed_segments) const
+OverwriteCachePersistence::readManifest(std::unordered_set<UInt64> & removed_segments, UInt64 * valid_bytes) const
 {
     const auto manifest_path = fs::path(getPath()) / manifest_file_name;
     auto file_buffer = disk->readFile(manifest_path, getReadSettings());
@@ -298,31 +306,44 @@ OverwriteCachePersistence::readManifest(std::unordered_set<UInt64> & removed_seg
             fingerprint);
 
     std::vector<Record> records;
-    size_t truncated_bytes = 0;
+    const UInt64 file_size = disk->getFileSize(manifest_path);
+    UInt64 valid_end = file_buffer->count();
+    bool truncated = false;
     while (!file_buffer->eof())
     {
         UInt64 payload_size = 0;
         UInt128 expected_checksum{};
         String payload;
-        /// A record whose frame or payload is incomplete, or whose checksum does not match, is the tail an
-        /// `Async` publication never got to finish. Everything from there on is treated as absent.
-        try
+        constexpr size_t frame_size = sizeof(UInt64) + sizeof(UInt128);
+        if (file_size - file_buffer->count() < frame_size)
         {
-            readBinaryLittleEndian(payload_size, *file_buffer);
-            readPODBinary(expected_checksum, *file_buffer);
-            payload.resize(payload_size);
-            file_buffer->readStrict(payload.data(), payload_size);
-        }
-        catch (const Exception &)
-        {
-            truncated_bytes = 1;
+            truncated = true;
             break;
         }
-
+        readBinaryLittleEndian(payload_size, *file_buffer);
+        readPODBinary(expected_checksum, *file_buffer);
+        if (payload_size > file_size - file_buffer->count())
+        {
+            truncated = true;
+            break;
+        }
+        payload.resize(payload_size);
+        file_buffer->readStrict(payload.data(), payload_size);
         if (sipHash128(payload.data(), payload.size()) != expected_checksum)
         {
-            truncated_bytes = payload_size;
-            break;
+            if (payload_size == 0 && expected_checksum == UInt128{})
+            {
+                char buffer[4096];
+                while (!file_buffer->eof())
+                {
+                    const auto count = file_buffer->read(buffer, sizeof(buffer));
+                    if (std::any_of(buffer, buffer + count, [](char value) { return value != 0; }))
+                        throw Exception(ErrorCodes::INCORRECT_DATA, "Nonzero data follows an invalid `OverwriteCache` manifest frame");
+                }
+                truncated = true;
+                break;
+            }
+            throw Exception(ErrorCodes::INCORRECT_DATA, "Checksum mismatch in `OverwriteCache` manifest {}", manifest_path.string());
         }
 
         ReadBufferFromString payload_buffer(payload);
@@ -331,6 +352,8 @@ OverwriteCachePersistence::readManifest(std::unordered_set<UInt64> & removed_seg
 
         UInt64 count = 0;
         readBinaryLittleEndian(count, payload_buffer);
+        if (count > (payload.size() - payload_buffer.count()) / 16)
+            throw Exception(ErrorCodes::INCORRECT_DATA, "Invalid segment count in `OverwriteCache` manifest");
         record.added.resize(count);
         for (auto & segment : record.added)
         {
@@ -339,6 +362,8 @@ OverwriteCachePersistence::readManifest(std::unordered_set<UInt64> & removed_seg
         }
 
         readBinaryLittleEndian(count, payload_buffer);
+        if (count > (payload.size() - payload_buffer.count()) / 8)
+            throw Exception(ErrorCodes::INCORRECT_DATA, "Invalid retirement count in `OverwriteCache` manifest");
         record.removed.resize(count);
         for (auto & segment_id : record.removed)
         {
@@ -347,14 +372,24 @@ OverwriteCachePersistence::readManifest(std::unordered_set<UInt64> & removed_seg
         }
 
         readBinaryLittleEndian(count, payload_buffer);
+        if (count > payload.size() - payload_buffer.count())
+            throw Exception(ErrorCodes::INCORRECT_DATA, "Invalid deletion count in `OverwriteCache` manifest");
         record.deleted_keys.resize(count);
         for (auto & key : record.deleted_keys)
             readStringBinary(key, payload_buffer);
 
+        if (!payload_buffer.eof())
+            throw Exception(ErrorCodes::INCORRECT_DATA, "Trailing bytes in `OverwriteCache` manifest record");
         records.push_back(std::move(record));
+        valid_end = file_buffer->count();
     }
 
-    if (truncated_bytes)
+    if (valid_bytes)
+        *valid_bytes = valid_end;
+    else if (truncated)
+        throw Exception(ErrorCodes::INCORRECT_DATA, "Incomplete active `OverwriteCache` manifest");
+
+    if (truncated)
         LOG_WARNING(
             log,
             "Manifest {} of storage `OverwriteCache` ends with an incomplete record. The publications it "
@@ -503,6 +538,9 @@ void OverwriteCachePersistence::writerThread()
 
 void OverwriteCachePersistence::writeCommit(const Commit & commit)
 {
+    std::lock_guard state_lock(state_mutex);
+    if (!manifest_buffer)
+        throw Exception(ErrorCodes::INCORRECT_DATA, "`OverwriteCache` manifest writer is closed");
     /// A segment file has to be durable before the record that claims it exists, and a retired file may
     /// only be deleted once the record that stops referring to it is durable.
     for (const auto & segment : commit.added)
@@ -517,8 +555,7 @@ void OverwriteCachePersistence::writeCommit(const Commit & commit)
     record.deleted_keys = commit.deleted_keys;
 
     {
-        std::lock_guard state_lock(state_mutex);
-        bytes_since_checkpoint += appendManifestRecord(record);
+        bytes_since_checkpoint += appendManifestRecord(record, *manifest_buffer);
         manifest_buffer->next();
         manifest_buffer->sync();
 
@@ -567,10 +604,11 @@ void OverwriteCachePersistence::writeSegmentFile(const AddedSegment & segment)
 
     /// A rename makes the file appear complete or not at all, so a crash never leaves a half-written
     /// segment where the manifest expects a whole one.
+    auto directory_guard = disk->getDirectorySyncGuard(table_path);
     disk->replaceFile(tmp_path, fs::path(table_path) / file_name);
 }
 
-UInt64 OverwriteCachePersistence::appendManifestRecord(const Record & record)
+UInt64 OverwriteCachePersistence::appendManifestRecord(const Record & record, WriteBuffer & out)
 {
     WriteBufferFromOwnString payload_buffer;
     writeBinaryLittleEndian(record.generation, payload_buffer);
@@ -590,11 +628,9 @@ UInt64 OverwriteCachePersistence::appendManifestRecord(const Record & record)
     const auto payload = payload_buffer.str();
     const auto checksum = sipHash128(payload.data(), payload.size());
 
-    if (!manifest_buffer)
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "Manifest of storage `OverwriteCache` is not open");
-    writeBinaryLittleEndian(static_cast<UInt64>(payload.size()), *manifest_buffer);
-    writePODBinary(checksum, *manifest_buffer);
-    manifest_buffer->write(payload.data(), payload.size());
+    writeBinaryLittleEndian(static_cast<UInt64>(payload.size()), out);
+    writePODBinary(checksum, out);
+    out.write(payload.data(), payload.size());
     return sizeof(UInt64) + sizeof(checksum) + payload.size();
 }
 
@@ -676,39 +712,52 @@ void OverwriteCachePersistence::checkpointManifest()
 
 void OverwriteCachePersistence::writeManifest(const std::vector<Record> & records)
 {
-    closeManifest();
-
     const auto table_path = getPath();
     const auto tmp_path = fs::path(table_path) / tmp_directory / manifest_file_name;
     {
-        manifest_buffer = disk->writeFile(tmp_path, DBMS_DEFAULT_BUFFER_SIZE, WriteMode::Rewrite);
-        writeString(manifest_magic, *manifest_buffer);
-        writeBinaryLittleEndian(format_version, *manifest_buffer);
-        writeStringBinary(fingerprint, *manifest_buffer);
+        auto temporary = disk->writeFile(tmp_path, DBMS_DEFAULT_BUFFER_SIZE, WriteMode::Rewrite);
+        writeString(manifest_magic, *temporary);
+        writeBinaryLittleEndian(format_version, *temporary);
+        writeStringBinary(fingerprint, *temporary);
         for (const auto & record : records)
-            appendManifestRecord(record);
+            appendManifestRecord(record, *temporary);
         /// The temporary file is not visible until replacement; one durability barrier covers it all.
-        manifest_buffer->next();
-        manifest_buffer->sync();
-        manifest_buffer->finalize();
-        manifest_buffer.reset();
+        temporary->next();
+        temporary->sync();
+        temporary->finalize();
+
     }
 
+    closeManifest();
+    auto directory_guard = disk->getDirectorySyncGuard(table_path);
     disk->replaceFile(tmp_path, fs::path(table_path) / manifest_file_name);
     openManifest(/*rewrite=*/false);
 }
 
 void OverwriteCachePersistence::truncate()
 {
+    std::lock_guard lifecycle_lock(lifecycle_mutex);
+    {
+        std::lock_guard lock(mutex);
+        if (backup_pins)
+            throw Exception(ErrorCodes::ABORTED, "Cannot change `OverwriteCache` files while a backup is pinned");
+    }
     if (!isEnabled())
         return;
 
     shutdown();
 
     const auto table_path = getPath();
-    if (disk->existsDirectory(table_path))
-        disk->removeRecursive(table_path);
-    createDirectories();
+    {
+        std::lock_guard state_lock(state_mutex);
+        writeManifest({});
+        closeManifest();
+    }
+    for (auto it = disk->iterateDirectory(table_path); it->isValid(); it->next())
+    {
+        if (it->name().ends_with(segment_file_suffix))
+            disk->removeFileIfExists(fs::path(table_path) / it->name());
+    }
 
     {
         std::lock_guard state_lock(state_mutex);
@@ -729,7 +778,7 @@ void OverwriteCachePersistence::truncate()
     }
     {
         std::lock_guard state_lock(state_mutex);
-        openManifest(/*rewrite=*/true);
+        openManifest(/*rewrite=*/false);
     }
 
     std::lock_guard lock(mutex);
@@ -741,6 +790,12 @@ void OverwriteCachePersistence::truncate()
 
 void OverwriteCachePersistence::removeAllFiles()
 {
+    std::lock_guard lifecycle_lock(lifecycle_mutex);
+    {
+        std::lock_guard lock(mutex);
+        if (backup_pins)
+            throw Exception(ErrorCodes::ABORTED, "Cannot change `OverwriteCache` files while a backup is pinned");
+    }
     if (!isEnabled())
         return;
 
@@ -748,11 +803,22 @@ void OverwriteCachePersistence::removeAllFiles()
 
     const auto table_path = getPath();
     if (disk->existsDirectory(table_path))
+    {
+        std::lock_guard state_lock(state_mutex);
+        writeManifest({});
+        closeManifest();
         disk->removeRecursive(table_path);
+    }
 }
 
 void OverwriteCachePersistence::rename(const String & new_path)
 {
+    std::lock_guard lifecycle_lock(lifecycle_mutex);
+    {
+        std::lock_guard lock(mutex);
+        if (backup_pins)
+            throw Exception(ErrorCodes::ABORTED, "Cannot change `OverwriteCache` files while a backup is pinned");
+    }
     if (!isEnabled())
         return;
 
@@ -800,6 +866,7 @@ void OverwriteCachePersistence::shutdown()
 
 OverwriteCachePersistence::BackupPin::BackupPin(OverwriteCachePersistence & persistence_) : persistence(persistence_)
 {
+    std::lock_guard lifecycle_lock(persistence.lifecycle_mutex);
     std::lock_guard lock(persistence.mutex);
     ++persistence.backup_pins;
 }
@@ -823,7 +890,7 @@ OverwriteCachePersistence::BackupPin::~BackupPin()
     }
 }
 
-std::vector<String> OverwriteCachePersistence::collectFilesForBackup()
+std::vector<String> OverwriteCachePersistence::collectFilesForBackup(String * manifest_contents)
 {
     if (!isEnabled())
         return {};
@@ -842,7 +909,20 @@ std::vector<String> OverwriteCachePersistence::collectFilesForBackup()
     std::vector<String> result;
     {
         std::lock_guard state_lock(state_mutex);
-        checkpointManifest();
+        try
+        {
+            checkpointManifest();
+        }
+        catch (...)
+        {
+            setException();
+            throw;
+        }
+        if (manifest_contents)
+        {
+            auto in = disk->readFile(fs::path(getPath()) / manifest_file_name, getReadSettings());
+            readStringUntilEOF(*manifest_contents, *in);
+        }
         result.reserve(live_segments.size() + 1);
         result.emplace_back(manifest_file_name);
         for (const auto & segment : live_segments)
@@ -859,11 +939,17 @@ void OverwriteCachePersistence::restoreFileFromBackup(const String & file_name, 
             "Storage `OverwriteCache` cannot restore data into a table created with `persist_mode = 'none'`");
 
     createDirectories();
-    auto out = disk->writeFile(fs::path(getPath()) / file_name, DBMS_DEFAULT_BUFFER_SIZE, WriteMode::Rewrite);
+    if (fs::path(file_name).filename() != file_name || file_name == "." || file_name == "..")
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid `OverwriteCache` backup filename");
+    const auto destination = fs::path(getPath()) / file_name;
+    const auto temporary = fs::path(getPath()) / tmp_directory / file_name;
+    auto out = disk->writeFile(temporary, DBMS_DEFAULT_BUFFER_SIZE, WriteMode::Rewrite);
     copyData(in, *out);
     out->next();
     out->sync();
     out->finalize();
+    auto directory_guard = disk->getDirectorySyncGuard(getPath());
+    disk->replaceFile(temporary, destination);
 }
 
 }

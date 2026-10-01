@@ -134,7 +134,7 @@ public:
 
     /// Makes the log self-contained and returns the files a backup has to copy, the manifest first.
     /// Requires a live `BackupPin`.
-    std::vector<String> collectFilesForBackup();
+    std::vector<String> collectFilesForBackup(String * manifest_contents = nullptr);
 
     /// Replaces the table's data with files taken from a backup. The table must be empty.
     void restoreFileFromBackup(const String & file_name, ReadBuffer & in);
@@ -161,7 +161,7 @@ private:
     void writerThread() TSA_NO_THREAD_SAFETY_ANALYSIS;
     void writeCommit(const Commit & commit);
     void writeSegmentFile(const AddedSegment & segment);
-    UInt64 appendManifestRecord(const Record & record) TSA_REQUIRES(state_mutex);
+    UInt64 appendManifestRecord(const Record & record, WriteBuffer & out) TSA_REQUIRES(state_mutex);
     void openManifest(bool rewrite) TSA_REQUIRES(state_mutex);
     void closeManifest() TSA_REQUIRES(state_mutex);
     void createDirectories();
@@ -171,7 +171,7 @@ private:
     /// surviving segment can be dropped.
     void checkpointManifest() TSA_REQUIRES(state_mutex);
     bool needsCheckpoint() const TSA_REQUIRES(state_mutex);
-    std::vector<Record> readManifest(std::unordered_set<UInt64> & removed_segments) const;
+    std::vector<Record> readManifest(std::unordered_set<UInt64> & removed_segments, UInt64 * valid_bytes = nullptr) const;
     void writeManifest(const std::vector<Record> & records) TSA_REQUIRES(state_mutex);
     String segmentFileName(UInt64 segment_id) const;
     void setException();
@@ -183,6 +183,7 @@ private:
     const String fingerprint;
     const LoggerPtr log;
 
+    std::mutex lifecycle_mutex;
     mutable std::mutex path_mutex;
     String path TSA_GUARDED_BY(path_mutex);
 
