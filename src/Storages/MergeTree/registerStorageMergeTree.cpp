@@ -1,3 +1,4 @@
+#include <Common/logger_useful.h>
 #include <Databases/DatabaseReplicatedHelpers.h>
 #include <Storages/MergeTree/MergeTreeIndexMinMax.h>
 #include <Storages/MergeTree/MergeTreeIndices.h>
@@ -439,6 +440,19 @@ static StoragePtr create(const StorageFactory::Arguments & args)
     MergeTreeData::MergingParams merging_params;
     merging_params.mode = MergeTreeData::MergingParams::Ordinary;
     merging_params.upsert = args.engine_name == "UpsertMergeTree";
+    if (!merging_params.upsert && args.storage_def->settings)
+    {
+        for (const auto & change : args.storage_def->settings->changes)
+        {
+            if (!change.name.starts_with("upsert_"))
+                continue;
+            if (args.mode <= LoadingStrictnessLevel::CREATE)
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Setting {} applies only to UpsertMergeTree", change.name);
+            /// Existing metadata from earlier binaries must remain attachable.
+            LOG_WARNING(getLogger("registerStorageMergeTree"), "Ignoring UpsertMergeTree setting {} on {} during ATTACH",
+                change.name, args.engine_name);
+        }
+    }
 
     if (merging_params.upsert && !is_extended_storage_def)
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "UpsertMergeTree requires an extended storage definition with UNIQUE KEY and ORDER BY");

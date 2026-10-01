@@ -33,6 +33,8 @@ class PartCatalog
     {
         std::mutex mutex;
         RangesInDataPartsPtr ranges;
+        std::once_flag versions_once;
+        std::shared_ptr<const std::unordered_map<String, Int64>> min_data_versions;
     };
     std::shared_ptr<Materialized> materialized = std::make_shared<Materialized>();
     static Root node(DataPartPtr part, Root left, Root right);
@@ -58,7 +60,7 @@ public:
     {
         return root && root->has_lightweight_delete;
     }
-    std::unordered_map<String, Int64> minDataVersions() const;
+    std::shared_ptr<const std::unordered_map<String, Int64>> minDataVersions() const;
     RangesInDataPartsPtr ranges(const std::function<bool(const IMergeTreeDataPart &)> & prune = {}) const;
 };
 }

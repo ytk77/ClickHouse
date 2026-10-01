@@ -782,9 +782,12 @@ TEST_F(UpsertDiskStateTest, ParallelRecoveryRejectsCorruptPayload)
         std::ofstream output(directory / part / ROWS_FILE, std::ios::binary | std::ios::app);
         output.put('x');
     }
-    Resources resources;
-    resources.recovery_threads = 4;
-    EXPECT_THROW((StateStore(directory, incarnation, true, true, {}, resources)), Exception);
+    for (UInt64 workers : {1, 4, 64})
+    {
+        Resources resources;
+        resources.recovery_threads = workers;
+        EXPECT_THROW((StateStore(directory, incarnation, true, true, {}, resources)), Exception);
+    }
 }
 
 TEST_F(UpsertDiskStateTest, PartialRelocationRecoversAndMergesMaskedSourceCopy)
@@ -821,5 +824,33 @@ TEST_F(UpsertDiskStateTest, PartialRelocationRecoversAndMergesMaskedSourceCopy)
     EXPECT_EQ(reopened.authorizedPartCount(), 1);
     EXPECT_TRUE(reopened.snapshot()->getMask(objectName(joined.record.part))->empty());
     EXPECT_EQ(reopened.loadPartRows(joined.record.final_name).size(), 2);
+}
+
+TEST_F(UpsertDiskStateTest, ParallelRecoveryRejectsBothPayloadNamesAndCanRetry)
+{
+    String temporary;
+    String final;
+    {
+        StateStore store(directory, incarnation, false, true);
+        auto prepared = prepare(store, {{"key", 1}});
+        temporary = prepared.record.temporary_name;
+        final = prepared.record.final_name;
+        store.append(prepared);
+    }
+    std::filesystem::copy(directory / temporary, directory / final, std::filesystem::copy_options::recursive);
+    for (UInt64 workers : {1, 64})
+    {
+        Resources resources;
+        resources.recovery_threads = workers;
+        EXPECT_THROW((StateStore(directory, incarnation, true, true, {}, resources)), Exception);
+    }
+    std::filesystem::remove_all(directory / final);
+    Resources resources;
+    resources.recovery_threads = 64;
+    StateStore recovered(directory, incarnation, true, true, {}, resources);
+    EXPECT_TRUE(std::filesystem::exists(directory / final));
+    EXPECT_FALSE(std::filesystem::exists(directory / temporary));
+    EXPECT_EQ(recovered.authorizedPartCount(), 1);
+    EXPECT_FALSE(prepare(recovered, {{"key", 0}}).produces_part);
 }
 #endif

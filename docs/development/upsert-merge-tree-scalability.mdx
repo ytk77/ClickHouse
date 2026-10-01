@@ -12,15 +12,19 @@ This work targets the overhead of retaining many live rows and parts. It does no
 
 ## Incremental publication {#incremental-publication}
 
-`PartCatalog` is an immutable AVL tree ordered by `MergeTreePartInfo`. Adding or retiring a part copies the affected search paths, rather than enumerating the native active-part set. Nodes aggregate the minimum metadata/data versions, partition boundaries, and lightweight-delete flag. Column and index sizes continue to use incremental accounting.
+`PartCatalog` is an immutable AVL tree ordered by `MergeTreePartInfo`. Adding or retiring a part copies the affected search paths, rather than enumerating the native active-part set. Nodes aggregate the minimum metadata/data versions, partition boundaries, and lightweight-delete flag. Column and index sizes continue to use incremental accounting. Publication returns the old snapshot to the caller, which retains it in a local variable declared before the parts lock. Cached full ranges and partition-version maps are therefore released after unlocking, including during exception unwinding. At most one retired root is held per committing operation; there is no retirement queue.
 
 A query owns the catalog root and its matching visibility snapshot. When a partition predicate is available before materialization, entire subtrees belonging to a pruned partition are skipped. Full materialization is cached per catalog root and reused by readers; it happens outside the writer's parts lock. A full-table query still enumerates its selected parts. Native `data_parts_indexes` and the catalog remain proportional to the active-part count; this is not disk-paged metadata.
 
-Maintenance traverses at most 256 new candidates per tick from the native ordered index, plus at most one small candidate carried across a scan boundary. Its cursor advances over healthy and oversized parts as well as candidates selected for rewriting. This removes full-table candidate copying and traverses a finite backlog in rounds. A continuously growing hot partition can still delay later partitions when ingestion outpaces maintenance. It does not provide a fixed TTL latency independent of the number of parts, nor a priority scheduler for compaction debt.
+Partition data-version maps are initialized lazily once per immutable root and shared directly by queries. The first query after publication may still pay O(selected parts) range-materialization cost; other readers can wait on that root's materialization mutex.
+
+Maintenance traverses at most 256 new candidates per tick from the native ordered index, plus at most one small candidate carried across a scan boundary. Its cursor advances over healthy and oversized parts as well as candidates selected for rewriting. This removes full-table candidate copying and traverses a finite backlog in rounds. A continuously growing hot partition can still delay later partitions when ingestion outpaces maintenance. It does not provide a fixed TTL latency independent of the number of parts, nor a priority scheduler for compaction debt. A complete idle scan backs off from 1 second to at most 30 seconds. A healthy cycle with new publications uses a 1-second cooldown before another full scan; an in-flight notification can request an earlier pass. Publications and schema changes wake an idle task. Tables with any TTL retain a maximum 1-second idle delay, including while TTL merges are stopped; this bounds the extra delay when time advances or TTL merges restart. Completing a cycle can still require multiple slices and rewrites. Even without rewrite work, a full pass needs roughly `ceil(P / 256)` ticks, normally spaced 100 ms apart, plus scheduling/lock wait time. TTL expiration therefore has no fixed 1-second completion guarantee; actual rewrites, throttling and contention can extend the delay substantially. Candidates that exceed the current unit budget remain ahead of the cursor for the next tick; carried candidates never move the cursor backwards.
+
+A maintenance `CORRUPTED_DATA` exception fences the table, increments `UpsertMaintenanceCorruptionFailures`, and logs the phase, candidate part when available, and cause. `UpsertMaintenanceFailures` also counts other maintenance exceptions. It does not repeatedly retry a corrupt candidate while silently preventing later parts from progressing. While fenced, TTL maintenance and new reads/writes stop. Restart performs full verification; actual corruption must be repaired before recovery can succeed.
 
 ## Visibility cache {#visibility-cache}
 
-The disk-state instance owns a byte-bounded cache of immutable decoded masks. Its keys contain the part object identity and an in-memory mask generation. An immutable version map is published with each pinned `RocksDB` snapshot; unchanged masks retain their generation across commits. The map is updated by observing mask operations in the actual state batch, including retirement and `TRUNCATE` range deletion.
+The disk-state instance owns a byte-bounded cache of immutable decoded masks. Its keys contain the part object identity and an in-memory mask generation. An immutable version map is published with each pinned `RocksDB` snapshot; unchanged masks retain their generation across commits. Mask-write helpers record an ordered change list alongside the state batch, including retirement and `TRUNCATE` range deletion. Publication applies only that list; debug builds cross-check it against the actual batch before writing.
 
 Recovery reconstructs the version map after validating the durable authority. Cache contents and generations are not persisted and cannot change winner decisions. Independent database instances have independent caches. Eviction releases the cache's reference; readers may retain an evicted bitmap until their query ends, so the configured cache size is not a total query-memory limit.
 
@@ -40,13 +44,19 @@ All settings have defaults. Ordinary `CREATE TABLE`, `INSERT` and `SELECT` requi
 | `upsert_partitioned_filters` | true | Partitioned index and Bloom-filter blocks |
 | `upsert_recovery_threads` | 4 | Maximum outstanding payload-verification workers |
 
-These are performance budgets, not changes to synchronous durability. WAL flushing thresholds and cache capacity are not hard limits on all process memory or disk use. Resources across multiple tables must still fit the server's capacity.
+These are performance budgets, not changes to synchronous durability. WAL flushing thresholds and cache capacity are not hard limits on all process memory or disk use. Resources across multiple tables must still fit the server's capacity. Default cache capacities plus configured write buffers total approximately 144 MiB per table; this is potential configured consumption, not a claim that all those bytes are always resident. It also excludes other memory such as part metadata and query buffers. **A multi-table sharding rollout requires an explicit aggregate resource budget; this implementation supplies no server-wide cache or memtable quota.**
+
+Explicit `upsert_*` settings on other `MergeTree` engines are rejected by `CREATE` and `ALTER MODIFY SETTING`. Inherited server defaults do not trigger that rejection. Existing non-upsert metadata containing such settings remains attachable, with a warning that the settings are ignored.
+
+The resource validator identifies the invalid setting, value and allowed range. `upsert_max_open_files` accepts 20 through 2,147,483,647; the `RocksDB` value -1 (unlimited) is not supported. Server `<merge_tree>` defaults are read when a table opens; updating them does not resize an already-open table's resources. Reopening applies the defaults, except where explicit table settings override them.
+
+The durable state format is unchanged, but table metadata containing new explicit settings is not understood by older binaries. Those tables cannot simply be attached after downgrade. `ALTER RESET SETTING` is currently unsupported on `UpsertMergeTree`; do not assume it can remove this compatibility barrier. Validate a data migration to an older-compatible table definition before downgrading.
 
 Recovery verifies every authorized payload and visibility mask before publishing the table. Its queue is bounded by `upsert_recovery_threads`, and all workers finish before recovery can release database state or reclaim retired data. A verification exception fails recovery. Parallel verification is limited by aggregate storage bandwidth; it does not promise speedup proportional to thread count.
 
 ## Measurements {#measurements}
 
-The `Upsert`-prefixed events in `system.events` and applicable query `ProfileEvents` distinguish winner lookup, mask loading/encoding, state preparation, synchronous state writes, insert commit-lock waiting/holding, snapshot construction, maintenance candidate visits, and recovery. `UpsertMaskCacheHits` and `UpsertMaskCacheMisses` describe decoded-mask reuse. `UpsertSnapshotPartsVisited` counts descriptors involved in tree construction, including balancing nodes; it is not the table's active-part count.
+The `Upsert`-prefixed events in `system.events` and applicable query `ProfileEvents` distinguish winner lookup, mask loading/encoding, state preparation, synchronous state writes, insert commit-lock waiting/holding, snapshot construction, maintenance candidate visits, and recovery. `UpsertMaskCacheHits` and `UpsertMaskCacheMisses` describe decoded-mask reuse. Independent `CurrentMetrics` named `UpsertMaskCacheBytes` and `UpsertMaskCacheEntries` report retained upsert mask caches without combining them with the legacy unique-key cache. They aggregate all upsert tables, not individual tables. `UpsertCatalogVersionsMicroseconds` and `UpsertCatalogRangesMicroseconds` measure query-side map lookup/initialization and range selection/materialization, including wait time. `UpsertCatalogNodesAllocated` (named `UpsertSnapshotPartsVisited` in the initial evaluation logs) counts nodes allocated during tree construction, including balancing nodes; it is not the table's active-part count.
 
 Use a baseline binary and the candidate with the same SQL, data, and settings. Record active parts and physical rows as well as latency: background maintenance can change these between runs. Small sample counts and concurrent build activity are insufficient for production tail-latency claims.
 
@@ -123,3 +133,64 @@ There were 30 samples per point/range phase and one timed trial per configuratio
 ## Remaining first-stage work {#remaining-first-stage-work}
 
 The current resource controls are per table. A server-wide shared block cache with per-table quotas, an explicit compression policy, and detailed `RocksDB` stall/cache statistics remain to be implemented. The maintenance cursor provides bounded candidate enumeration; the proposed generation-aware priority heap is still pending. Publication uses a balanced immutable tree with one part per node; grouping parts into larger bounded leaves remains a memory/CPU tradeoff to measure. The current metrics do not replace a dedicated `system.upsert_state` table.
+
+
+## Review follow-up {#review-follow-up}
+
+The follow-up to commit `33b9962eb85` addresses the review findings without changing the durable format:
+
+| Finding | Change |
+| --- | --- |
+| Per-query partition-version map construction | Lazy `call_once` cache per immutable catalog root, shared directly by queries |
+| Repeated healthy-table scans | Complete-cycle idle backoff, publication wakeup, and a short cooldown for a healthy cycle with new publications |
+| Cursor skips budget-rejected candidates or moves backwards through a carried candidate | Advance only after acceptance or an explicit skip, never backwards |
+| Full batch parsing to locate mask changes | Ordered mask-write helpers, with a debug comparison against the actual batch before durable write |
+| Cache metrics mixed with legacy unique-key metrics | Independent upsert mask cache metrics and explicit query-side catalog timers |
+| Unclear resource errors or ignored explicit settings | Named values/ranges in errors; validation for explicit settings on other engines while preserving legacy attach |
+| Corrupt candidate repeatedly prevents progress | Explicit table fence with phase/part diagnostics and failure counters |
+| Cached full ranges destroyed while holding the parts lock | One old snapshot retained locally until after unlocking, including exception unwinding |
+
+The reviewer recommended a separate change for server-wide shared caches and write-buffer budgets. A shared decoded-mask cache would require a database-instance epoch in the cache key: generation numbers restart on reopen, so `(part UUID, generation)` alone would be unsafe across instances. The current private caches do not have this aliasing risk. Shared resource budgets and a priority maintenance scheduler remain open work, not implied by these fixes.
+
+
+### Follow-up validation {#review-follow-up-validation}
+
+The follow-up build passed 86 scoped C++ tests and 52 isolated-server integration cases. The same 86 tests also passed with `UpsertDiskState.cpp` compiled with debug checks enabled, exercising the ordered mask-change list against `WriteBatch::Iterate`. This is targeted invariant coverage in an otherwise Release build, not a full Debug, ASan or TSan build.
+
+New coverage includes a 2,000-round publisher/idle race model, idle backoff and TTL caps, shared lazy version-map identity, corrupt recovery with 1/4/64 workers, conflicting temporary/final payload names followed by recovery retry, random pruning predicates with both analyzers, JOIN and additional table filters, 300-partition TTL cleanup, inherited server defaults, legacy non-upsert metadata attach, and maintenance corruption fencing followed by full recovery. The complete Docker suite, row-policy/parallel-replica planning combinations and sanitizer validation remain outstanding.
+
+One initial integration run failed because the compatibility fixture used a full `ATTACH` without the UUID required by an Atomic database. The fixture now supplies a UUID; the targeted retry and subsequent complete 52-case run passed. This failure did not require a production-code change.
+
+### Follow-up performance comparison {#review-follow-up-performance}
+
+Six sequential runs compared commit `33b9962eb85` with the follow-up candidate, using one million live rows per run, 100,000 input updates, fresh local data directories and no concurrent build or correctness suite. All six runs passed their query-result and restart checks. This comparison measures the review fixes, separately from the earlier `061c0f5e06e` comparison.
+
+With maintenance publication paused, both versions retained exactly 20,480 parts and 1.1 million physical rows across 1,024 partitions:
+
+| Measurement | `33b9962eb85` | Follow-up |
+| --- | ---: | ---: |
+| Initial insert | 28.259 s | 26.595 s |
+| Overwrite | 24.182 s | 26.097 s |
+| Point p50 / p95 before updates | 16.45 / 27.86 ms | 16.38 / 29.31 ms |
+| Point p50 / p95 after updates | 30.29 / 47.26 ms | 30.03 / 37.07 ms |
+| Range p50 / p95 before updates | 158.09 / 252.29 ms | 165.67 / 263.26 ms |
+| Range p50 / p95 after updates | 951.63 / 1180.06 ms | 998.89 / 1281.73 ms |
+| Aggregate commit lock wait / hold | 0.137 / 25.709 s | 0.144 / 25.558 s |
+| Restart and verify | 11.909 s | 12.031 s |
+
+Two further pairs kept normal maintenance enabled and concentrated updates on at most 1,000 keys:
+
+| Measurement | One partition: before / after | 512 partitions: before / after |
+| --- | ---: | ---: |
+| Initial insert | 8.039 / 8.460 s | 17.539 / 18.618 s |
+| Overwrite | 0.192 / 0.211 s | 14.605 / 16.706 s |
+| Post-update point p95 | 5.04 / 9.09 ms | 23.61 / 25.19 ms |
+| Post-update range p95 | 9.33 / 14.14 ms | 163.08 / 151.76 ms |
+| Aggregate commit lock wait | 0.982 / 1.981 s | 2.152 / 2.466 s |
+| Aggregate commit lock hold | 2.974 / 2.730 s | 15.062 / 15.390 s |
+| Restart and verify | 0.441 / 0.472 s | 6.622 / 4.987 s |
+| Active parts | 16 / 6 | 8,144 / 7,994 |
+
+These measurements do **not** demonstrate an overall performance improvement from the review fixes. The controlled comparison improves post-update point p95 but increases overwrite and range-query duration. The hot-key trials also show slower writes and higher aggregate lock wait. Differing maintenance progress limits attribution in those two pairs; the cooldown does not eliminate contention within a scan cycle. A priority scheduler or an explicit candidate budget, followed by repeated trials, remains necessary before claiming a sustained-ingestion improvement.
+
+Each configuration has one timed trial and 30 samples per read phase. Aggregate lock counters are not per-commit p99 measurements. The results establish neither capacity at 10 billion rows nor a production latency guarantee.

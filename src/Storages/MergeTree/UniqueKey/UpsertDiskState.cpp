@@ -29,8 +29,8 @@
 
 namespace CurrentMetrics
 {
-extern const Metric DeleteBitmapCacheBytes;
-extern const Metric DeleteBitmapCacheEntries;
+extern const Metric UpsertMaskCacheBytes;
+extern const Metric UpsertMaskCacheEntries;
 extern const Metric LocalThread;
 extern const Metric LocalThreadActive;
 extern const Metric LocalThreadScheduled;
@@ -57,12 +57,20 @@ namespace DB::Upsert
 {
 void Resources::validate() const
 {
-    if (index_cache_bytes < (1ULL << 20) || write_buffer_bytes < (1ULL << 20)
-        || write_buffer_count < 2 || write_buffer_count > 64 || wal_bytes < write_buffer_bytes
-        || background_jobs < 1 || background_jobs > 128 || max_open_files < 20
-        || max_open_files > static_cast<UInt64>(std::numeric_limits<int>::max())
-        || recovery_threads < 1 || recovery_threads > 64)
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid UpsertMergeTree resource budgets");
+    const auto validate_range = [](const char * name, UInt64 value, UInt64 minimum, UInt64 maximum)
+    {
+        if (value < minimum || value > maximum)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid {} = {} for UpsertMergeTree; expected {}..{}",
+                name, value, minimum, maximum);
+    };
+    validate_range("upsert_index_cache_bytes", index_cache_bytes, 1ULL << 20, std::numeric_limits<size_t>::max());
+    validate_range("upsert_write_buffer_bytes", write_buffer_bytes, 1ULL << 20, std::numeric_limits<size_t>::max());
+    validate_range("upsert_mask_cache_bytes", mask_cache_bytes, 0, std::numeric_limits<size_t>::max());
+    validate_range("upsert_write_buffer_count", write_buffer_count, 2, 64);
+    validate_range("upsert_wal_bytes", wal_bytes, write_buffer_bytes, std::numeric_limits<UInt64>::max());
+    validate_range("upsert_background_jobs", background_jobs, 1, 128);
+    validate_range("upsert_max_open_files", max_open_files, 20, std::numeric_limits<int>::max());
+    validate_range("upsert_recovery_threads", recovery_threads, 1, 64);
 }
 
 #if USE_ROCKSDB
@@ -281,49 +289,75 @@ private:
 
 namespace
 {
+struct MaskChange
+{
+    enum class Kind
+    {
+        Put,
+        Delete,
+        Clear
+    };
+    Kind kind;
+    String part;
+#ifndef NDEBUG
+    bool operator==(const MaskChange &) const = default;
+#endif
+};
+
+#ifndef NDEBUG
 class MaskVersionUpdates final : public rocksdb::WriteBatch::Handler
 {
 public:
-    MaskVersions versions;
-    explicit MaskVersionUpdates(const Database & database)
-        : versions(database.mask_versions), generation(database.mask_generation + 1)
-    {
-        if (!generation)
-            throw Exception(ErrorCodes::LIMIT_EXCEEDED, "UpsertMergeTree mask generation exhausted");
-    }
+    std::vector<MaskChange> changes;
     void Put(const rocksdb::Slice & key, const rocksdb::Slice &) override
     {
         if (key.starts_with("M"))
-            versions.set(key.ToString().substr(1), generation);
+            changes.push_back({MaskChange::Kind::Put, key.ToString().substr(1)});
     }
     void Delete(const rocksdb::Slice & key) override
     {
         if (key.starts_with("M"))
-            versions.erase(key.ToString().substr(1));
+            changes.push_back({MaskChange::Kind::Delete, key.ToString().substr(1)});
     }
     rocksdb::Status DeleteRangeCF(uint32_t column_family, const rocksdb::Slice & begin, const rocksdb::Slice & end) override
     {
         if (column_family != 0)
             return rocksdb::Status::InvalidArgument("Unexpected UpsertMergeTree column family");
         if (begin.ToString() == "M" && end.ToString() == "N")
-            versions.clear();
+            changes.push_back({MaskChange::Kind::Clear, {}});
         else if (begin.ToString() < "N" && end.ToString() > "M")
             return rocksdb::Status::InvalidArgument("Unsupported UpsertMergeTree mask range deletion");
         return rocksdb::Status::OK();
     }
-private:
-    UInt64 generation;
 };
+#endif
 }
 
 struct DiskPrepared
 {
     rocksdb::WriteBatch batch;
+    std::vector<MaskChange> mask_changes;
     std::shared_ptr<DiskMaskSnapshot> masks;
     UInt64 previous_csn = 0;
     bool durable = false;
     bool catalog_change = false;
     UInt64 previous_part_count = 0;
+
+    void putMask(const String & part, const DeleteBitmap & mask)
+    {
+        check(batch.Put("M" + part, encodeMask(mask)));
+        mask_changes.push_back({MaskChange::Kind::Put, part});
+    }
+    void deleteMask(const String & part)
+    {
+        check(batch.Delete("M" + part));
+        mask_changes.push_back({MaskChange::Kind::Delete, part});
+    }
+    void clearMasks()
+    {
+        check(batch.DeleteRange("M", "N"));
+        mask_changes.push_back({MaskChange::Kind::Clear, {}});
+    }
 };
 
 struct DiskState::Impl
@@ -512,8 +546,8 @@ DiskState::DiskState(const String & table_path, ObjectID incarnation, bool attac
     impl->table_path = table_path;
     impl->resources = resources;
     if (resources.mask_cache_bytes)
-        impl->database->mask_cache = std::make_unique<DeleteBitmapCache>("LRU", CurrentMetrics::DeleteBitmapCacheBytes,
-            CurrentMetrics::DeleteBitmapCacheEntries, resources.mask_cache_bytes, 0.5);
+        impl->database->mask_cache = std::make_unique<DeleteBitmapCache>("LRU", CurrentMetrics::UpsertMaskCacheBytes,
+            CurrentMetrics::UpsertMaskCacheEntries, resources.mask_cache_bytes, 0.5);
     impl->clock = clock ? std::move(clock) : StateClock([]
     {
         return static_cast<UInt64>(std::chrono::duration_cast<std::chrono::seconds>(
@@ -792,7 +826,7 @@ StateStore::Prepared DiskState::prepare(const String & partition, PartCommit par
             mask.add(offset);
             ++position;
         } while (position < part.kills.size() && part.kills[position].part == id);
-        batch.Put("M" + objectName(id), encodeMask(mask));
+        result.disk->putMask(objectName(id), mask);
         checkBatchBudget(batch);
     }
     part.token.accepted = part.rows - part.dead.size();
@@ -831,7 +865,7 @@ StateStore::Prepared DiskState::prepare(const String & partition, PartCommit par
         if (authorizedPart(part.final_name))
             throw Exception(ErrorCodes::CORRUPTED_DATA, "Reused UpsertMergeTree final part name");
         batch.Put("A" + part.final_name, result.payload);
-        batch.Put("M" + objectName(part.part), encodeMask(*dead));
+        result.disk->putMask(objectName(part.part), *dead);
         batch.Put("part_count", number(impl->part_count + 1));
         batch.Put("O" + objectName(result.operation_id), number(result.csn));
     }
@@ -967,13 +1001,13 @@ StateStore::Prepared DiskState::prepareMerge(
         {
             batch.Put("R" + name, *authorization);
             batch.Delete("A" + name);
-            batch.Delete("M" + objectName(source.part));
+            result.disk->deleteMask(objectName(source.part));
             batch.Delete("O" + objectName(source.part));
         }
         else
         {
             /// Relocation and source masking share one durable batch; readers cannot see both copies.
-            batch.Put("M" + objectName(source.part), encodeMask(rewritten_mask));
+            result.disk->putMask(objectName(source.part), rewritten_mask);
         }
     }
     if (mapped_output.size() != output.size())
@@ -999,7 +1033,7 @@ StateStore::Prepared DiskState::prepareMerge(
         if (info.getPartitionId() != partition || authorizedPart(part.final_name))
             throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree merge output partition or name mismatch");
         batch.Put("A" + part.final_name, result.payload);
-        batch.Put("M" + objectName(part.part), encodeMask(*dead));
+        result.disk->putMask(objectName(part.part), *dead);
         batch.Put("O" + objectName(part.part), number(result.csn));
     }
     else
@@ -1051,7 +1085,8 @@ StateStore::Prepared DiskState::prepareTruncate()
 
     /// Clear active authorizations, sequence counters, token expiry, masks, operation bindings, tokens and winners.
     /// Range tombstones preserve the old masks for readers holding a pre-truncate `RocksDB` snapshot.
-    for (const char space : {'A', 'C', 'E', 'M', 'O', 'T', 'W'})
+    result.disk->clearMasks();
+    for (const char space : {'A', 'C', 'E', 'O', 'T', 'W'})
         check(batch.DeleteRange(String(1, space), String(1, space + 1)));
     batch.Put("part_count", number(0));
     batch.Put("retry_bytes", number(0));
@@ -1110,7 +1145,7 @@ StateStore::Prepared DiskState::preparePartition(
         source.token.accepted = source.rows;
         batch.Put("R" + name, encodePartCommit(source));
         batch.Delete("A" + name);
-        batch.Delete("M" + objectName(source.part));
+        result.disk->deleteMask(objectName(source.part));
         batch.Delete("O" + objectName(source.part));
         result.retired_parts.push_back(name);
         checkBatchBudget(batch);
@@ -1278,7 +1313,7 @@ StateStore::Prepared DiskState::preparePartition(
     }
     for (const auto & [id, mask] : masks)
     {
-        batch.Put("M" + objectName(id), encodeMask(*mask));
+        result.disk->putMask(objectName(id), *mask);
         checkBatchBudget(batch);
     }
     for (const auto & [partition, csn] : sequences)
@@ -1309,8 +1344,31 @@ void DiskState::append(const StateStore::Prepared & prepared)
         if (current != prepared.disk->previous_csn)
             throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree commit sequence changed under the commit lock");
     }
-    MaskVersionUpdates mask_updates(*impl->database);
+    const auto generation = impl->database->mask_generation + 1;
+    if (!generation)
+        throw Exception(ErrorCodes::LIMIT_EXCEEDED, "UpsertMergeTree mask generation exhausted");
+    auto versions = impl->database->mask_versions;
+    for (const auto & change : prepared.disk->mask_changes)
+    {
+        switch (change.kind)
+        {
+            case MaskChange::Kind::Put:
+                versions.set(change.part, generation);
+                break;
+            case MaskChange::Kind::Delete:
+                versions.erase(change.part);
+                break;
+            case MaskChange::Kind::Clear:
+                versions.clear();
+                break;
+        }
+    }
+#ifndef NDEBUG
+    MaskVersionUpdates mask_updates;
     check(prepared.disk->batch.Iterate(&mask_updates));
+    if (mask_updates.changes != prepared.disk->mask_changes)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree mask changes differ from the state batch");
+#endif
     rocksdb::WriteOptions options;
     options.sync = true;
     FailPointInjection::pauseFailPoint(FailPoints::upsert_pause_before_state_write);
@@ -1330,7 +1388,7 @@ void DiskState::append(const StateStore::Prepared & prepared)
     {
         throw Exception(ErrorCodes::FAULT_INJECTED, "Injected UpsertMergeTree failure after disk-state sync");
     });
-    impl->database->mask_versions = std::move(mask_updates.versions);
+    impl->database->mask_versions = std::move(versions);
     ++impl->database->mask_generation;
     prepared.disk->masks->bind();
 }

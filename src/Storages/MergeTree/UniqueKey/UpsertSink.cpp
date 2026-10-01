@@ -376,6 +376,7 @@ bool StorageMergeTree::commitUpsertBlock(Upsert::PreparedInsert & input)
 {
     auto & part = input.temporary->part;
     auto & authorization = input.authorization;
+    UpsertReadSnapshotPtr retired_snapshot;
     Stopwatch lock_wait;
     auto lock = lockParts();
     ProfileEvents::increment(ProfileEvents::UpsertCommitLockWaitMicroseconds, lock_wait.elapsedMicroseconds());
@@ -412,7 +413,8 @@ bool StorageMergeTree::commitUpsertBlock(Upsert::PreparedInsert & input)
         else
             persist();
         upsert_store->publish(prepared);
-        publishUpsertReadSnapshot(std::move(read_snapshot));
+        retired_snapshot = publishUpsertReadSnapshot(std::move(read_snapshot));
+        notifyUpsertMaintenance();
     }
     catch (...)
     {

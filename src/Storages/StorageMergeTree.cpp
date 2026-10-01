@@ -269,7 +269,7 @@ StorageMergeTree::StorageMergeTree(
                 throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree loaded part identity mismatch");
         }
         auto lock = lockParts();
-        publishUpsertReadSnapshot(prepareUpsertReadSnapshot(upsert_store->snapshot(), nullptr, {}, lock));
+        (void)publishUpsertReadSnapshot(prepareUpsertReadSnapshot(upsert_store->snapshot(), nullptr, {}, lock));
     }
 
     if (mode < LoadingStrictnessLevel::ATTACH && !getDataPartsForInternalUsage().empty() && !isTableReadonly())

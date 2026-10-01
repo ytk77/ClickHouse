@@ -252,6 +252,7 @@ Pipe StorageMergeTree::alterPartition(
                      const std::vector<String> & partitions, const std::vector<String> & detached,
                      const UpsertReadSnapshotPtr & removal_snapshot)
     {
+        UpsertReadSnapshotPtr retired_snapshot;
         /// Never hold another table's schema lock while waiting for this one: an insert can visit both through a view.
         auto schema_lock = target.tryLockTimed(target.upsert_schema_lock, RWLockImpl::Write,
             query_context->getCurrentQueryId(), settings[Setting::lock_acquire_timeout]);
@@ -297,7 +298,8 @@ Pipe StorageMergeTree::alterPartition(
             }, lock);
             target.removePartsFromWorkingSet(nullptr, removed, true, lock);
             target.upsert_store->publish(prepared);
-            target.publishUpsertReadSnapshot(std::move(read_snapshot));
+            retired_snapshot = target.publishUpsertReadSnapshot(std::move(read_snapshot));
+            target.notifyUpsertMaintenance();
             target.upsert_maintenance_cursor.reset();
         }
         catch (...)

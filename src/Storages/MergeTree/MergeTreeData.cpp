@@ -3337,7 +3337,7 @@ catch (...)
 MergeTreeData::~MergeTreeData()
 {
     /// Release cached part owners while all storage members are still alive.
-    publishUpsertReadSnapshot(nullptr);
+    (void)publishUpsertReadSnapshot(nullptr);
 }
 
 void MergeTreeData::loadUnexpectedDataParts()
@@ -4840,6 +4840,14 @@ void checkVersionColumnTypesConversion(const IDataType * old_type, const IDataTy
 
 void MergeTreeData::checkAlterIsPossible(const AlterCommands & commands, ContextPtr local_context) const
 {
+    if (!merging_params.upsert)
+    {
+        for (const auto & command : commands)
+            if (command.type == AlterCommand::MODIFY_SETTING)
+                for (const auto & change : command.settings_changes)
+                    if (change.name.starts_with("upsert_"))
+                        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Setting {} applies only to UpsertMergeTree", change.name);
+    }
     if (merging_params.upsert)
     {
         for (const auto & command : commands)
@@ -12248,7 +12256,7 @@ MergeTreeData::UpsertReadSnapshotPtr MergeTreeData::prepareUpsertReadSnapshot(
     for (size_t i = 0; i < expected_parts.size(); ++i)
         chassert((*actual_parts)[i].data_part == expected_parts[i]);
     const auto expected_info = getPartsSnapshotInfo(expected_parts);
-    chassert(result->catalog.minDataVersions() == *expected_info.min_data_versions);
+    chassert(*result->catalog.minDataVersions() == *expected_info.min_data_versions);
     chassert(result->parts_info.min_metadata_version == expected_info.min_metadata_version);
     chassert(result->parts_info.has_lightweight_delete_parts == expected_info.has_lightweight_delete_parts);
 #endif
@@ -12269,13 +12277,14 @@ MergeTreeData::UpsertReadSnapshotPtr MergeTreeData::getUpsertReadSnapshotForQuer
     return snapshot;
 }
 
-void MergeTreeData::publishUpsertReadSnapshot(UpsertReadSnapshotPtr snapshot)
+MergeTreeData::UpsertReadSnapshotPtr MergeTreeData::publishUpsertReadSnapshot(UpsertReadSnapshotPtr snapshot)
 {
     {
         std::lock_guard lock(upsert_snapshot_mutex);
         upsert_read_snapshot.swap(snapshot);
     }
-    /// Releasing an old version can reclaim parts or a database snapshot; do that outside the publication mutex.
+    /// The caller releases cached ranges after its parts lock; there is no unbounded retirement queue.
+    return snapshot;
 }
 
 StorageSnapshotPtr
@@ -12296,7 +12305,7 @@ MergeTreeData::createStorageSnapshot(const StorageMetadataPtr & metadata_snapsho
         snapshot_data->upsert_catalog = std::make_shared<const Upsert::PartCatalog>(published->catalog);
         snapshot_data->upsert_snapshot = published->visibility;
         parts_info = published->parts_info;
-        parts_info.min_data_versions = std::make_shared<const PartitionIdToMinBlock>(published->catalog.minDataVersions());
+        parts_info.min_data_versions = published->catalog.minDataVersions();
     }
     else
     {

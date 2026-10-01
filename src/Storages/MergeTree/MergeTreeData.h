@@ -1615,7 +1615,8 @@ protected:
         Upsert::SnapshotPtr visibility, const DataPartPtr & added_part, const DataPartsVector & removed_parts, DataPartsLock & lock, const DataPartsVector & added_parts = {}) const;
     UpsertReadSnapshotPtr getUpsertReadSnapshot() const;
     UpsertReadSnapshotPtr getUpsertReadSnapshotForQuery() const;
-    void publishUpsertReadSnapshot(UpsertReadSnapshotPtr snapshot);
+    /// Retain the returned old version until after releasing the caller's parts lock.
+    [[nodiscard]] UpsertReadSnapshotPtr publishUpsertReadSnapshot(UpsertReadSnapshotPtr snapshot);
 
     /// This mutex only protects copying or swapping a pointer, never I/O or snapshot construction/destruction.
     mutable std::mutex upsert_snapshot_mutex;

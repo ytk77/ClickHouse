@@ -1,0 +1,5 @@
+<clickhouse>
+    <merge_tree>
+        <upsert_recovery_threads>2</upsert_recovery_threads>
+    </merge_tree>
+</clickhouse>

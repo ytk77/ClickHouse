@@ -27,7 +27,7 @@ PartCatalog::Node::Node(DataPartPtr part_, Root left_, Root right_)
         min_data_version = std::min(min_data_version, child->min_data_version);
         has_lightweight_delete |= child->has_lightweight_delete;
     }
-    ProfileEvents::increment(ProfileEvents::UpsertSnapshotPartsVisited);
+    ProfileEvents::increment(ProfileEvents::UpsertCatalogNodesAllocated);
 }
 
 PartCatalog::Root PartCatalog::node(DataPartPtr part, Root left, Root right)
@@ -122,11 +122,16 @@ void PartCatalog::versions(const Root & current, std::unordered_map<String, Int6
     versions(current->right, result);
 }
 
-std::unordered_map<String, Int64> PartCatalog::minDataVersions() const
+std::shared_ptr<const std::unordered_map<String, Int64>> PartCatalog::minDataVersions() const
 {
-    std::unordered_map<String, Int64> result;
-    versions(root, result);
-    return result;
+    ProfileEventTimeIncrement<Microseconds> timer(ProfileEvents::UpsertCatalogVersionsMicroseconds);
+    std::call_once(materialized->versions_once, [&]
+    {
+        auto result = std::make_shared<std::unordered_map<String, Int64>>();
+        versions(root, *result);
+        materialized->min_data_versions = std::move(result);
+    });
+    return materialized->min_data_versions;
 }
 
 void PartCatalog::collect(const Root & current, RangesInDataParts & result, size_t & index, size_t & offset,
@@ -152,6 +157,8 @@ void PartCatalog::collect(const Root & current, RangesInDataParts & result, size
 
 RangesInDataPartsPtr PartCatalog::ranges(const std::function<bool(const IMergeTreeDataPart &)> & prune) const
 {
+    ProfileEventTimeIncrement<Microseconds> timer(ProfileEvents::UpsertCatalogRangesMicroseconds);
+    bool use_pruning = false;
     if (prune)
     {
         const auto any_pruned = [&](const auto & self, const Root & entry) -> bool
@@ -165,25 +172,25 @@ RangesInDataPartsPtr PartCatalog::ranges(const std::function<bool(const IMergeTr
             return self(self, entry->left) || self(self, entry->right);
         };
         /// A usable predicate may still exclude no partitions. Preserve the reusable ranges in that case.
-        if (!any_pruned(any_pruned, root))
-            return ranges();
-        if (root->first_partition == root->last_partition)
+        use_pruning = any_pruned(any_pruned, root);
+        if (use_pruning && root->first_partition == root->last_partition)
             return std::make_shared<const RangesInDataParts>();
     }
     std::unique_lock<std::mutex> lock;
-    if (!prune)
+    if (!use_pruning)
     {
         lock = std::unique_lock(materialized->mutex);
         if (materialized->ranges)
             return materialized->ranges;
     }
     auto result = std::make_shared<RangesInDataParts>();
-    if (!prune)
+    if (!use_pruning)
         result->reserve(size());
     size_t index = 0;
     size_t offset = 0;
-    collect(root, *result, index, offset, prune);
-    if (!prune)
+    const std::function<bool(const IMergeTreeDataPart &)> no_pruning;
+    collect(root, *result, index, offset, use_pruning ? prune : no_pruning);
+    if (!use_pruning)
         materialized->ranges = result;
     return result;
 }

@@ -110,7 +110,11 @@
     M(UpsertCommitLockWaitMicroseconds, "Time waiting for the `UpsertMergeTree` insert commit lock.", ValueType::Microseconds) \
     M(UpsertCommitLockHoldMicroseconds, "Time holding the `UpsertMergeTree` insert commit lock.", ValueType::Microseconds) \
     M(UpsertSnapshotBuildMicroseconds, "Time spent constructing `UpsertMergeTree` read snapshots.", ValueType::Microseconds) \
-    M(UpsertSnapshotPartsVisited, "Part descriptors visited while updating `UpsertMergeTree` snapshots.", ValueType::Number) \
+    M(UpsertCatalogNodesAllocated, "Immutable catalog nodes allocated while updating `UpsertMergeTree` snapshots, including path copies and rotations.", ValueType::Number) \
+    M(UpsertCatalogVersionsMicroseconds, "Time retrieving or initializing cached `UpsertMergeTree` partition data versions.", ValueType::Microseconds) \
+    M(UpsertCatalogRangesMicroseconds, "Time selecting or materializing `UpsertMergeTree` catalog ranges.", ValueType::Microseconds) \
+    M(UpsertMaintenanceFailures, "Exceptions encountered by `UpsertMergeTree` background maintenance.", ValueType::Number) \
+    M(UpsertMaintenanceCorruptionFailures, "Maintenance corruption detections that fence an `UpsertMergeTree` table.", ValueType::Number) \
     M(UpsertMaintenanceCandidates, "Part candidates inspected by `UpsertMergeTree` maintenance.", ValueType::Number) \
     M(UpsertRecoveryMicroseconds, "Time spent recovering and verifying `UpsertMergeTree` disk state.", ValueType::Microseconds) \
     M(UpsertRecoveryParts, "Authorized parts fully verified during `UpsertMergeTree` recovery.", ValueType::Number) \

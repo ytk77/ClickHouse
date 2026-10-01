@@ -1,5 +1,7 @@
 #pragma once
 
+#include <Storages/MergeTree/UniqueKey/UpsertMaintenanceSchedule.h>
+
 #include <string>
 #include <Core/Names.h>
 #include <Storages/AlterCommands.h>
@@ -162,6 +164,8 @@ private:
     /// Accessed only by the single table maintenance task; resume after the previous selected unit.
     std::optional<MergeTreePartInfo> upsert_maintenance_cursor;
     DataPartPtr upsert_maintenance_pending;
+    Upsert::MaintenanceSchedule upsert_maintenance_schedule;
+    void notifyUpsertMaintenance();
     void runUpsertMaintenance();
     void alterUpsertMetadata(const AlterCommands & commands, ContextPtr local_context);
     void mutateUpsert(const MutationCommands & commands, ContextPtr context);

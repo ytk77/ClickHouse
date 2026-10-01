@@ -18,8 +18,12 @@ extern const Event UpsertStateWrites;
 extern const Event UpsertCommitLockWaitMicroseconds;
 extern const Event UpsertCommitLockHoldMicroseconds;
 extern const Event UpsertSnapshotBuildMicroseconds;
-extern const Event UpsertSnapshotPartsVisited;
+extern const Event UpsertCatalogNodesAllocated;
+extern const Event UpsertCatalogVersionsMicroseconds;
+extern const Event UpsertCatalogRangesMicroseconds;
 extern const Event UpsertMaintenanceCandidates;
+extern const Event UpsertMaintenanceCorruptionFailures;
+extern const Event UpsertMaintenanceFailures;
 extern const Event UpsertRecoveryMicroseconds;
 extern const Event UpsertRecoveryParts;
 }
