@@ -194,3 +194,34 @@ Two further pairs kept normal maintenance enabled and concentrated updates on at
 These measurements do **not** demonstrate an overall performance improvement from the review fixes. The controlled comparison improves post-update point p95 but increases overwrite and range-query duration. The hot-key trials also show slower writes and higher aggregate lock wait. Differing maintenance progress limits attribution in those two pairs; the cooldown does not eliminate contention within a scan cycle. A priority scheduler or an explicit candidate budget, followed by repeated trials, remains necessary before claiming a sustained-ingestion improvement.
 
 Each configuration has one timed trial and 30 samples per read phase. Aggregate lock counters are not per-commit p99 measurements. The results establish neither capacity at 10 billion rows nor a production latency guarantee.
+
+## Correctness follow-up to the second review {#correctness-second-review}
+
+The follow-up to `eea2c8468d9` covers the following review items:
+
+| Item | Resolution |
+| --- | --- |
+| 1: Native partition transfer can expose masked source rows | The shared structure check rejects unique-key sources, including transfers to `ReplicatedMergeTree`; upsert-to-upsert transfer retains its visibility-aware path. |
+| 2: Multiple view sinks share a retry namespace | Dependent-view tokens use `DeduplicationInfo` source/view/block identities, with unit numbering local to that identity. Direct inserts retain the existing retry format. Disabled deduplication is respected. |
+| 3: Tuple keys fail at insertion | Recursively flatten tuple elements for comparable encoding; normalize wrapped and sparse columns. |
+| 4–5: A healthy prefix or an oversized part prevents expiration | A due or sufficiently masked source that does not fit the remaining budget starts an independent segmented rewrite. |
+| 6: Interrupted native deletion leaves directories behind | Recovery removes well-formed `delete_tmp_` directories after checking that they do not name an active authorization; symbolic links remain errors. |
+| 7: A fenced table breaks metadata introspection | Size introspection uses the last published accounting; user data reads remain fenced. |
+| 8: Independent parallel-replica snapshots | Unsupported parallel-replica reads are rejected at snapshot acquisition and the legacy read entry point. |
+| 9: Database background work races with table deletion | `DROP` releases the published snapshot and closes durable state before removing files. Remaining pinned snapshots cause an exception and preserve the files. |
+| 10: Cleanup can fail after import publication | `ATTACH` schedules cleanup instead of running unrelated retirement cleanup on its success path. |
+| 11: `SYSTEM STOP MERGES` does not stop maintenance | Stop before candidate scanning and wake maintenance when merge or TTL action locks are removed. |
+| 12: Shutdown waits for a full rewrite | Check both shutdown and flush preparation between input blocks and output units; completed partial publications remain durable. |
+| 14: Failed creation prevents retry | Validate resource settings before creating data directories or the manifest, and remove an exclusively created file if writing or syncing it fails. This does not cover every later database-metadata failure after successful storage construction. |
+
+The view-token fix does not make source and dependent-view commits atomic. If an input chunk is partly committed at the source, source replay can filter those rows before they ever reach a view. If the source commits but the view fails, a retry can likewise omit rows from the target. These cases still require reconciliation; a successful retry alone is not evidence that every dependent target contains every source row. The regression for a failed source stream checks token stability for the later blocks, without assuming atomic recovery of already committed source blocks.
+
+Items 13 and 15 remain separate work: handling dependent-view topology changes between asynchronous queue admission and flush, and legacy `parts_sync_v1` zero-filled-tail recovery. The current failure behavior is not replaced with a permissive recovery path. General cleanup after a later `CREATE` metadata failure, retired-mask cache eviction, and interrupted manifest-upgrade cleanup also remain open. No experimental setting gate is added: default-settings creation is an explicit requirement for this engine.
+
+### Correctness follow-up validation {#correctness-second-review-validation}
+
+The Release build passed, followed by 88 scoped C++ tests and 15 new integration cases run against an isolated local server, including an embedded Keeper for the replicated transfer case. Coverage includes nested tuple keys, sparse input, two views sharing a target, disabled token deduplication, source-stream retry identity, TTL budget starvation, indexed parts exceeding the maintenance byte target, fenced metadata introspection, orphan deletion directories, repeated table deletion, parallel-replica rejection with both analyzers, deferred import cleanup and retry after invalid resource settings in an `Ordinary` database. C++ cases cover a pinned-reader close refusal and retry after a failed exclusive durable-file creation.
+
+The initial final integration run passed 14 of 15 cases: resource validation preceded manifest creation but still followed directory creation. Moving validation before directory creation fixed the same-name retry; the subsequent full 15-case run passed. The built binary also contained the independent `OverwriteCache` memory-setting change from the primary checkout; the upsert patch is kept in its own branch.
+
+This is not the full Docker suite or an ASan/TSan run. Deterministic cancellation during a long rewrite at server shutdown, the exact post-import cleanup failure window, and all remote parallel-replica modes remain untested. The temporary-directory regression constructs the interrupted-deletion state; it does not kill the process during the native rename.

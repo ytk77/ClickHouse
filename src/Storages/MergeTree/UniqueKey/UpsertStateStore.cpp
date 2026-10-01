@@ -144,6 +144,16 @@ StateStore::StateStore(String table_path_, ObjectID incarnation_, bool attach, b
 
 StateStore::~StateStore() = default;
 
+void StateStore::close()
+{
+    current_snapshot.reset();
+    if (disk)
+        disk->close();
+    partitions.clear();
+    registry.reset();
+}
+
+
 SnapshotPtr StateStore::snapshot() const
 {
     return disk ? disk->snapshot() : current_snapshot;

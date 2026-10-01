@@ -32,6 +32,7 @@ static struct InitFiu
 /// - PAUSEABLE: the failpoint will be blocked every time when pauseFailPoint is called, until disableFailPoint is called.
 
 #define APPLY_FOR_FAILPOINTS(ONCE, REGULAR, PAUSEABLE_ONCE, PAUSEABLE) \
+    ONCE(upsert_throw_after_durable_file_create) \
     ONCE(upsert_log_throw_after_append) \
     ONCE(upsert_log_throw_after_sync) \
     PAUSEABLE_ONCE(upsert_pause_before_state_write) \

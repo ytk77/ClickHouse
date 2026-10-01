@@ -8,10 +8,12 @@
 #include <Interpreters/InsertDeduplication.h>
 #include <Interpreters/ProcessList.h>
 #include <Columns/ColumnsNumber.h>
+#include <Columns/ColumnSparse.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <Core/Settings.h>
 #include <Core/UUID.h>
 #include <Common/Exception.h>
+#include <Common/SipHash.h>
 #include <Common/FailPoint.h>
 #include <Common/MemoryTrackerUtils.h>
 #include <Common/CurrentMemoryTracker.h>
@@ -35,6 +37,7 @@ extern const SettingsUInt64 max_partitions_per_insert_block;
 extern const SettingsUInt64 unique_key_max_encoded_size;
 extern const SettingsString insert_deduplication_token;
 extern const SettingsUInt64 input_format_max_block_wait_ms;
+extern const SettingsBool insert_deduplicate;
 extern const SettingsMaxThreads max_insert_threads;
 extern const SettingsMaxThreads max_threads;
 extern const SettingsUInt64 max_threads_min_free_memory_per_thread;
@@ -176,10 +179,33 @@ void Sink::consume(Chunk & chunk)
 {
     if (!chunk.getNumRows())
         return;
-    const String client_token = context->getSettingsRef()[Setting::insert_deduplication_token];
+    String client_token = context->getSettingsRef()[Setting::insert_deduplication_token];
     if (client_token.size() > 1024)
         throw Exception(ErrorCodes::LIMIT_EXCEEDED, "UpsertMergeTree deduplication token exceeds 1024 bytes");
-    const auto input = getHeader().cloneWithColumns(chunk.getColumns());
+    const auto info = chunk.getChunkInfos().get<DeduplicationInfo>();
+    const bool view_input = info && info->getVisitedViews().size() > 1;
+    if (view_input)
+    {
+        /// View contexts disable ordinary insert deduplication; their chunk carries the actual
+        /// dependency policy and a stable source/view/block identity across filtered retries.
+        if (info->isDisabled())
+            client_token.clear();
+        else if (!client_token.empty())
+        {
+            SipHash hash;
+            for (const auto & token : info->getDeduplicationHashes("", true))
+                hash.update(token.hash);
+            client_token = "upsert_view_v1:" + getSipHash128AsHexString(hash.get128());
+            /// Earlier source chunks can disappear on retry. Number units inside this identified
+            /// chunk, rather than counting the chunks that happened to reach this sink.
+            unit = 0;
+        }
+    }
+    else if (!context->getSettingsRef()[Setting::insert_deduplicate])
+        client_token.clear();
+    auto input = getHeader().cloneWithColumns(chunk.getColumns());
+    for (auto & column : input)
+        column.column = recursiveRemoveSparse(column.column->convertToFullIfWrapped());
     IColumn::Filter forwarded;
     if (has_dependent_views && !client_token.empty())
         forwarded.resize_fill(input.rows(), 0);
@@ -214,8 +240,8 @@ void Sink::consume(Chunk & chunk)
             chunk.clear();
         else if (kept != input.rows())
         {
-            if (auto info = chunk.getChunkInfos().extract<DeduplicationInfo>())
-                chunk.getChunkInfos().add(info->filterSourceRows(forwarded));
+            if (auto source_info = chunk.getChunkInfos().extract<DeduplicationInfo>())
+                chunk.getChunkInfos().add(source_info->filterSourceRows(forwarded));
             Columns columns;
             for (const auto & column : input)
                 columns.push_back(column.column->filter(forwarded, kept));

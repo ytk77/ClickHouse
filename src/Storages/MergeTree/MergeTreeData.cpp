@@ -7538,7 +7538,10 @@ IStorage::ColumnSizeByName MergeTreeData::getColumnSizes(const Names & columns) 
 {
     if (merging_params.upsert)
     {
-        const auto snapshot = getUpsertReadSnapshotForQuery();
+        /// Introspection reports the last published accounting even if data reads are fenced.
+        const auto snapshot = getUpsertReadSnapshot();
+        if (!snapshot)
+            return {};
         auto result = snapshot->column_sizes;
         RangesInDataPartsPtr subcolumn_parts;
         for (const auto & name : columns)
@@ -10521,6 +10524,11 @@ MergeTreeData & MergeTreeData::checkStructureAndGetMergeTreeData(IStorage & sour
                         "Table {} supports attachPartitionFrom only for MergeTree family of table engines. Got {}",
                         source_table.getStorageID().getNameForLogs(), source_table.getName());
 
+    /// Native partition transfer does not carry the source visibility state.
+    if (src_snapshot->hasUniqueKey() || src_data->merging_params.upsert)
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
+            "Native partition transfer from a UNIQUE KEY table requires visibility-aware import");
+
     if (my_snapshot->getColumns().getAllPhysical().sizeOfDifference(src_snapshot->getColumns().getAllPhysical()))
         throw Exception(ErrorCodes::INCOMPATIBLE_COLUMNS, "Tables have different structure");
 
@@ -12300,6 +12308,10 @@ MergeTreeData::createStorageSnapshot(const StorageMetadataPtr & metadata_snapsho
     if (merging_params.upsert)
     {
         const auto published = getUpsertReadSnapshotForQuery();
+        if (query_context->getSettingsRef()[Setting::parallel_replicas_for_non_replicated_merge_tree]
+            && (query_context->canUseParallelReplicasOnInitiator() || query_context->canUseParallelReplicasOnFollower()
+                || query_context->canUseParallelReplicasCustomKey()))
+            throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree does not support parallel replica snapshots");
         if (query_context->getCurrentTransaction())
             throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree does not support explicit transactions");
         snapshot_data->upsert_catalog = std::make_shared<const Upsert::PartCatalog>(published->catalog);

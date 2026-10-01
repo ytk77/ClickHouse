@@ -1184,7 +1184,10 @@ public:
     ColumnSizeByName getColumnSizes() const override
     {
         if (merging_params.upsert)
-            return getUpsertReadSnapshotForQuery()->column_sizes;
+        {
+            const auto snapshot = getUpsertReadSnapshot();
+            return snapshot ? snapshot->column_sizes : ColumnSizeByName{};
+        }
         /// Always keep locks order parts_lock -> sizes_lock
         auto parts_lock = readLockParts();
         std::unique_lock sizes_lock(columns_and_secondary_indices_sizes_mutex);
@@ -1197,7 +1200,10 @@ public:
     IndexSizeByName getSecondaryIndexSizes() const override
     {
         if (merging_params.upsert)
-            return getUpsertReadSnapshotForQuery()->secondary_index_sizes;
+        {
+            const auto snapshot = getUpsertReadSnapshot();
+            return snapshot ? snapshot->secondary_index_sizes : IndexSizeByName{};
+        }
         /// Always keep locks order parts_lock -> sizes_lock
         auto parts_lock = readLockParts();
         std::unique_lock sizes_lock(columns_and_secondary_indices_sizes_mutex);
@@ -1208,7 +1214,10 @@ public:
     IndexSize getPrimaryIndexSize() const
     {
         if (merging_params.upsert)
-            return getUpsertReadSnapshotForQuery()->primary_index_size;
+        {
+            const auto snapshot = getUpsertReadSnapshot();
+            return snapshot ? snapshot->primary_index_size : IndexSize{};
+        }
         /// Always keep locks order parts_lock -> sizes_lock
         auto parts_lock = readLockParts();
         std::unique_lock sizes_lock(columns_and_secondary_indices_sizes_mutex);

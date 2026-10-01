@@ -853,4 +853,21 @@ TEST_F(UpsertDiskStateTest, ParallelRecoveryRejectsBothPayloadNamesAndCanRetry)
     EXPECT_EQ(recovered.authorizedPartCount(), 1);
     EXPECT_FALSE(prepare(recovered, {{"key", 0}}).produces_part);
 }
+TEST_F(UpsertDiskStateTest, ClosePreservesPinnedReadersAndReleasesDatabaseLock)
+{
+    StateStore store(directory, incarnation, false, true);
+    {
+        auto prepared = prepare(store, {{"key", 1}});
+        commit(store, prepared);
+    }
+    auto pinned = store.snapshot();
+    EXPECT_THROW(store.close(), Exception);
+    EXPECT_EQ(pinned->getMask(objectName(store.authorizedPart("p_1_1_0").value()))->cardinality(), 0);
+    pinned.reset();
+    EXPECT_NO_THROW(store.close());
+    /// Opening the same path proves that the original database handle and its lock are gone.
+    StateStore reopened(directory, incarnation, true, true);
+    EXPECT_EQ(reopened.authorizedPartCount(), 1);
+}
+
 #endif
