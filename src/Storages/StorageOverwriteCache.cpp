@@ -829,6 +829,7 @@ StorageOverwriteCache::StorageOverwriteCache(
     , key_columns(std::move(key_columns_))
     , lookup_index_columns(std::move(lookup_indexes_))
     , settings(std::move(settings_))
+    , max_memory_bytes(settings.max_memory_bytes)
     , log(getLogger("StorageOverwriteCache (" + table_id_.getNameForLogs() + ")"))
 {
     StorageInMemoryMetadata metadata;
@@ -1031,8 +1032,8 @@ StorageOverwriteCache::SmallSegmentCompactionResult StorageOverwriteCache::compa
     }
 
     const UInt64 bytes_before = total_size_bytes.load(std::memory_order_relaxed);
-    if (merged_segment->allocated_bytes > settings.max_memory_bytes
-        || bytes_before > settings.max_memory_bytes - merged_segment->allocated_bytes)
+    if (merged_segment->allocated_bytes > max_memory_bytes
+        || bytes_before > max_memory_bytes - merged_segment->allocated_bytes)
         return SmallSegmentCompactionResult::NoWork;
 
     const UInt64 current_generation = published_generation.load(std::memory_order_acquire);
@@ -1990,12 +1991,12 @@ void StorageOverwriteCache::insertBlock(const Block & input_block, UInt64 replay
         }
     }
 
-    if (prospective_bytes > settings.max_memory_bytes)
+    if (prospective_bytes > max_memory_bytes)
         throw Exception(
             ErrorCodes::MEMORY_LIMIT_EXCEEDED,
             "`OverwriteCache` insert requires {} bytes, exceeding `max_memory_bytes` = {}",
             prospective_bytes,
-            settings.max_memory_bytes);
+            max_memory_bytes);
 
     const auto new_entries = static_cast<EntryId>(std::ranges::count_if(mutations, [](const auto & mutation) { return mutation.is_new; }));
     if (new_entries > std::numeric_limits<EntryId>::max() - next_entry_id)
@@ -2190,12 +2191,12 @@ void StorageOverwriteCache::insertBlock(const Block & input_block, UInt64 replay
             lookup_bytes_delta[prepared.index] += prepared.bytes_delta;
         }
 
-        if (prospective_bytes > settings.max_memory_bytes)
+        if (prospective_bytes > max_memory_bytes)
             throw Exception(
                 ErrorCodes::MEMORY_LIMIT_EXCEEDED,
                 "`OverwriteCache` insert requires {} bytes, exceeding `max_memory_bytes` = {}",
                 prospective_bytes,
-                settings.max_memory_bytes);
+                max_memory_bytes);
 
         /// Push the new versions before the keys become reachable. They carry the not-yet-published
         /// generation, so no reader can see them until `published_generation` is bumped.
@@ -2511,7 +2512,7 @@ size_t StorageOverwriteCache::deleteKeys(const std::vector<String> & serialized_
         /// A rewritten segment coexists with its source until the readers of the previous epoch drain, so
         /// it needs room beside it. Freeing memory must never fail for want of memory, so a segment whose
         /// source-sized upper bound does not fit is simply left alone instead of failing the `DELETE`.
-        const UInt64 headroom = settings.max_memory_bytes - std::min(bytes_before + compaction_budget, settings.max_memory_bytes);
+        const UInt64 headroom = max_memory_bytes - std::min(bytes_before + compaction_budget, max_memory_bytes);
         if (compaction.source->allocated_bytes > headroom)
             continue;
         compaction_budget += compaction.source->allocated_bytes;
@@ -3328,11 +3329,27 @@ void StorageOverwriteCache::clearData()
 
 void StorageOverwriteCache::checkAlterIsPossible(const AlterCommands & commands, ContextPtr) const
 {
+    if (commands.size() == 1 && commands.front().type == AlterCommand::MODIFY_SETTING)
+    {
+        for (const auto & change : commands.front().settings_changes)
+        {
+            if (change.name != "max_memory_bytes")
+                throw Exception(
+                    ErrorCodes::NOT_IMPLEMENTED,
+                    "Storage `OverwriteCache` only supports modifying the `max_memory_bytes` setting, got {}",
+                    backQuote(change.name));
+            if (!getUInt64Setting(change))
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Storage `OverwriteCache` requires a positive `max_memory_bytes`");
+        }
+        return;
+    }
+
     if (commands.size() != 1
         || (commands.front().type != AlterCommand::ADD_LOOKUP_INDEX && commands.front().type != AlterCommand::DROP_LOOKUP_INDEX))
         throw Exception(
             ErrorCodes::NOT_IMPLEMENTED,
-            "Storage `OverwriteCache` supports only one `ADD INDEX (...)` or `DROP INDEX (...)` command per ALTER");
+            "Storage `OverwriteCache` supports only one `ADD INDEX (...)`, `DROP INDEX (...)` "
+            "or `MODIFY SETTING max_memory_bytes` command per ALTER");
 
     auto columns = extractIdentifierList(*commands.front().lookup_index, "lookup `INDEX` clause");
     std::unordered_map<String, size_t> key_order;
@@ -3363,6 +3380,42 @@ void StorageOverwriteCache::alter(const AlterCommands & commands, ContextPtr que
 {
     checkAlterIsPossible(commands, query_context);
     const auto & command = commands.front();
+
+    if (command.type == AlterCommand::MODIFY_SETTING)
+    {
+        const auto table_id = getStorageID();
+        const auto metadata_snapshot = getInMemoryMetadataPtr(query_context, false);
+        StorageInMemoryMetadata new_metadata = *metadata_snapshot;
+        commands.apply(new_metadata, query_context);
+        auto & changes = new_metadata.settings_changes->as<ASTSetQuery &>().changes;
+
+        /// Preserve the existing admission budget, including across reattach: its implicit default
+        /// depends on the original `max_memory_bytes`, but this command only changes the table limit.
+        if (std::ranges::none_of(changes, [](const auto & change) { return change.name == "max_pending_insert_bytes"; }))
+            changes.emplace_back("max_pending_insert_bytes", settings.max_pending_insert_bytes);
+
+        ASTStorage storage_def;
+        storage_def.set(storage_def.settings, new_metadata.settings_changes->clone());
+        const UInt64 new_limit = parseSettings(storage_def).max_memory_bytes;
+        auto prepared_metadata = std::make_shared<const StorageInMemoryMetadata>(new_metadata);
+
+        auto writer_lock = lockOverwriteCacheWriter(writer_mutex);
+        const UInt64 current_bytes = total_size_bytes.load(std::memory_order_relaxed);
+        if (new_limit < current_bytes)
+            throw Exception(
+                ErrorCodes::MEMORY_LIMIT_EXCEEDED,
+                "`OverwriteCache` cannot set `max_memory_bytes` to {} below the current accounted memory of {} bytes",
+                new_limit,
+                current_bytes);
+
+        DatabaseCatalog::instance()
+            .getDatabase(table_id.database_name)
+            ->alterTable(query_context, table_id, new_metadata, /*validate_new_create_query=*/true);
+
+        max_memory_bytes = new_limit;
+        setInMemoryMetadata(std::move(prepared_metadata));
+        return;
+    }
 
     Names columns = extractIdentifierList(*command.lookup_index, "lookup `INDEX` clause");
     std::unordered_map<String, size_t> key_order;
@@ -3532,7 +3585,7 @@ void StorageOverwriteCache::alter(const AlterCommands & commands, ContextPtr que
     }
 
     const UInt64 current_bytes = total_size_bytes.load(std::memory_order_relaxed);
-    if (index_bytes > settings.max_memory_bytes - std::min(current_bytes, settings.max_memory_bytes))
+    if (index_bytes > max_memory_bytes - std::min(current_bytes, max_memory_bytes))
         throw Exception(ErrorCodes::MEMORY_LIMIT_EXCEEDED, "`OverwriteCache` cannot add lookup index within `max_memory_bytes`");
 
     auto next_lookup_index_columns = lookup_index_columns;

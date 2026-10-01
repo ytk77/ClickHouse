@@ -971,6 +971,8 @@ private:
     const Names key_columns;
     std::vector<Names> lookup_index_columns;
     const OverwriteCacheSettings settings;
+    /// Admission limit guarded by `writer_mutex`; other settings remain fixed after construction.
+    UInt64 max_memory_bytes;
     LoggerPtr log;
 
     Block sample_block;

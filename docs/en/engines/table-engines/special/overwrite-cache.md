@@ -131,6 +131,21 @@ If persisting fails, the error is not swallowed - the table stops accepting publ
 
 Lookup indexes are declared only through `INDEX (...)`. The legacy settings `max_index_probe_rows`, `max_index_result_rows`, `index_each_key_column`, `secondary_index_columns`, `secondary_index_segment_column`, and `max_secondary_index_rows` are not supported. Every lookup-index column must occur in `KEYS`, and duplicate tuples are rejected.
 
+### Changing the memory limit {#changing-the-memory-limit}
+
+Change `max_memory_bytes` on an existing table with:
+
+```sql
+ALTER TABLE latest_state
+    MODIFY SETTING max_memory_bytes = 515396075520;
+```
+
+The value is a positive integer number of bytes; this example sets 480 GiB. The new limit takes effect for subsequent write publications, lookup-index builds and background compaction without restarting or reattaching the table. It is saved in table metadata and survives restart and `DETACH`/`ATTACH`.
+
+Both increases and decreases are supported. A decrease below the table's current engine-accounted memory is rejected with `MEMORY_LIMIT_EXCEEDED`, leaving the limit unchanged. No rows are evicted. The accounting is the same as for insert admission; it is not a limit on the server's total resident memory.
+
+This command changes only `max_memory_bytes`. The separate insert-preparation budget, `max_pending_insert_bytes`, retains its current value. If that budget was implicit, its effective value is saved explicitly in metadata so reattaching the table preserves it. Other engine settings cannot be changed through this command, and it cannot be combined with lookup-index changes in the same `ALTER`.
+
 ## Reading rows {#reading-rows}
 
 Normal `SELECT` queries must contain either:
