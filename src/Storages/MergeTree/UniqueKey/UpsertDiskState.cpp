@@ -38,6 +38,7 @@ extern const Metric LocalThreadScheduled;
 
 namespace DB::ErrorCodes
 {
+extern const int ABORTED;
 extern const int BAD_ARGUMENTS;
 extern const int ROCKSDB_ERROR;
 extern const int LOGICAL_ERROR;
@@ -464,8 +465,13 @@ struct DiskState::Impl
         /// preparations have no durable decision and no reader can reference them during recovery.
         for (const auto & entry : fs::directory_iterator(table_path))
         {
-            if (!entry.path().filename().string().starts_with("tmp_upsert_"))
+            const auto name = entry.path().filename().string();
+            const bool deletion = name.starts_with("delete_tmp_")
+                && MergeTreePartInfo::tryParsePartName(name.substr(11), MERGE_TREE_DATA_MIN_FORMAT_VERSION_WITH_CUSTOM_PARTITIONING);
+            if (!name.starts_with("tmp_upsert_") && !deletion)
                 continue;
+            if (deletion && database->get("A" + name.substr(11)))
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree deletion directory names an active part");
             if (entry.is_symlink())
                 throw Exception(ErrorCodes::CORRUPTED_DATA, "Symbolic link replaces an UpsertMergeTree preparation");
             fs::remove_all(entry.path());
@@ -606,6 +612,16 @@ DiskState::DiskState(const String & table_path, ObjectID incarnation, bool attac
 }
 
 DiskState::~DiskState() = default;
+
+void DiskState::close()
+{
+    impl->current.reset();
+    /// Snapshots own the database. Never invalidate a reader or delete files under a live handle.
+    if (impl->database.use_count() != 1)
+        throw Exception(ErrorCodes::ABORTED, "Cannot close UpsertMergeTree state while snapshots remain pinned");
+    impl->database->db.reset();
+}
+
 
 PartRows DiskState::loadPartRows(const String & name) const
 {
@@ -1443,6 +1459,10 @@ StateStore::Prepared DiskState::prepareTruncate()
     std::unreachable();
 }
 PartRows DiskState::loadPartRows(const String &) const
+{
+    std::unreachable();
+}
+void DiskState::close()
 {
     std::unreachable();
 }

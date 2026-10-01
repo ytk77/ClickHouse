@@ -36,6 +36,7 @@
 
 namespace DB::ErrorCodes
 {
+extern const int ABORTED;
 extern const int CORRUPTED_DATA;
 extern const int BAD_ARGUMENTS;
 extern const int LIMIT_EXCEEDED;
@@ -252,6 +253,9 @@ void StorageMergeTree::runUpsertMaintenance()
             upsert_store->pruneRetired();
         }
 
+        if (merger_mutator.merges_blocker.isCancelled())
+            return;
+
         DataPartsVector sources;
         String partition;
         const auto metadata = getInMemoryMetadataPtr(getContext(), true);
@@ -316,11 +320,6 @@ void StorageMergeTree::runUpsertMaintenance()
                     partition = id;
                 }
                 const auto size = candidate->getBytesUncompressedOnDisk();
-                if (size > max_source_bytes || candidate->rows_count > Upsert::MAX_UNIT_ROWS)
-                {
-                    advance_cursor(candidate);
-                    continue;
-                }
                 fiu_do_on(FailPoints::upsert_maintenance_corrupt_candidate,
                 {
                     throw Exception(ErrorCodes::CORRUPTED_DATA, "Injected UpsertMergeTree corrupt maintenance candidate");
@@ -364,8 +363,18 @@ void StorageMergeTree::runUpsertMaintenance()
                 {
                     if (worthy())
                         break;
+                    if (!rewrite)
+                    {
+                        advance_cursor(candidate);
+                        continue;
+                    }
+                    /// A healthy prefix must not starve a due or masked source. Rewrite it alone;
+                    /// output and state commits are already split into bounded units.
+                    sources.clear();
+                    sources.push_back(candidate);
+                    needs_rewrite = true;
                     advance_cursor(candidate);
-                    continue;
+                    break;
                 }
                 advance_cursor(candidate);
                 needs_rewrite |= rewrite;
@@ -397,6 +406,8 @@ void StorageMergeTree::runUpsertMaintenance()
     }
     catch (...)
     {
+        if (getCurrentExceptionCode() == ErrorCodes::ABORTED && (shutdown_called || flush_called))
+            return;
         ProfileEvents::increment(ProfileEvents::UpsertMaintenanceFailures);
         if (getCurrentExceptionCode() == ErrorCodes::CORRUPTED_DATA)
         {
@@ -461,6 +472,8 @@ bool StorageMergeTree::rewriteUpsertParts(const DataPartsVector & sources, const
     const Upsert::StateStore::MergeInput merge_input{snapshot, lineage, source_offsets};
     auto flush = [&](bool retire_sources)
     {
+        if (shutdown_called || flush_called)
+            throw Exception(ErrorCodes::ABORTED, "UpsertMergeTree rewrite cancelled during shutdown");
         output.setColumns(std::move(output_columns));
 
         MergeTreeTemporaryPartPtr temporary;
@@ -588,6 +601,8 @@ bool StorageMergeTree::rewriteUpsertParts(const DataPartsVector & sources, const
         size_t offset = 0;
         while (executor.pull(block))
         {
+            if (shutdown_called || flush_called)
+                throw Exception(ErrorCodes::ABORTED, "UpsertMergeTree rewrite cancelled during shutdown");
             if (offset + block.rows() > lineage[source_index].size())
                 throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree maintenance read exceeds source lineage");
             const auto ttl_keep = filterTTL(block, ttl_algorithms);

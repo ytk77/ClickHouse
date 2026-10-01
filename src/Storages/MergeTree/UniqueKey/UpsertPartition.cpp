@@ -448,8 +448,8 @@ Pipe StorageMergeTree::alterPartition(
             }
             loaded.clear();
             inputs.clear();
-            auto lock = lockParts();
-            upsert_store->pruneRetired();
+            /// Import is committed; cleanup failures must not turn success into an ambiguous error.
+            upsert_maintenance_task->schedule();
             continue;
         }
         if (transfer)

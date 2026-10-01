@@ -86,6 +86,8 @@ public:
 
     StateStore(String table_path_, ObjectID incarnation_, bool attach, bool use_disk_state = false, StateClock clock = {}, const Resources & resources = {});
     ~StateStore();
+    /// Called after stopping writers and releasing the published read snapshot, before deleting files.
+    void close();
     SnapshotPtr snapshot() const;
     const std::map<String, ObjectID> & authorizedParts() const;
     std::optional<ObjectID> authorizedPart(const String & name) const;

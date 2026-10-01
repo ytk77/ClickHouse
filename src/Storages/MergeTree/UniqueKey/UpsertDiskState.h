@@ -15,6 +15,8 @@ class DiskState
 public:
     DiskState(const String & table_path, ObjectID incarnation, bool attach, StateClock clock = {}, const Resources & resources = {});
     ~DiskState();
+    /// Called after stopping writers and releasing the published read snapshot, before deleting files.
+    void close();
     SnapshotPtr snapshot() const;
     std::optional<ObjectID> authorizedPart(const String & name) const;
     UInt64 authorizedPartCount() const;

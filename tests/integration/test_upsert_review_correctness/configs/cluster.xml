@@ -1,0 +1,10 @@
+<clickhouse>
+    <remote_servers>
+        <review_cluster>
+            <shard>
+                <replica><host>127.0.0.1</host><port>9000</port></replica>
+                <replica><host>127.0.0.1</host><port>9000</port></replica>
+            </shard>
+        </review_cluster>
+    </remote_servers>
+</clickhouse>

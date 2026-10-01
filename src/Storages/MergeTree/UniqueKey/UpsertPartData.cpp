@@ -7,6 +7,8 @@
 #include <Storages/MergeTree/MergeTreeDataPartChecksum.h>
 #include <Storages/StorageInMemoryMetadata.h>
 #include <DataTypes/IDataType.h>
+#include <Columns/ColumnTuple.h>
+#include <Columns/ColumnSparse.h>
 #include <Interpreters/Context.h>
 #include <Core/UUID.h>
 #include <Common/ErrnoException.h>
@@ -29,6 +31,7 @@
 namespace DB::ErrorCodes
 {
 extern const int BAD_ARGUMENTS;
+extern const int LOGICAL_ERROR;
 extern const int CANNOT_OPEN_FILE;
 extern const int CANNOT_READ_FROM_FILE_DESCRIPTOR;
 }
@@ -59,12 +62,26 @@ private:
     const bool is_datetime64;
 };
 
+void appendKeyColumns(const ColumnPtr & input, Columns & columns)
+{
+    auto column = recursiveRemoveSparse(input->convertToFullIfWrapped());
+    if (const auto * tuple = typeid_cast<const ColumnTuple *>(column.get()))
+    {
+        for (const auto & element : tuple->getColumns())
+            appendKeyColumns(element, columns);
+    }
+    else
+        columns.push_back(std::move(column));
+}
+
 VectorWithMemoryTracking<String> encodeKeys(const Block & block, const StorageInMemoryMetadata & metadata, size_t limit)
 {
     Columns columns;
     for (const auto & name : metadata.getUniqueKeyColumns())
-        columns.push_back(block.getByName(name).column);
+        appendKeyColumns(block.getByName(name).column, columns);
     VectorWithMemoryTracking<String> keys;
+    if (columns.empty())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree key has no scalar elements");
     UniqueKeyEncoding::encodeBlock(columns, nullptr, limit, keys);
     return keys;
 }

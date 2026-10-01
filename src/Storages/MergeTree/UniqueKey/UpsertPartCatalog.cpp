@@ -124,9 +124,9 @@ void PartCatalog::versions(const Root & current, std::unordered_map<String, Int6
 
 std::shared_ptr<const std::unordered_map<String, Int64>> PartCatalog::minDataVersions() const
 {
-    ProfileEventTimeIncrement<Microseconds> timer(ProfileEvents::UpsertCatalogVersionsMicroseconds);
     std::call_once(materialized->versions_once, [&]
     {
+        ProfileEventTimeIncrement<Microseconds> timer(ProfileEvents::UpsertCatalogVersionsMicroseconds);
         auto result = std::make_shared<std::unordered_map<String, Int64>>();
         versions(root, *result);
         materialized->min_data_versions = std::move(result);

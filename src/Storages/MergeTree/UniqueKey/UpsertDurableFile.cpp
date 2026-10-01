@@ -36,6 +36,7 @@ namespace ErrorCodes
 namespace FailPoints
 {
 extern const char upsert_throw_before_payload_sync[];
+extern const char upsert_throw_after_durable_file_create[];
 }
 
 namespace Upsert
@@ -145,17 +146,32 @@ void syncFiles(const std::vector<String> & paths)
 void createDurableFile(const String & path, std::string_view contents)
 {
     FileDescriptor file(path, O_WRONLY | O_CREAT | O_EXCL);
-    while (!contents.empty())
+    try
     {
-        const auto written = ::write(file.get(), contents.data(), contents.size());
-        if (written < 0 && errno == EINTR)
-            continue;
-        if (written <= 0)
-            ErrnoException::throwWithErrno(ErrorCodes::CANNOT_WRITE_TO_FILE_DESCRIPTOR, errno, "Cannot write UpsertMergeTree file {}", path);
-        contents.remove_prefix(static_cast<size_t>(written));
+        fiu_do_on(FailPoints::upsert_throw_after_durable_file_create,
+        {
+            throw Exception(ErrorCodes::FAULT_INJECTED, "Injected failure after creating an UpsertMergeTree file");
+        });
+        while (!contents.empty())
+        {
+            const auto written = ::write(file.get(), contents.data(), contents.size());
+            if (written < 0 && errno == EINTR)
+                continue;
+            if (written <= 0)
+                ErrnoException::throwWithErrno(ErrorCodes::CANNOT_WRITE_TO_FILE_DESCRIPTOR, errno, "Cannot write UpsertMergeTree file {}", path);
+            contents.remove_prefix(static_cast<size_t>(written));
+        }
+        file.sync();
+        syncDirectory(std::filesystem::path(path).parent_path());
     }
-    file.sync();
-    syncDirectory(std::filesystem::path(path).parent_path());
+    catch (...)
+    {
+        /// This call owns the file because the exclusive create succeeded. Never remove a
+        /// pre-existing path when opening failed, and leave no partial file blocking a retry.
+        std::filesystem::remove(path);
+        syncDirectory(std::filesystem::path(path).parent_path());
+        throw;
+    }
 }
 
 String readBoundedFile(const String & path, size_t max_bytes)

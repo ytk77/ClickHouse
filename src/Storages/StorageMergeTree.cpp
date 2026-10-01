@@ -228,18 +228,11 @@ StorageMergeTree::StorageMergeTree(
     , cleanup_thread(*this)
     , support_transaction(supportTransaction(getDisks(), log.load()))
 {
-    initializeDirectoriesAndFormatVersion(relative_data_path_, LoadingStrictnessLevel::ATTACH <= mode, date_column_name);
-
     if (merging_params.upsert)
     {
         const auto disks = getDisks();
         if (disks.size() != 1 || disks.front()->getDataSourceDescription().type != DataSourceType::Local)
             throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree currently requires exactly one local disk");
-        bool use_disk_state = false;
-        const auto incarnation = Upsert::initializeTableManifest(
-            fs::path(disks.front()->getPath()) / relative_data_path_, disks.front()->getName(), disks.front()->getPath(),
-            metadata_, merging_params.upsert_version_column, LoadingStrictnessLevel::ATTACH <= mode, use_disk_state);
-
         const auto upsert_settings = getSettings();
         Upsert::Resources resources;
         resources.index_cache_bytes = (*upsert_settings)[MergeTreeSetting::upsert_index_cache_bytes];
@@ -251,8 +244,18 @@ StorageMergeTree::StorageMergeTree(
         resources.recovery_threads = (*upsert_settings)[MergeTreeSetting::upsert_recovery_threads];
         resources.mask_cache_bytes = (*upsert_settings)[MergeTreeSetting::upsert_mask_cache_bytes];
         resources.partitioned_filters = (*upsert_settings)[MergeTreeSetting::upsert_partitioned_filters];
+        resources.validate();
+        initializeDirectoriesAndFormatVersion(relative_data_path_, LoadingStrictnessLevel::ATTACH <= mode, date_column_name);
+        bool use_disk_state = false;
+        const auto incarnation = Upsert::initializeTableManifest(
+            fs::path(disks.front()->getPath()) / relative_data_path_, disks.front()->getName(), disks.front()->getPath(),
+            metadata_, merging_params.upsert_version_column, LoadingStrictnessLevel::ATTACH <= mode, use_disk_state);
         upsert_store = std::make_unique<Upsert::StateStore>(fs::path(disks.front()->getPath()) / relative_data_path_,
             incarnation, LoadingStrictnessLevel::ATTACH <= mode, use_disk_state, Upsert::StateClock{}, resources);
+    }
+    else
+    {
+        initializeDirectoriesAndFormatVersion(relative_data_path_, LoadingStrictnessLevel::ATTACH <= mode, date_column_name);
     }
 
     loadDataParts(LoadingStrictnessLevel::FORCE_RESTORE <= mode, std::nullopt);
@@ -417,6 +420,10 @@ void StorageMergeTree::read(
                     "Physical part and block virtual columns are not supported for UpsertMergeTree: {}", name);
 
     const auto & settings = local_context->getSettingsRef();
+    if (merging_params.upsert && settings[Setting::parallel_replicas_for_non_replicated_merge_tree]
+        && (local_context->canUseParallelReplicasOnInitiator() || local_context->canUseParallelReplicasOnFollower()
+            || local_context->canUseParallelReplicasCustomKey()))
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree does not support parallel replica snapshots");
     /// reading step for parallel replicas with the analyzer is built in Planner, so don't do it here
     if (local_context->canUseParallelReplicasOnInitiator() && settings[Setting::parallel_replicas_for_non_replicated_merge_tree]
         && !settings[Setting::allow_experimental_analyzer])
@@ -532,6 +539,14 @@ StorageMergeTree::write(const ASTPtr & /*query*/, const StorageMetadataPtr & met
 void StorageMergeTree::drop()
 {
     shutdown(true);
+    if (upsert_store)
+    {
+        std::lock_guard operation_lock(upsert_operation_mutex);
+        auto lock = lockParts();
+        upsert_fenced = true;
+        (void)publishUpsertReadSnapshot(nullptr);
+        upsert_store->close();
+    }
     dropAllData();
 }
 
@@ -3484,7 +3499,12 @@ ActionLock StorageMergeTree::getActionLock(StorageActionBlockType action_type)
 void StorageMergeTree::onActionLockRemove(StorageActionBlockType action_type)
 {
     if (action_type == ActionLocks::PartsMerge ||  action_type == ActionLocks::PartsTTLMerge)
-        background_operations_assignee.trigger();
+    {
+        if (merging_params.upsert && upsert_maintenance_task)
+            upsert_maintenance_task->schedule();
+        else
+            background_operations_assignee.trigger();
+    }
     else if (action_type == ActionLocks::PartsMove)
         background_moves_assignee.trigger();
     else if (action_type == ActionLocks::Cleanup)

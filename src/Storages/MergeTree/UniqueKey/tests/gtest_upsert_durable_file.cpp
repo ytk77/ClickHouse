@@ -1,5 +1,7 @@
 #include <Storages/MergeTree/UniqueKey/UpsertDurableFile.h>
 #include <Common/Exception.h>
+#include <Common/FailPoint.h>
+#include "config.h"
 #include <Core/UUID.h>
 #include <IO/WriteHelpers.h>
 #include <gtest/gtest.h>
@@ -116,3 +118,16 @@ TEST_F(UpsertDurableFileTest, DirectoryBarriersRejectSymlinksBelowConfiguredDisk
     EXPECT_THROW(syncDirectoryAncestors(root / "store" / "redirect" / "table", root), Exception);
     EXPECT_THROW(syncDirectoryAncestors(root / "store" / "redirect", root), Exception);
 }
+
+#if USE_LIBFIU
+TEST_F(UpsertDurableFileTest, FailedExclusiveCreateCanBeRetried)
+{
+    const auto path = (directory / "manifest").string();
+    FailPointInjection::enableFailPoint("upsert_throw_after_durable_file_create");
+    EXPECT_THROW(createDurableFile(path, "payload"), Exception);
+    FailPointInjection::disableFailPoint("upsert_throw_after_durable_file_create");
+    EXPECT_FALSE(std::filesystem::exists(path));
+    EXPECT_NO_THROW(createDurableFile(path, "retry"));
+    EXPECT_EQ(readBoundedFile(path, 5), "retry");
+}
+#endif
