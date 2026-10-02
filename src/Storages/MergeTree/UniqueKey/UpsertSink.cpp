@@ -4,6 +4,7 @@
 #include <Storages/MergeTree/UniqueKey/UpsertDurableFile.h>
 #include <Storages/StorageMergeTree.h>
 #include <Storages/MergeTree/MergeTreeDataWriter.h>
+#include <Storages/MergeTree/MergeTreeSettings.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/InsertDeduplication.h>
 #include <Interpreters/ProcessList.h>
@@ -52,6 +53,7 @@ extern const int LIMIT_EXCEEDED;
 }
 namespace DB::FailPoints
 {
+extern const char upsert_throw_during_cache_prewarm[];
 extern const char upsert_throw_after_rename[];
 extern const char upsert_throw_before_publish[];
 extern const char upsert_throw_during_part_precommit[];
@@ -398,56 +400,84 @@ std::unique_ptr<Upsert::PreparedInsert> StorageMergeTree::prepareUpsertBlock(
         std::move(temporary), partition_id, std::move(authorization), std::move(validated));
 }
 
+void StorageMergeTree::prewarmUpsertPartCaches(MergeTreeTemporaryPart & temporary) noexcept
+{
+    try
+    {
+        const auto caches = getCachesToPrewarm(temporary.part->getBytesUncompressedOnDisk());
+        if (!caches.mark_cache && !caches.index_mark_cache && !caches.primary_index_cache)
+            return;
+        fiu_do_on(FailPoints::upsert_throw_during_cache_prewarm,
+        {
+            throw Exception(ErrorCodes::FAULT_INJECTED, "Injected UpsertMergeTree cache prewarm failure");
+        });
+        temporary.prewarmCaches();
+        ProfileEvents::increment(ProfileEvents::UpsertPartCachePrewarms);
+    }
+    catch (...)
+    {
+        /// Cache filling is optional; a published durable commit must keep its successful outcome.
+        ProfileEvents::increment(ProfileEvents::UpsertPartCachePrewarmFailures);
+        tryLogCurrentException(log, "Could not prewarm committed UpsertMergeTree part caches");
+    }
+}
+
 bool StorageMergeTree::commitUpsertBlock(Upsert::PreparedInsert & input)
 {
     auto & part = input.temporary->part;
     auto & authorization = input.authorization;
     UpsertReadSnapshotPtr retired_snapshot;
-    Stopwatch lock_wait;
-    auto lock = lockParts();
-    ProfileEvents::increment(ProfileEvents::UpsertCommitLockWaitMicroseconds, lock_wait.elapsedMicroseconds());
-    ProfileEventTimeIncrement<Microseconds> hold_timer(ProfileEvents::UpsertCommitLockHoldMicroseconds);
-    if (upsert_fenced)
-        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree is fenced pending restart and recovery");
-    auto block_holder = fillNewPartName(part, lock);
-    authorization.final_name = part->name;
-    Upsert::StateStore::Prepared prepared;
-    try
+    bool produces_part = false;
     {
-        prepared = upsert_store->prepare(input.partition, std::move(authorization), input.rows);
+        Stopwatch lock_wait;
+        auto lock = lockParts();
+        ProfileEvents::increment(ProfileEvents::UpsertCommitLockWaitMicroseconds, lock_wait.elapsedMicroseconds());
+        ProfileEventTimeIncrement<Microseconds> hold_timer(ProfileEvents::UpsertCommitLockHoldMicroseconds);
+        if (upsert_fenced)
+            throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree is fenced pending restart and recovery");
+        auto block_holder = fillNewPartName(part, lock);
+        authorization.final_name = part->name;
+        Upsert::StateStore::Prepared prepared;
+        try
+        {
+            prepared = upsert_store->prepare(input.partition, std::move(authorization), input.rows);
+        }
+        catch (...)
+        {
+            if (upsert_store->isFenced())
+                upsert_fenced = true;
+            throw;
+        }
+        if (prepared.replayed_token)
+            return false;
+        produces_part = prepared.produces_part;
+        /// Allocate the complete next read version before any ambiguous durable operation.
+        auto read_snapshot = prepareUpsertReadSnapshot(prepared.snapshot, prepared.produces_part ? part : nullptr, {}, lock);
+        bool persist_started = false;
+        auto persist = [&]
+        {
+            persist_started = true;
+            upsert_store->append(prepared);
+        };
+        try
+        {
+            if (prepared.produces_part)
+                commitUpsertPart(part, persist, lock);
+            else
+                persist();
+            upsert_store->publish(prepared);
+            retired_snapshot = publishUpsertReadSnapshot(std::move(read_snapshot));
+            notifyUpsertMaintenance();
+        }
+        catch (...)
+        {
+            if (persist_started)
+                upsert_fenced = true;
+            throw;
+        }
     }
-    catch (...)
-    {
-        if (upsert_store->isFenced())
-            upsert_fenced = true;
-        throw;
-    }
-    if (prepared.replayed_token)
-        return false;
-    /// Allocate the complete next read version before any ambiguous durable operation.
-    auto read_snapshot = prepareUpsertReadSnapshot(prepared.snapshot, prepared.produces_part ? part : nullptr, {}, lock);
-    bool persist_started = false;
-    auto persist = [&]
-    {
-        persist_started = true;
-        upsert_store->append(prepared);
-    };
-    try
-    {
-        if (prepared.produces_part)
-            commitUpsertPart(part, persist, lock);
-        else
-            persist();
-        upsert_store->publish(prepared);
-        retired_snapshot = publishUpsertReadSnapshot(std::move(read_snapshot));
-        notifyUpsertMaintenance();
-    }
-    catch (...)
-    {
-        if (persist_started)
-            upsert_fenced = true;
-        throw;
-    }
+    if (produces_part)
+        prewarmUpsertPartCaches(*input.temporary);
     return true;
 }
 

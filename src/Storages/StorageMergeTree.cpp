@@ -571,7 +571,7 @@ void StorageMergeTree::alter(
 
     if (merging_params.upsert)
     {
-        alterUpsertMetadata(commands, local_context);
+        alterUpsertMetadata(commands, local_context, table_lock_holder);
         return;
     }
 

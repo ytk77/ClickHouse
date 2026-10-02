@@ -54,6 +54,115 @@ The durable state format is unchanged, but table metadata containing new explici
 
 Recovery verifies every authorized payload and visibility mask before publishing the table. Its queue is bounded by `upsert_recovery_threads`, and all workers finish before recovery can release database state or reclaim retired data. A verification exception fails recovery. Parallel verification is limited by aggregate storage bandwidth; it does not promise speedup proportional to thread count.
 
+## Query part size and cache prewarming {#query-part-size-prewarming}
+
+`UpsertMergeTree` stores ordinary column-oriented `MergeTree` parts. A small whole-row byte target can nevertheless produce many parts on a wide table, even when a query reads only two columns. Every selected part adds file, mark-loading and scheduling work. Compare identical queries and data on the same host with matched cache states before attributing a latency difference to the engine.
+
+`upsert_maintenance_target_bytes` controls background source selection and the output byte target. The default is 33,554,432 bytes (32 MiB); the supported range is 32 through 256 MiB. Row, lineage and durable-state budgets remain enforced and can split output earlier. This setting does not enlarge insertion units or foreground mutation output, and does not change the durable format.
+
+```sql
+ALTER TABLE events MODIFY SETTING
+    upsert_maintenance_target_bytes = 134217728,
+    prewarm_mark_cache = 1,
+    columns_to_prewarm_mark_cache = 'AFFILIATE,USER_ID';
+```
+
+The setting above and `prewarm_mark_cache`, `prewarm_primary_key_cache`, `columns_to_prewarm_mark_cache`, and `min_bytes_to_prewarm_caches` can be changed with a settings-only `ALTER TABLE ... MODIFY SETTING`. Resource settings in the preceding table remain open-time settings. `RESET SETTING` remains unsupported; explicitly assigning 33,554,432 sets the target back to 32 MiB, rather than restoring inheritance from server defaults. Metadata containing the new setting requires a binary that recognizes it.
+
+Changing the target wakes maintenance and revisits existing parts. Convergence requires multiple cycles and additional rewrite I/O. The settings operation waits for an active rewrite under the operation mutex; that wait has no separate `lock_acquire_timeout`. A failed metadata operation leaves the table usable only when the old metadata can be verified unchanged. A failure after replacement, or an uncertain metadata state, fences the table until restart and full recovery.
+
+Rewrite memory is not limited to the target: input columns, filtered copies, output and rebuilding an overflowing prefix coexist. Peak memory can be several times the target (roughly 2–3 times for these buffers, plus writer and state overhead). Background work does not inherit the client's query memory limit. Concurrent maintenance across tables requires a server memory budget. Longer rewrites also retain source parts longer and temporarily increase disk use.
+
+An in-memory hint records background output cut by a byte, row, lineage or state budget. At the same or a smaller target, healthy compaction skips that part; expiration, stale TTL metadata and at least 25 percent masked rows still trigger rewriting. This prevents endless rewrites caused by differences between serialized and in-memory column sizes. Raising the target or changing the schema allows reconsideration. Retired-part hints are removed. A successfully published intermediate output and its hint remain valid if a later batch fails or stops for a changed TTL policy; the source stays active with the already moved rows masked. Hints disappear on reopen, so restart can cause additional compaction before convergence. A hinted part with less than 25 percent masked rows can retain that unused space until another rewrite condition applies. `UpsertMaintenanceSaturatedSkips` counts these scheduling skips.
+
+Insertion, background rewrite and partition import prewarm caches after successful publication and outside the parts lock, using the existing temporary writer's retained marks. Wide parts honor the configured column filter; Compact parts keep a single marks file for all columns, so the column filter does not apply. Prewarming remains disabled by default and respects the minimum-size setting. A cache-fill failure is logged and counted without changing an already durable commit result. `UpsertPartCachePrewarms` counts eligible successful prewarm calls, not marks inserted: a part whose writer started before prewarming was enabled may have no retained marks. `UpsertPartCachePrewarmFailures` counts exceptions. Prewarming addresses mark loading; it does not warm all column data pages.
+
+### Reproduce the wide-table comparison {#reproduce-wide-table-comparison}
+
+`tests/integration/test_upsert_query_performance/benchmark.py` creates a fresh isolated loopback server and a 29-column table, inserts deterministic data, waits for compaction and executes the same `AFFILIATE` aggregation six times. Each invocation requires a new work directory. Run configurations sequentially, without concurrent builds or correctness tests:
+
+```bash
+python3 tests/integration/test_upsert_query_performance/benchmark.py \
+    --binary build_release/programs/clickhouse \
+    --work-dir tmp/upsert-query-128m \
+    --log-dir build_release \
+    --rows 5000000 --target-mib 128 --prewarm --seconds 900 \
+    > build_release/test_upsert_query_128m.log 2>&1
+```
+
+Use `--legacy` with a baseline binary, `--target-mib 32`, `--target-mib 256`, and `--replacing` for the other configurations. Compare the generated `aggregate.tsv` files exactly. The synthetic version and key definitions match, allowing `ReplacingMergeTree FINAL` to serve as an oracle in this experiment. Production tables with different partition or ordering keys need a separate semantic comparison.
+
+The first scan follows a file-local `POSIX_FADV_DONTNEED` request on this instance's own data/mark files; it is not a guaranteed disk-cold read. No shared-host kernel cache is cleared. Subsequent scans are warm samples. `results.json` records part counts, load/compaction times, query counters and server memory high-water marks. That high-water mark includes insertion and other server activity, so it does not isolate rewrite memory. A single trial per configuration cannot establish production tail latency or a promised speedup.
+
+### Wide-table local results {#wide-table-local-results}
+
+The 2026-10-02 comparison used five million deterministic rows, 29 columns, eight query threads,
+a fresh local server per configuration and five warm samples. Runs were sequential without a
+concurrent build or correctness suite. The baseline was `8ea965c973d`. All five aggregate outputs
+matched byte for byte, including the matching-key `ReplacingMergeTree FINAL` oracle.
+
+| Configuration | Active parts | First scan after file-local eviction | Warm median | Load | Compaction convergence |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Baseline, 32 MiB | 115 | 170.64 ms | 60.51 ms | 70.69 s | 16.52 s |
+| Candidate, 32 MiB and prewarm | 115 | 130.33 ms | 58.67 ms | 58.01 s | 15.34 s |
+| Candidate, 128 MiB and prewarm | 34 | 104.24 ms | 49.08 ms | 56.87 s | 75.39 s |
+| Candidate, 256 MiB and prewarm | 15 | 93.61 ms | 56.95 ms | 57.13 s | 67.28 s |
+| `ReplacingMergeTree FINAL` | 1 | 76.99 ms | 49.20 ms | 33.57 s | 24.39 s |
+
+At the same 115 parts, prewarming reduced first-scan mark misses from 575 to zero, file opens
+from 1,152 to 577, and aggregate mark-loading wait from 212,203 to 2,648 microseconds.
+With 128/256 MiB targets, first-scan file opens fell to 172/77. OS-read bytes remained around
+107–110 MB across upsert configurations: prewarming did not eliminate column-data I/O.
+Process memory high-water marks were approximately 1.09/1.14/1.31 GiB for the three candidate
+configurations, including insertion and all server activity; they are not isolated rewrite peaks.
+
+These trials demonstrate fewer parts and lower first-scan overhead on this dataset. They do not
+establish a 12-fold improvement or explain the complete cross-host production comparison. Warm
+latency did not improve monotonically with target size. Larger targets required more compaction
+time, and each configuration had only one load/convergence trial, so write-speed differences should
+not be attributed to this change. The default target remains 32 MiB.
+
+A second comparison used 20 million live rows and two million same-value overwrites, with the
+same aggregation and eight query threads. Both aggregate outputs matched exactly:
+
+| Measurement | Baseline | Candidate, 256 MiB and prewarm |
+| --- | ---: | ---: |
+| Active parts after convergence | 458 | 58 |
+| First scan after file-local eviction | 640.52 ms | 272.93 ms |
+| Five-sample warm median | 190.69 ms | 190.93 ms |
+| First-scan file opens | 4,582 | 292 |
+| First-scan mark misses | 2,290 | 0 |
+| First-scan aggregate mark-loading wait | 1,066,672 µs | 2,216 µs |
+| First-scan aggregate disk-read elapsed | 2,942,602 µs | 844,182 µs |
+| First-scan OS-read bytes | 441,835,520 | 426,713,088 |
+| Initial insertion | 271.98 s | 249.03 s |
+| Two million overwrites | 27.66 s | 34.46 s |
+| Compaction convergence | 66.85 s | 294.28 s |
+| Process memory high-water mark | 1,270,260 KiB | 1,472,996 KiB |
+
+The first scan improved approximately 2.35 times, while warm latency was unchanged. Convergence
+took approximately 4.4 times longer and process peak memory rose about 16 percent. These are
+tradeoffs from a single bounded trial, not production sizing guarantees. All five warm client timings
+were recorded; the baseline's final warm `query_log` entry was not captured by the immediate flush,
+so its supplementary warm event medians use four records. The benchmark now waits for every
+sample's log entry before completing telemetry collection.
+
+### Query performance change validation {#query-performance-validation}
+
+The Release build and 25 isolated-server integration cases passed: eight new cases and seventeen
+existing schema, TTL, partition, materialized-view and projection regressions. New coverage checks
+settings history and persistence, invalid values, metadata failure before/after replacement,
+post-commit prewarm failure, per-query column-selective cache misses, concurrent insertion during
+large rewrites and settings changes, deletion/restart, budget-cut convergence across reopen, and
+reconsideration after raising the target. A separate 100,000-row smoke run verified that all six
+query-log samples are collected. Python formatting, `Ruff` and `Pylint` checks passed.
+
+The standard C++ unit executable could not initialize the unrelated `SilkEnvironment` because
+this host cannot initialize its `io_uring` scheduler. The scoped upsert runner links the current
+compiled test objects and product libraries without that unrelated global test initializer; all 88
+scoped tests passed. This is
+not a full Docker integration, ASan or TSan run.
+
 ## Measurements {#measurements}
 
 The `Upsert`-prefixed events in `system.events` and applicable query `ProfileEvents` distinguish winner lookup, mask loading/encoding, state preparation, synchronous state writes, insert commit-lock waiting/holding, snapshot construction, maintenance candidate visits, and recovery. `UpsertMaskCacheHits` and `UpsertMaskCacheMisses` describe decoded-mask reuse. Independent `CurrentMetrics` named `UpsertMaskCacheBytes` and `UpsertMaskCacheEntries` report retained upsert mask caches without combining them with the legacy unique-key cache. They aggregate all upsert tables, not individual tables. `UpsertCatalogVersionsMicroseconds` and `UpsertCatalogRangesMicroseconds` measure query-side map lookup/initialization and range selection/materialization, including wait time. `UpsertCatalogNodesAllocated` (named `UpsertSnapshotPartsVisited` in the initial evaluation logs) counts nodes allocated during tree construction, including balancing nodes; it is not the table's active-part count.

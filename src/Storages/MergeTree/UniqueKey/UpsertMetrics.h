@@ -24,6 +24,9 @@ extern const Event UpsertCatalogRangesMicroseconds;
 extern const Event UpsertMaintenanceCandidates;
 extern const Event UpsertMaintenanceCorruptionFailures;
 extern const Event UpsertMaintenanceFailures;
+extern const Event UpsertMaintenanceSaturatedSkips;
+extern const Event UpsertPartCachePrewarms;
+extern const Event UpsertPartCachePrewarmFailures;
 extern const Event UpsertRecoveryMicroseconds;
 extern const Event UpsertRecoveryParts;
 }

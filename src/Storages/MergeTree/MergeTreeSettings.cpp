@@ -56,6 +56,12 @@ namespace ErrorCodes
   * and should not be changed by the user without a reason.
   */
 #define MERGE_TREE_SETTINGS(DECLARE, DECLARE_WITH_ALIAS) \
+    DECLARE(UInt64, upsert_maintenance_target_bytes, 32ULL << 20, R"(
+Target uncompressed physical column bytes per background `UpsertMergeTree` rewrite part.
+Allowed range: 32 MiB to 256 MiB. Row, lineage and state batch limits can split output earlier.
+Larger targets increase rewrite memory and temporary disk usage. Does not change insert units.
+Can be changed with `ALTER TABLE ... MODIFY SETTING`.
+)", 0) \
     DECLARE(UInt64, upsert_index_cache_bytes, 64ULL << 20, R"(
 Resource limit for the 64 MiB block cache in `UpsertMergeTree`. Applied when the table opens.
 No query or database setting is required. `ALTER` of this setting is not supported.

@@ -50,11 +50,14 @@ extern const char upsert_maintenance_corrupt_candidate[];
 extern const char upsert_ttl_pause_after_manifest_upgrade[];
 extern const char upsert_ttl_pause_after_metadata_commit[];
 extern const char upsert_ttl_throw_after_metadata_commit[];
+extern const char upsert_settings_throw_before_metadata[];
+extern const char upsert_settings_throw_after_metadata[];
 }
 
 namespace DB::MergeTreeSetting
 {
 extern const MergeTreeSettingsBool share_nested_offsets;
+extern const MergeTreeSettingsUInt64 upsert_maintenance_target_bytes;
 }
 
 namespace DB::Setting
@@ -108,7 +111,7 @@ IColumn::Filter filterTTL(const Block & block, std::vector<TTLAlgorithmPtr> & al
 }
 }
 
-void StorageMergeTree::alterUpsertMetadata(const AlterCommands & commands, ContextPtr local_context)
+void StorageMergeTree::alterUpsertMetadata(const AlterCommands & commands, ContextPtr local_context, AlterLockHolder & table_lock_holder)
 {
     checkAlterIsPossible(commands, local_context);
     NameSet dropped_columns;
@@ -127,13 +130,13 @@ void StorageMergeTree::alterUpsertMetadata(const AlterCommands & commands, Conte
             before.erase(before.begin() + offset, before.end());
             auto after = commands;
             after.erase(after.begin(), after.begin() + offset);
-            alterUpsertMetadata(before, local_context);
+            alterUpsertMetadata(before, local_context, table_lock_holder);
             if (auto metadata_cache = local_context->getQueryMetadataCache())
             {
                 auto [cache, cache_lock] = metadata_cache->getStorageMetadataCache();
                 cache->clear();
             }
-            alterUpsertMetadata(after, local_context);
+            alterUpsertMetadata(after, local_context, table_lock_holder);
             return;
         }
         if (it->type == AlterCommand::DROP_COLUMN)
@@ -171,8 +174,59 @@ void StorageMergeTree::alterUpsertMetadata(const AlterCommands & commands, Conte
     const auto table_path = (std::filesystem::path(disk->getPath()) / getRelativeDataPath()).string();
     const auto metadata_path = std::filesystem::path(metadata_disk->getPath()) / database->getObjectMetadataPath(table_id.table_name);
 
+    if (commands.isSettingsAlter())
+    {
+        /// Settings affect future work only. Persist metadata before changing the live settings.
+        std::lock_guard ttl_guard(upsert_ttl_mutex);
+        if (upsert_fenced)
+            throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree is fenced pending restart and recovery");
+        const auto relative_metadata_path = database->getObjectMetadataPath(table_id.table_name);
+        const auto previous_metadata_text = readMetadataFile(metadata_disk, relative_metadata_path);
+        bool metadata_replaced = false;
+        try
+        {
+            fiu_do_on(FailPoints::upsert_settings_throw_before_metadata,
+            {
+                throw Exception(ErrorCodes::FAULT_INJECTED, "Injected UpsertMergeTree failure before settings metadata");
+            });
+            database->alterTable(local_context, table_id, new_metadata, /*validate_new_create_query=*/false);
+            metadata_replaced = true;
+            Upsert::syncFiles({metadata_path.string()});
+            Upsert::syncDirectory(metadata_path.parent_path().string());
+            fiu_do_on(FailPoints::upsert_settings_throw_after_metadata,
+            {
+                throw Exception(ErrorCodes::FAULT_INJECTED, "Injected UpsertMergeTree failure after settings metadata");
+            });
+            changeSettings(new_metadata.settings_changes, table_lock_holder);
+        }
+        catch (...)
+        {
+            const auto error = std::current_exception();
+            bool unchanged = false;
+            try
+            {
+                /// `alterTable` can throw after its rename. Only verified unchanged metadata is safe.
+                unchanged = !metadata_replaced && readMetadataFile(metadata_disk, relative_metadata_path) == previous_metadata_text;
+            }
+            catch (...)
+            {
+                tryLogCurrentException(log, "Could not verify UpsertMergeTree metadata after settings failure");
+            }
+            if (!unchanged)
+                upsert_fenced = true;
+            std::rethrow_exception(error);
+        }
+        upsert_maintenance_cursor.reset();
+        upsert_maintenance_pending.reset();
+        notifyUpsertMaintenance();
+        if (upsert_maintenance_task)
+            upsert_maintenance_task->schedule();
+        return;
+    }
+
     if (changes_schema)
     {
+        upsert_saturated_parts.clear();
         /// Current-schema inserts cannot introduce obsolete files. Clean them before excluding writers.
         reconcileUpsertParts(old_metadata, local_context);
         schema_lock = tryLockTimed(upsert_schema_lock, RWLockImpl::Write,
@@ -227,7 +281,6 @@ void StorageMergeTree::notifyUpsertMaintenance()
 void StorageMergeTree::runUpsertMaintenance()
 {
     /// Each task handles a bounded unit; native merges remain disabled for this protocol.
-    constexpr size_t max_source_bytes = 32U << 20;
     constexpr size_t max_sources = 16;
     constexpr size_t max_lineage_bytes = Upsert::MAX_RECORD_BYTES - Upsert::PART_ROWS_ENVELOPE_BYTES;
     bool did_work = false;
@@ -245,6 +298,7 @@ void StorageMergeTree::runUpsertMaintenance()
                 return;
         }
         std::lock_guard operation_lock(upsert_operation_mutex);
+        const size_t max_source_bytes = (*getSettings())[MergeTreeSetting::upsert_maintenance_target_bytes];
         phase = "cleaning retired payloads";
         clearOldPartsFromFilesystem(false, false);
         {
@@ -350,6 +404,16 @@ void StorageMergeTree::runUpsertMaintenance()
                     || part_policy->second.file_size != policy_checksum.file_size || part_policy->second.file_hash != policy_checksum.file_hash;
                 const bool ttl_due = apply_ttl && (stale_ttl || (candidate->ttl_infos.part_min_ttl && candidate->ttl_infos.part_min_ttl <= now));
                 const bool rewrite = ttl_due || (mask->cardinality() > 0 && mask->cardinality() * 4 >= candidate->rows_count);
+                if (!rewrite)
+                {
+                    const auto saturated = upsert_saturated_parts.find(candidate->name);
+                    if (saturated != upsert_saturated_parts.end() && max_source_bytes <= saturated->second)
+                    {
+                        ProfileEvents::increment(ProfileEvents::UpsertMaintenanceSaturatedSkips);
+                        advance_cursor(candidate);
+                        continue;
+                    }
+                }
                 /// Target-sized healthy parts are complete; they must not block later small parts in any budget dimension.
                 if (!rewrite && (size > max_source_bytes / 2 || candidate->rows_count > Upsert::MAX_UNIT_ROWS / 2
                     || candidate_lineage_bytes > max_lineage_bytes / 2 || candidate_state_bytes > Upsert::MAX_PENDING_STATE_BYTES / 2))
@@ -401,7 +465,7 @@ void StorageMergeTree::runUpsertMaintenance()
         {
             phase = "rewriting source parts";
             diagnostic_part = sources.front();
-            did_work = rewriteUpsertParts(sources, metadata, getContext(), apply_ttl);
+            did_work = rewriteUpsertParts(sources, metadata, getContext(), apply_ttl, {}, max_source_bytes, true);
         }
     }
     catch (...)
@@ -430,9 +494,8 @@ void StorageMergeTree::runUpsertMaintenance()
 }
 
 bool StorageMergeTree::rewriteUpsertParts(const DataPartsVector & sources, const StorageMetadataPtr & metadata,
-    ContextPtr query_context, bool apply_ttl, const MutationCommands & commands)
+    ContextPtr query_context, bool apply_ttl, const MutationCommands & commands, size_t max_output_bytes, bool remember_budget_cuts)
 {
-    constexpr size_t max_source_bytes = 32U << 20;
     const auto now = time(nullptr);
     const auto policy_checksum = Upsert::ttlPolicyChecksum(*metadata);
     const auto partition = sources.front()->info.getPartitionId();
@@ -500,63 +563,83 @@ bool StorageMergeTree::rewriteUpsertParts(const DataPartsVector & sources, const
             Upsert::syncDirectory(std::filesystem::path(path) / "..");
         }
         UpsertReadSnapshotPtr retired_snapshot;
-        FailPointInjection::pauseFailPoint(FailPoints::upsert_pause_before_merge_commit);
-        std::lock_guard ttl_lock(upsert_ttl_mutex);
-        const auto current_metadata = getInMemoryMetadataPtr(getContext(), true);
-        const auto current_policy_checksum = Upsert::ttlPolicyChecksum(*current_metadata);
-        if (apply_ttl && (current_policy_checksum.file_size != policy_checksum.file_size
-            || current_policy_checksum.file_hash != policy_checksum.file_hash))
+        bool produces_part = false;
         {
-            /// Rebuild under the current policy; an old `TTL` result must not commit after an alter.
-            return false;
+            FailPointInjection::pauseFailPoint(FailPoints::upsert_pause_before_merge_commit);
+            std::lock_guard ttl_lock(upsert_ttl_mutex);
+            const auto current_metadata = getInMemoryMetadataPtr(getContext(), true);
+            const auto current_policy_checksum = Upsert::ttlPolicyChecksum(*current_metadata);
+            if (apply_ttl && (current_policy_checksum.file_size != policy_checksum.file_size
+                || current_policy_checksum.file_hash != policy_checksum.file_hash))
+            {
+                /// Rebuild under the current policy; an old `TTL` result must not commit after an alter.
+                return false;
+            }
+            auto lock = lockParts();
+            if (upsert_fenced)
+                throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree is fenced pending restart and recovery");
+            if (temporary)
+            {
+                auto holder = fillNewPartName(temporary->part, lock);
+                authorization.final_name = temporary->part->name;
+            }
+            decltype(upsert_saturated_parts)::node_type saturated_hint;
+            if (remember_budget_cuts && !retire_sources && temporary)
+            {
+                /// Allocate optional scheduling metadata before the durable commit; publish it afterward.
+                upsert_saturated_parts.reserve(upsert_saturated_parts.size() + 1);
+                decltype(upsert_saturated_parts) staging;
+                staging.emplace(temporary->part->name, max_output_bytes);
+                saturated_hint = staging.extract(temporary->part->name);
+            }
+            auto prepared = upsert_store->prepareMerge(
+                partition, std::move(authorization), output_rows, source_names, expired, retire_sources, &merge_input);
+            const auto & retired_sources = retire_sources ? sources : DataPartsVector{};
+            auto read_snapshot = prepareUpsertReadSnapshot(
+                prepared.snapshot, prepared.produces_part ? temporary->part : nullptr, retired_sources, lock);
+            bool persist_started = false;
+            auto persist = [&]
+            {
+                persist_started = true;
+                upsert_store->append(prepared);
+            };
+            try
+            {
+                if (prepared.produces_part)
+                    commitUpsertPart(temporary->part, persist, lock);
+                else
+                    persist();
+                removePartsFromWorkingSet(nullptr, retired_sources, true, lock);
+                upsert_store->publish(prepared);
+                retired_snapshot = publishUpsertReadSnapshot(std::move(read_snapshot));
+                if (prepared.produces_part && !saturated_hint.empty())
+                    upsert_saturated_parts.insert(std::move(saturated_hint));
+                for (const auto & retired : retired_sources)
+                    upsert_saturated_parts.erase(retired->name);
+                chassert(upsert_saturated_parts.size() <= getActivePartsCount());
+                notifyUpsertMaintenance();
+                did_work = true;
+                output = metadata->getSampleBlock().cloneEmpty();
+                output_columns = output.mutateColumns();
+                ordinals = ColumnUInt64::create();
+                row_lineage = ColumnString::create();
+                expired.clear();
+                lineage_bytes = Upsert::PART_ROWS_ENVELOPE_BYTES;
+                unit_rows = 0;
+                for (auto & offsets : source_offsets)
+                    offsets.clear();
+                produces_part = prepared.produces_part;
+            }
+            catch (...)
+            {
+                if (persist_started)
+                    upsert_fenced = true;
+                throw;
+            }
         }
-        auto lock = lockParts();
-        if (upsert_fenced)
-            throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree is fenced pending restart and recovery");
-        if (temporary)
-        {
-            auto holder = fillNewPartName(temporary->part, lock);
-            authorization.final_name = temporary->part->name;
-        }
-        auto prepared = upsert_store->prepareMerge(
-            partition, std::move(authorization), output_rows, source_names, expired, retire_sources, &merge_input);
-        const auto & retired_sources = retire_sources ? sources : DataPartsVector{};
-        auto read_snapshot = prepareUpsertReadSnapshot(
-            prepared.snapshot, prepared.produces_part ? temporary->part : nullptr, retired_sources, lock);
-        bool persist_started = false;
-        auto persist = [&]
-        {
-            persist_started = true;
-            upsert_store->append(prepared);
-        };
-        try
-        {
-            if (prepared.produces_part)
-                commitUpsertPart(temporary->part, persist, lock);
-            else
-                persist();
-            removePartsFromWorkingSet(nullptr, retired_sources, true, lock);
-            upsert_store->publish(prepared);
-            retired_snapshot = publishUpsertReadSnapshot(std::move(read_snapshot));
-            notifyUpsertMaintenance();
-            did_work = true;
-            output = metadata->getSampleBlock().cloneEmpty();
-            output_columns = output.mutateColumns();
-            ordinals = ColumnUInt64::create();
-            row_lineage = ColumnString::create();
-            expired.clear();
-            lineage_bytes = Upsert::PART_ROWS_ENVELOPE_BYTES;
-            unit_rows = 0;
-            for (auto & offsets : source_offsets)
-                offsets.clear();
-            return true;
-        }
-        catch (...)
-        {
-            if (persist_started)
-                upsert_fenced = true;
-            throw;
-        }
+        if (produces_part)
+            prewarmUpsertPartCaches(*temporary);
+        return true;
     };
     for (size_t source_index = 0; source_index < sources.size(); ++source_index)
     {
@@ -685,7 +768,7 @@ bool StorageMergeTree::rewriteUpsertParts(const DataPartsVector & sources, const
                     }
                     /// Measure the actual representation, including shared values in `LowCardinality` dictionaries.
                     /// A single wide value is indivisible and remains subject to the query memory limit.
-                    if (candidate_bytes <= max_source_bytes || previous_rows + rows <= 1)
+                    if (candidate_bytes <= max_output_bytes || previous_rows + rows <= 1)
                         break;
 
                     /// Compact the retained prefix: `popBack` alone can leave unused dictionary values behind.
@@ -841,6 +924,7 @@ void StorageMergeTree::truncateUpsert(ContextPtr query_context)
             notifyUpsertMaintenance();
             upsert_maintenance_cursor.reset();
             upsert_maintenance_pending.reset();
+            upsert_saturated_parts.clear();
         }
         catch (...)
         {

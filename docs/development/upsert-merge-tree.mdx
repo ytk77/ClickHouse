@@ -305,6 +305,26 @@ while the manifest continues to bind the disk, keys, version type and table inca
 Older binaries reject this manifest. The legacy `parts_sync_v1` protocol does not support these
 operations.
 
+## Background part size and prewarming {#upsert-background-part-size-prewarming}
+
+For wide tables, larger background parts can reduce the number of files and marks opened by
+aggregation queries. `upsert_maintenance_target_bytes` defaults to 32 MiB and accepts 32–256 MiB.
+It applies to background maintenance; insertion units and foreground mutation output retain their
+existing limits. Row, lineage and state budgets can split a background part before this byte target.
+
+```sql
+ALTER TABLE current_state MODIFY SETTING
+    upsert_maintenance_target_bytes = 134217728,
+    prewarm_mark_cache = 1,
+    columns_to_prewarm_mark_cache = 'id,value';
+```
+
+Existing parts converge gradually, requiring rewrite I/O and memory that can be several times the
+target. Prewarming uses marks retained by the writer after successful publication; failures do not
+change the durable result. It does not warm all data pages. Defaults remain unchanged.
+See [query part size and cache prewarming](/development/upsert-merge-tree-scalability#query-part-size-prewarming)
+for the supported settings, memory and waiting behavior, restart convergence and downgrade limits.
+
 ## Row expiration {#upsert-row-expiration}
 
 New `disk_state_v2` tables support table-level `TTL ... DELETE`, including `DELETE WHERE`:
