@@ -58,7 +58,7 @@ Recovery verifies every authorized payload and visibility mask before publishing
 
 `UpsertMergeTree` stores ordinary column-oriented `MergeTree` parts. A small whole-row byte target can nevertheless produce many parts on a wide table, even when a query reads only two columns. Every selected part adds file, mark-loading and scheduling work. Compare identical queries and data on the same host with matched cache states before attributing a latency difference to the engine.
 
-`upsert_maintenance_target_bytes` controls background source selection and the output byte target. The default is 33,554,432 bytes (32 MiB); the supported range is 32 through 256 MiB. Row, lineage and durable-state budgets remain enforced and can split output earlier. This setting does not enlarge insertion units or foreground mutation output, and does not change the durable format.
+`upsert_maintenance_target_bytes` controls background source selection and the output byte target. The default is 268,435,456 bytes (256 MiB); the supported range is 32 through 256 MiB. Explicit table settings and server `<merge_tree>` defaults override this compiled default. Row, lineage and durable-state budgets remain enforced and can split output earlier. This setting does not enlarge insertion units or foreground mutation output, and does not change the durable format.
 
 ```sql
 ALTER TABLE events MODIFY SETTING
@@ -120,7 +120,8 @@ These trials demonstrate fewer parts and lower first-scan overhead on this datas
 establish a 12-fold improvement or explain the complete cross-host production comparison. Warm
 latency did not improve monotonically with target size. Larger targets required more compaction
 time, and each configuration had only one load/convergence trial, so write-speed differences should
-not be attributed to this change. The default target remains 32 MiB.
+not be attributed to this change. These trials used the targets listed in the table; the compiled
+default was subsequently increased to 256 MiB.
 
 A second comparison used 20 million live rows and two million same-value overwrites, with the
 same aggregation and eight query threads. Both aggregate outputs matched exactly:

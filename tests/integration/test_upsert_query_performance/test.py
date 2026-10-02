@@ -45,7 +45,7 @@ def test_target_settings_persist_and_reject_invalid_values():
         node.query(
             "SELECT count() FROM system.settings_changes ARRAY JOIN changes AS c "
             "WHERE type='MergeTree' AND c.name='upsert_maintenance_target_bytes' "
-            "AND c.new_value='33554432'"
+            "AND c.new_value='268435456'"
         ).strip()
         == "1"
     )

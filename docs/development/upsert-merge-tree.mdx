@@ -308,7 +308,7 @@ operations.
 ## Background part size and prewarming {#upsert-background-part-size-prewarming}
 
 For wide tables, larger background parts can reduce the number of files and marks opened by
-aggregation queries. `upsert_maintenance_target_bytes` defaults to 32 MiB and accepts 32–256 MiB.
+aggregation queries. `upsert_maintenance_target_bytes` defaults to 256 MiB and accepts 32–256 MiB.
 It applies to background maintenance; insertion units and foreground mutation output retain their
 existing limits. Row, lineage and state budgets can split a background part before this byte target.
 
@@ -321,7 +321,7 @@ ALTER TABLE current_state MODIFY SETTING
 
 Existing parts converge gradually, requiring rewrite I/O and memory that can be several times the
 target. Prewarming uses marks retained by the writer after successful publication; failures do not
-change the durable result. It does not warm all data pages. Defaults remain unchanged.
+change the durable result. It does not warm all data pages. Mark prewarming remains disabled by default.
 See [query part size and cache prewarming](/development/upsert-merge-tree-scalability#query-part-size-prewarming)
 for the supported settings, memory and waiting behavior, restart convergence and downgrade limits.
 
