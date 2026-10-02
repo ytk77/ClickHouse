@@ -72,6 +72,9 @@
     M(ReplicaReady, "Indicates if the replica is ready for queries: 0 = no, 1 = yes") \
     M(MemoryTracking, "Total amount of memory (bytes) allocated by the server.") \
     M(MemoryTrackingUncorrected, "Total amount of memory (bytes) allocated by the server not corrected by RSS.") \
+    M(UpsertMaintenanceRewrites, "Currently admitted background `UpsertMergeTree` rewrites.") \
+    M(UpsertMaintenanceReservedBytes, "Estimated memory reserved by admitted background `UpsertMergeTree` rewrites.") \
+    M(UpsertMaintenanceMemoryTracking, "Tracked allocations attributed to active background `UpsertMergeTree` rewrites.") \
     M(MergesMutationsMemoryTracking, "Total amount of memory (bytes) allocated by background tasks (merges and mutations).") \
     M(EphemeralNode, "Number of ephemeral nodes hold in ZooKeeper.") \
     M(MaxAllocatedEphemeralLockSequentialNumber, "The maximum sequential number allocated for ephemeral lock znodes in ZooKeeper. Primarily influenced by the block numbers.") \

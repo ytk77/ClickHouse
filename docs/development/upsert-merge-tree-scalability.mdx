@@ -77,6 +77,91 @@ An in-memory hint records background output cut by a byte, row, lineage or state
 
 Insertion, background rewrite and partition import prewarm caches after successful publication and outside the parts lock, using the existing temporary writer's retained marks. Wide parts honor the configured column filter; Compact parts keep a single marks file for all columns, so the column filter does not apply. Prewarming remains disabled by default and respects the minimum-size setting. A cache-fill failure is logged and counted without changing an already durable commit result. `UpsertPartCachePrewarms` counts eligible successful prewarm calls, not marks inserted: a part whose writer started before prewarming was enabled may have no retained marks. `UpsertPartCachePrewarmFailures` counts exceptions. Prewarming addresses mark loading; it does not warm all column data pages.
 
+### Background rewrite admission and write amplification {#background-rewrite-admission}
+
+The compiled target remains 256 MiB. Healthy compaction requires comparable source sizes:
+when extending a run, neither the accumulated prefix nor the next candidate may exceed four times
+the other. An incompatible healthy singleton is deferred so newer small parts can merge with each
+other first. A ready run is processed before reconsidering the next candidate. Expired rows, stale
+`TTL` policy and at least 25 percent masked rows can trigger a singleton rewrite and never require
+a size-matched partner. Such a source does not make unrelated, disproportionate healthy neighbors
+eligible for the same run. This trades some
+additional active parts and slower convergence for less repeated copying during small-batch ingestion.
+A quiet table may retain a sequence such as 100/20/4/1 MiB rather than repeatedly copying its largest part.
+
+Two server settings, read at startup, bound background rewrite admission:
+
+| Setting | Default | Meaning |
+| --- | ---: | --- |
+| `max_concurrent_upsert_maintenance_rewrites` | 2 | Concurrent background rewrite attempts across tables |
+| `upsert_maintenance_memory_budget` | 2 GiB | Soft budget for estimated memory reservations of admitted attempts |
+
+Both must be positive. Reservations estimate three times the smaller of the target and selected
+sources' total uncompressed on-disk bytes, plus the largest source, decoded lineage and row metadata,
+and estimated state work capped at half the state-batch limit. Small rewrites therefore do not reserve
+an entire target-sized buffer. A single attempt exceeding the reservation budget may run alone when
+background and server headroom permit it; `UpsertMaintenanceOversizedAdmissions` records this policy.
+Admission also checks the background merge soft limit and server memory hard limit, using their
+current tracked usage plus reservations. This intentionally counts some active allocations twice.
+Reservations are estimates, not allocator caps or an out-of-memory guarantee: defaults, dictionaries,
+projections and writer buffers can change actual usage. Active rewrites use the ordinary background
+merge memory tracker and remain subject to the server memory limit.
+
+A cheap admission precheck runs before cleanup or candidate scanning. Deferrals at this point have a
+separate counter and do not produce denial warnings, because the table may be idle. They preserve an
+existing longer idle delay (up to 30 seconds) when no new publication has occurred. A task denied admission releases
+its locks and retries after 1, 2, 4, 8, then 10 seconds, plus a stable table-specific offset of up to
+250 milliseconds. If selection has already run, its cursor and carried candidate are restored.
+Notifications cannot bypass this retry deadline. Denials are logged at consecutive counts of 1, 2, 4,
+8 and so on. Admission uses polling rather than a FIFO queue, so strict fairness is not guaranteed.
+It does not wait for a rewrite slot on a worker thread. A task also reschedules if a foreground
+operation holds the table operation mutex. An admitted rewrite still runs on a background schedule
+pool worker; this change does not move rewriting to a dedicated executor. Admission limits do not
+cover foreground mutations, partition imports or retirement cleanup.
+
+`MEMORY_LIMIT_EXCEEDED`, `CANNOT_ALLOCATE_MEMORY`, and allocation exceptions trigger a per-table monotonic-clock retry deadline of 1, 2, 4, 8, 16, 32,
+then 60 seconds. New publications cannot bypass that deadline. A successful rewrite resets the delay.
+The configured target is not silently reduced. A reservation that never fits the background or server
+headroom remains deferred; operators must lower the table target or provide more headroom. Resource pressure can delay `TTL`
+cleanup. The size-ratio rule itself never suppresses an expired source.
+
+The sequential source reader already uses `max_merges_bandwidth_for_server` for local and remote
+column-data reads. This is not a complete rewrite-I/O limit: output writing, lineage reads, payload
+hashing and synchronization are not all charged to that throttler. No automatic upgrade ramp is
+implemented. Before upgrading existing tables without explicit targets, administrators can retain
+the previous target with `<merge_tree><upsert_maintenance_target_bytes>33554432</upsert_maintenance_target_bytes></merge_tree>`
+and raise individual table targets gradually. Without an override, reopening adopts 256 MiB and can
+initiate substantial compaction; the admission limits bound simultaneous work, not total rewrite bytes.
+
+Observability:
+
+- `system.metrics`: `UpsertMaintenanceRewrites`, `UpsertMaintenanceReservedBytes`, and
+  `UpsertMaintenanceMemoryTracking` expose admitted attempts, reserved estimates and attributed allocations.
+- `ProfileEvents`: `UpsertMaintenanceAdmissionPrecheckDeferrals`, `UpsertMaintenanceAdmissionDenied`, `UpsertMaintenanceSizeRatioSkips`,
+  `UpsertMaintenanceMemoryBackoffs`, and `UpsertMaintenanceRewritesStarted` expose scheduling decisions.
+  Candidate and skip counters include scans later deferred by admission and their retries; use actual
+  rewrite/write counters to detect repeated rewriting, not candidate counts.
+- `UpsertMaintenanceReadBytes` counts column blocks pulled using their in-memory `Block::bytes` size,
+  including masked rows. `UpsertMaintenanceWrittenBytes` counts the same measure submitted to part writers before
+  internal lineage columns are added. Both include work from failed attempts; neither measures physical
+  device I/O. Compare written bytes against application insert-column bytes measured with the same
+  in-memory representation over the same interval.
+- `UpsertMaintenancePeakMemoryBytes` sums peak tracked memory across attempts. Divide by attempts for
+  a mean of peaks; it is not a server-wide maximum or a latency percentile.
+
+Foreground `DELETE` and schema/index rewrites still use 32 MiB output units, so they can split a larger
+part and require later background compaction. Changing that path, mask-only expiration, vertical
+rewriting and large-part activation require separate correctness and resource validation. These
+admission and selection changes do not modify the durable format or the winner publication protocol.
+
+The admission and size-ratio changes passed a Release compile/link and static review on 2026-10-02.
+Functional, fault-injection and sustained-load tests of these changes have not yet run. Earlier test
+counts and historical measurements below predate these safeguards and do not validate their benefit.
+Follow-up evaluation should separate target and prewarming in a same-binary 2-by-2 comparison and
+include sustained small inserts, hot-key overwrites, multiple tables converging together, memory
+pressure, mixed-age `TTL`, and foreground deletes. Measure insert/query latency distributions,
+rewrite bytes, admission denials and task memory peaks; no performance multiple is promised.
+
 ### Reproduce the wide-table comparison {#reproduce-wide-table-comparison}
 
 `tests/integration/test_upsert_query_performance/benchmark.py` creates a fresh isolated loopback server and a 29-column table, inserts deterministic data, waits for compaction and executes the same `AFFILIATE` aggregation six times. Each invocation requires a new work directory. Run configurations sequentially, without concurrent builds or correctness tests:

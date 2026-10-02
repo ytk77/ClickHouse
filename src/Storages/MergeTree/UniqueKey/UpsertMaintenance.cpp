@@ -23,6 +23,12 @@
 #include <QueryPipeline/QueryPipelineBuilder.h>
 #include <Parsers/ASTAlterQuery.h>
 #include <Core/Settings.h>
+#include <Core/ServerSettings.h>
+#include <Common/CurrentMetrics.h>
+#include <Common/ThreadStatus.h>
+#include <Common/ThreadGroupSwitcher.h>
+#include <Common/MemoryTracker.h>
+#include <base/scope_guard.h>
 #include <Columns/ColumnString.h>
 #include <Columns/ColumnsNumber.h>
 #include <DataTypes/DataTypeString.h>
@@ -33,6 +39,8 @@
 #include <Common/assert_cast.h>
 #include <filesystem>
 #include <numeric>
+#include <limits>
+#include <new>
 
 namespace DB::ErrorCodes
 {
@@ -42,6 +50,8 @@ extern const int BAD_ARGUMENTS;
 extern const int LIMIT_EXCEEDED;
 extern const int SUPPORT_IS_DISABLED;
 extern const int FAULT_INJECTED;
+extern const int MEMORY_LIMIT_EXCEEDED;
+extern const int CANNOT_ALLOCATE_MEMORY;
 }
 namespace DB::FailPoints
 {
@@ -52,6 +62,19 @@ extern const char upsert_ttl_pause_after_metadata_commit[];
 extern const char upsert_ttl_throw_after_metadata_commit[];
 extern const char upsert_settings_throw_before_metadata[];
 extern const char upsert_settings_throw_after_metadata[];
+}
+
+namespace CurrentMetrics
+{
+extern const Metric UpsertMaintenanceRewrites;
+extern const Metric UpsertMaintenanceReservedBytes;
+extern const Metric UpsertMaintenanceMemoryTracking;
+}
+
+namespace DB::ServerSetting
+{
+extern const ServerSettingsNonZeroUInt64 max_concurrent_upsert_maintenance_rewrites;
+extern const ServerSettingsNonZeroUInt64 upsert_maintenance_memory_budget;
 }
 
 namespace DB::MergeTreeSetting
@@ -69,6 +92,128 @@ namespace DB
 {
 namespace
 {
+/// Reservations are process-wide, matching the server's background memory tracker.
+/// Account both reservations and measured memory conservatively: active rewrites can be counted twice.
+class MaintenanceAdmission
+{
+    static inline std::mutex mutex;
+    static inline UInt64 active = 0;
+    static inline UInt64 reserved = 0;
+    UInt64 reservation = 0;
+
+    static bool fits(UInt64 limit, UInt64 used, UInt64 extra)
+    {
+        return used <= limit && extra <= limit - used;
+    }
+
+public:
+    MaintenanceAdmission() = default;
+    MaintenanceAdmission(const MaintenanceAdmission &) = delete;
+    MaintenanceAdmission & operator=(const MaintenanceAdmission &) = delete;
+
+    static bool canAttempt(const ServerSettings & settings)
+    {
+        std::lock_guard lock(mutex);
+        const auto background_limit = background_memory_tracker.getSoftLimit();
+        const auto server_limit = total_memory_tracker.getHardLimit();
+        return active < settings[ServerSetting::max_concurrent_upsert_maintenance_rewrites]
+            && reserved < settings[ServerSetting::upsert_maintenance_memory_budget]
+            && (background_limit <= 0 || fits(background_limit, std::max<Int64>(0, background_memory_tracker.get()), reserved))
+            && (server_limit <= 0 || fits(server_limit, std::max<Int64>(0, total_memory_tracker.get()), reserved));
+    }
+
+    bool tryAcquire(UInt64 bytes, const ServerSettings & settings)
+    {
+        std::lock_guard lock(mutex);
+        const UInt64 memory_limit = settings[ServerSetting::upsert_maintenance_memory_budget];
+        /// This is a soft reservation budget: allow one oversized unit in isolation, subject to
+        /// the actual background and server headroom checks below, so a large source can make progress.
+        const bool oversized = bytes > memory_limit && active == 0;
+        if (bytes > static_cast<UInt64>(std::numeric_limits<Int64>::max())
+            || active >= settings[ServerSetting::max_concurrent_upsert_maintenance_rewrites]
+            || (!oversized && !fits(memory_limit, reserved, bytes)))
+            return false;
+        const UInt64 total_reserved = reserved + bytes;
+        const auto background_limit = background_memory_tracker.getSoftLimit();
+        const auto server_limit = total_memory_tracker.getHardLimit();
+        if ((background_limit > 0 && !fits(background_limit, std::max<Int64>(0, background_memory_tracker.get()), total_reserved))
+            || (server_limit > 0 && !fits(server_limit, std::max<Int64>(0, total_memory_tracker.get()), total_reserved)))
+            return false;
+        if (oversized)
+            ProfileEvents::increment(ProfileEvents::UpsertMaintenanceOversizedAdmissions);
+        reservation = bytes;
+        reserved += bytes;
+        ++active;
+        CurrentMetrics::add(CurrentMetrics::UpsertMaintenanceRewrites);
+        CurrentMetrics::add(CurrentMetrics::UpsertMaintenanceReservedBytes, bytes);
+        return true;
+    }
+
+    ~MaintenanceAdmission()
+    {
+        if (!reservation)
+            return;
+        std::lock_guard lock(mutex);
+        reserved -= reservation;
+        --active;
+        CurrentMetrics::sub(CurrentMetrics::UpsertMaintenanceReservedBytes, reservation);
+        CurrentMetrics::sub(CurrentMetrics::UpsertMaintenanceRewrites);
+    }
+};
+
+UInt64 estimateRewriteMemory(const MergeTreeData::DataPartsVector & sources, UInt64 target)
+{
+    UInt64 largest_source = 0;
+    UInt64 selected_bytes = 0;
+    UInt64 state_bytes = 0;
+    UInt64 lineage = 0;
+    UInt64 rows = 0;
+    for (const auto & source : sources)
+    {
+        const UInt64 source_bytes = source->getBytesUncompressedOnDisk();
+        largest_source = std::max(largest_source, source_bytes);
+        if (source_bytes > static_cast<UInt64>(std::numeric_limits<Int64>::max()) - selected_bytes)
+            return std::numeric_limits<UInt64>::max();
+        selected_bytes += source_bytes;
+        const auto lineage_size = source->checksums.files.at(Upsert::ROWS_FILE).file_size;
+        lineage += lineage_size;
+        rows += source->rows_count;
+        state_bytes += Upsert::estimateInsertStateBytes(lineage_size, source->rows_count, source->info.getPartitionId().size(), 1024);
+    }
+    /// Source lineage remains loaded while column buffers and a state batch are built.
+    /// Saturate an unrepresentable estimate so admission rejects it without attempting allocation.
+    const UInt64 fixed = 2 * lineage + rows * sizeof(Upsert::PartRow)
+        + std::min<UInt64>(state_bytes, Upsert::MAX_PENDING_STATE_BYTES / 2);
+    const UInt64 output_bytes = std::min(target, selected_bytes);
+    const UInt64 max_estimate = std::numeric_limits<Int64>::max();
+    if (fixed > max_estimate || output_bytes > (max_estimate - fixed) / 3)
+        return std::numeric_limits<UInt64>::max();
+    const UInt64 subtotal = fixed + 3 * output_bytes;
+    if (largest_source > max_estimate - subtotal)
+        return std::numeric_limits<UInt64>::max();
+    return subtotal + largest_source;
+}
+
+bool isMaintenanceMemoryFailure()
+{
+    try
+    {
+        throw;
+    }
+    catch (const Exception & e)
+    {
+        return e.code() == ErrorCodes::MEMORY_LIMIT_EXCEEDED || e.code() == ErrorCodes::CANNOT_ALLOCATE_MEMORY;
+    }
+    catch (const std::bad_alloc &)
+    {
+        return true;
+    }
+    catch (...)
+    {
+        return false;
+    }
+}
+
 std::vector<TTLAlgorithmPtr> buildDeleteTTLAlgorithms(const StorageInMemoryMetadata & metadata, const ContextPtr & context, time_t now)
 {
     std::vector<TTLAlgorithmPtr> algorithms;
@@ -280,6 +425,13 @@ void StorageMergeTree::notifyUpsertMaintenance()
 
 void StorageMergeTree::runUpsertMaintenance()
 {
+    if (upsert_fenced || shutdown_called || flush_called)
+        return;
+    if (const auto delay = upsert_maintenance_schedule.remainingRetryDelay())
+    {
+        upsert_maintenance_task->scheduleAfter(delay);
+        return;
+    }
     /// Each task handles a bounded unit; native merges remain disabled for this protocol.
     constexpr size_t max_sources = 16;
     constexpr size_t max_lineage_bytes = Upsert::MAX_RECORD_BYTES - Upsert::PART_ROWS_ENVELOPE_BYTES;
@@ -289,15 +441,37 @@ void StorageMergeTree::runUpsertMaintenance()
     bool failed = false;
     const char * phase = "acquiring locks";
     DataPartPtr diagnostic_part;
+    const auto postpone_admission = [&]
+    {
+        ProfileEvents::increment(ProfileEvents::UpsertMaintenanceAdmissionDenied);
+        const auto delay = upsert_maintenance_schedule.admissionFailure(sipHash64(getStorageID().getFullTableName()) % 251);
+        const auto denials = upsert_maintenance_schedule.consecutiveAdmissionDenials();
+        if ((denials & (denials - 1)) == 0)
+            LOG_WARNING(log, "UpsertMergeTree maintenance admission denied {} consecutive times; retry in {} ms", denials, delay);
+        upsert_maintenance_task->scheduleAfter(delay);
+    };
     try
     {
+        if (!MaintenanceAdmission::canAttempt(getContext()->getServerSettings()))
+        {
+            /// Work has not been selected yet; do not report an idle table as a denied rewrite.
+            ProfileEvents::increment(ProfileEvents::UpsertMaintenanceAdmissionPrecheckDeferrals);
+            upsert_maintenance_task->scheduleAfter(upsert_maintenance_schedule.precheckDeferral(
+                sipHash64(getStorageID().getFullTableName()) % 251));
+            return;
+        }
         auto table_lock = lockForShare(RWLockImpl::NO_QUERY, Poco::Timespan(5, 0));
         {
             auto lock = lockParts();
             if (upsert_fenced)
                 return;
         }
-        std::lock_guard operation_lock(upsert_operation_mutex);
+        std::unique_lock operation_lock(upsert_operation_mutex, std::try_to_lock);
+        if (!operation_lock.owns_lock())
+        {
+            upsert_maintenance_task->scheduleAfter(1000);
+            return;
+        }
         const size_t max_source_bytes = (*getSettings())[MergeTreeSetting::upsert_maintenance_target_bytes];
         phase = "cleaning retired payloads";
         clearOldPartsFromFilesystem(false, false);
@@ -317,6 +491,8 @@ void StorageMergeTree::runUpsertMaintenance()
         const auto now = time(nullptr);
         const bool apply_ttl = metadata->hasAnyTTL() && !merger_mutator.ttl_merges_blocker.isCancelled();
         const auto policy_checksum = Upsert::ttlPolicyChecksum(*metadata);
+        const auto previous_cursor = upsert_maintenance_cursor;
+        const auto previous_pending = upsert_maintenance_pending;
         {
             auto lock = lockParts();
             if (upsert_fenced)
@@ -421,6 +597,21 @@ void StorageMergeTree::runUpsertMaintenance()
                     advance_cursor(candidate);
                     continue;
                 }
+                /// Do not repeatedly rewrite a large healthy prefix for a trickle of new rows.
+                /// Small tails accumulate into their own tier before joining a larger part.
+                /// An urgent source can start its own run; it never needs a size-matched partner.
+                if (!sources.empty()
+                    && (size < bytes / 4 + (bytes % 4 != 0) || bytes < size / 4 + (size % 4 != 0)))
+                {
+                    ProfileEvents::increment(ProfileEvents::UpsertMaintenanceSizeRatioSkips);
+                    if (worthy())
+                        break;
+                    sources.clear();
+                    bytes = 0;
+                    rows = 0;
+                    lineage_bytes = 0;
+                    state_bytes = 0;
+                }
                 if (size > max_source_bytes - bytes || candidate->rows_count > Upsert::MAX_UNIT_ROWS - rows
                     || candidate_lineage_bytes > max_lineage_bytes - lineage_bytes
                     || candidate_state_bytes > Upsert::MAX_PENDING_STATE_BYTES - state_bytes)
@@ -463,16 +654,48 @@ void StorageMergeTree::runUpsertMaintenance()
 
         if (!sources.empty())
         {
+            MaintenanceAdmission admission;
+            if (!admission.tryAcquire(estimateRewriteMemory(sources, max_source_bytes), getContext()->getServerSettings()))
+            {
+                /// Retry the same bounded slice, including a carried candidate, after resources become available.
+                upsert_maintenance_cursor = previous_cursor;
+                upsert_maintenance_pending = previous_pending;
+                postpone_admission();
+                return;
+            }
+            upsert_maintenance_schedule.admissionSucceeded();
             phase = "rewriting source parts";
             diagnostic_part = sources.front();
+            auto thread_group = ThreadGroup::createForMergeMutate(getContext());
+            thread_group->memory_tracker.setMetric(CurrentMetrics::UpsertMaintenanceMemoryTracking);
+            SCOPE_EXIT({
+                ProfileEvents::increment(ProfileEvents::UpsertMaintenancePeakMemoryBytes, thread_group->memory_tracker.getPeak());
+                background_memory_tracker.adjustOnBackgroundTaskEnd(&thread_group->memory_tracker);
+                CurrentMetrics::sub(CurrentMetrics::UpsertMaintenanceMemoryTracking, thread_group->memory_tracker.get());
+            });
+            ThreadGroupSwitcher switcher(thread_group, ThreadName::MERGE_MUTATE, /*allow_existing_group=*/true);
+            ProfileEvents::increment(ProfileEvents::UpsertMaintenanceRewritesStarted);
             did_work = rewriteUpsertParts(sources, metadata, getContext(), apply_ttl, {}, max_source_bytes, true);
+            if (did_work)
+                upsert_maintenance_schedule.rewriteSucceeded();
         }
+        else
+            upsert_maintenance_schedule.admissionSucceeded();
     }
     catch (...)
     {
         if (getCurrentExceptionCode() == ErrorCodes::ABORTED && (shutdown_called || flush_called))
             return;
         ProfileEvents::increment(ProfileEvents::UpsertMaintenanceFailures);
+        if (isMaintenanceMemoryFailure())
+        {
+            ProfileEvents::increment(ProfileEvents::UpsertMaintenanceMemoryBackoffs);
+            const auto delay = upsert_maintenance_schedule.memoryFailure();
+            tryLogCurrentException(log, fmt::format("UpsertMergeTree maintenance memory limit while {} (part {}); retry in {} ms",
+                phase, diagnostic_part ? diagnostic_part->name : "none", delay));
+            upsert_maintenance_task->scheduleAfter(delay);
+            return;
+        }
         if (getCurrentExceptionCode() == ErrorCodes::CORRUPTED_DATA)
         {
             {
@@ -545,6 +768,8 @@ bool StorageMergeTree::rewriteUpsertParts(const DataPartsVector & sources, const
         authorization.part = Upsert::newObjectID();
         if (output.rows())
         {
+            if (remember_budget_cuts)
+                ProfileEvents::increment(ProfileEvents::UpsertMaintenanceWrittenBytes, output.bytes());
             output.insert({std::move(ordinals), std::make_shared<DataTypeUInt64>(), Upsert::ORDINAL_COLUMN});
             output.insert({std::move(row_lineage), std::make_shared<DataTypeString>(), Upsert::LINEAGE_COLUMN});
             BlockWithPartition block;
@@ -684,6 +909,8 @@ bool StorageMergeTree::rewriteUpsertParts(const DataPartsVector & sources, const
         size_t offset = 0;
         while (executor.pull(block))
         {
+            if (remember_budget_cuts)
+                ProfileEvents::increment(ProfileEvents::UpsertMaintenanceReadBytes, block.bytes());
             if (shutdown_called || flush_called)
                 throw Exception(ErrorCodes::ABORTED, "UpsertMergeTree rewrite cancelled during shutdown");
             if (offset + block.rows() > lineage[source_index].size())

@@ -385,6 +385,18 @@ Setting the ratio to `0` disables both the startup cap and the runtime adjustmen
 The maximum memory consumption of the server is further restricted by setting `max_server_memory_usage`.
 :::
 )", 0) \
+    DECLARE(NonZeroUInt64, max_concurrent_upsert_maintenance_rewrites, 2, R"(
+Maximum number of concurrent background `UpsertMergeTree` rewrites across the server.
+Tasks that cannot acquire a slot reschedule without waiting on a worker thread.
+Applied at server startup. Does not limit foreground mutations or partition operations.
+)", 0) \
+    DECLARE(NonZeroUInt64, upsert_maintenance_memory_budget, 2ULL << 30, R"(
+Server-wide soft budget in bytes for estimated memory reservations of background `UpsertMergeTree` rewrites.
+Admission also respects available headroom under the background merge soft limit and server hard limit.
+Reservations include column buffers, lineage and state overhead; they are estimates, not hard allocation limits.
+One oversized unit may run alone if background and server memory headroom permit it.
+Applied at server startup. The default is 2 GiB.
+)", 0) \
     DECLARE(UInt64, merges_mutations_memory_usage_soft_limit, 0, R"(
 Sets the limit on how much RAM is allowed to use for performing merge and mutation operations.
 If ClickHouse reaches the limit set, it won't schedule any new background merge or mutation operations but will continue to execute already scheduled tasks.

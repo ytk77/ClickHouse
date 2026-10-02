@@ -322,6 +322,9 @@ ALTER TABLE current_state MODIFY SETTING
 Existing parts converge gradually, requiring rewrite I/O and memory that can be several times the
 target. Prewarming uses marks retained by the writer after successful publication; failures do not
 change the durable result. It does not warm all data pages. Mark prewarming remains disabled by default.
+Background rewrites use server-wide concurrency and estimated-memory admission limits, and healthy
+parts are selected by size ratio to reduce repeated rewriting during small-batch ingestion.
+See [background rewrite admission](/development/upsert-merge-tree-scalability#background-rewrite-admission).
 See [query part size and cache prewarming](/development/upsert-merge-tree-scalability#query-part-size-prewarming)
 for the supported settings, memory and waiting behavior, restart convergence and downgrade limits.
 

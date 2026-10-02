@@ -113,6 +113,15 @@
     M(UpsertCatalogNodesAllocated, "Immutable catalog nodes allocated while updating `UpsertMergeTree` snapshots, including path copies and rotations.", ValueType::Number) \
     M(UpsertCatalogVersionsMicroseconds, "Time retrieving or initializing cached `UpsertMergeTree` partition data versions.", ValueType::Microseconds) \
     M(UpsertCatalogRangesMicroseconds, "Time selecting or materializing `UpsertMergeTree` catalog ranges.", ValueType::Microseconds) \
+    M(UpsertMaintenanceOversizedAdmissions, "Isolated background `UpsertMergeTree` rewrites admitted above the soft reservation budget, with available background and server headroom.", ValueType::Number) \
+    M(UpsertMaintenanceAdmissionPrecheckDeferrals, "Background `UpsertMergeTree` scans postponed by the cheap admission precheck, before determining whether rewriting is needed.", ValueType::Number) \
+    M(UpsertMaintenanceAdmissionDenied, "Background `UpsertMergeTree` rewrites postponed by concurrency or estimated memory admission.", ValueType::Number) \
+    M(UpsertMaintenanceSizeRatioSkips, "Healthy `UpsertMergeTree` merge prefixes deferred because source sizes are too unequal.", ValueType::Number) \
+    M(UpsertMaintenanceMemoryBackoffs, "Background `UpsertMergeTree` memory failures triggering exponential retry backoff.", ValueType::Number) \
+    M(UpsertMaintenanceRewritesStarted, "Admitted background `UpsertMergeTree` rewrite attempts.", ValueType::Number) \
+    M(UpsertMaintenanceReadBytes, "Uncompressed column bytes pulled by background `UpsertMergeTree` rewrites, including masked rows and failed attempts.", ValueType::Bytes) \
+    M(UpsertMaintenanceWrittenBytes, "Uncompressed column bytes submitted to background `UpsertMergeTree` part writers, including failed attempts.", ValueType::Bytes) \
+    M(UpsertMaintenancePeakMemoryBytes, "Sum of per-attempt peak tracked memory for background `UpsertMergeTree` rewrites.", ValueType::Bytes) \
     M(UpsertMaintenanceSaturatedSkips, "Budget-cut `UpsertMergeTree` parts skipped during healthy compaction.", ValueType::Number) \
     M(UpsertPartCachePrewarms, "Successful cache prewarm calls after durable `UpsertMergeTree` part publication.", ValueType::Number) \
     M(UpsertPartCachePrewarmFailures, "Optional cache prewarm failures after durable `UpsertMergeTree` publication.", ValueType::Number) \
