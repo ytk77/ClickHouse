@@ -113,6 +113,9 @@
     M(UpsertCatalogNodesAllocated, "Immutable catalog nodes allocated while updating `UpsertMergeTree` snapshots, including path copies and rotations.", ValueType::Number) \
     M(UpsertCatalogVersionsMicroseconds, "Time retrieving or initializing cached `UpsertMergeTree` partition data versions.", ValueType::Microseconds) \
     M(UpsertCatalogRangesMicroseconds, "Time selecting or materializing `UpsertMergeTree` catalog ranges.", ValueType::Microseconds) \
+    M(UpsertMaintenanceSaturatedSkips, "Budget-cut `UpsertMergeTree` parts skipped during healthy compaction.", ValueType::Number) \
+    M(UpsertPartCachePrewarms, "Successful cache prewarm calls after durable `UpsertMergeTree` part publication.", ValueType::Number) \
+    M(UpsertPartCachePrewarmFailures, "Optional cache prewarm failures after durable `UpsertMergeTree` publication.", ValueType::Number) \
     M(UpsertMaintenanceFailures, "Exceptions encountered by `UpsertMergeTree` background maintenance.", ValueType::Number) \
     M(UpsertMaintenanceCorruptionFailures, "Maintenance corruption detections that fence an `UpsertMergeTree` table.", ValueType::Number) \
     M(UpsertMaintenanceCandidates, "Part candidates inspected by `UpsertMergeTree` maintenance.", ValueType::Number) \

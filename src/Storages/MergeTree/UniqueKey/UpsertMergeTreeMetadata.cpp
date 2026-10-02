@@ -12,6 +12,7 @@ namespace DB
 namespace MergeTreeSetting
 {
     extern const MergeTreeSettingsBool ttl_only_drop_parts;
+    extern const MergeTreeSettingsUInt64 upsert_maintenance_target_bytes;
 }
 
 namespace ErrorCodes
@@ -42,6 +43,11 @@ bool supportedKeyType(const IDataType & type)
 void validateUpsertMergeTreeMetadata(
     const StorageInMemoryMetadata & metadata, const String & version_column, MergeTreeSettings & settings)
 {
+    const UInt64 target_bytes = settings[MergeTreeSetting::upsert_maintenance_target_bytes];
+    if (target_bytes < (32ULL << 20) || target_bytes > (256ULL << 20))
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "Setting upsert_maintenance_target_bytes={} must be between 33554432 and 268435456 bytes", target_bytes);
+
     if (!metadata.hasUniqueKey())
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "UpsertMergeTree requires a nonempty UNIQUE KEY");
 

@@ -4852,6 +4852,15 @@ void MergeTreeData::checkAlterIsPossible(const AlterCommands & commands, Context
     {
         for (const auto & command : commands)
         {
+            if (command.type == AlterCommand::MODIFY_SETTING && commands.isSettingsAlter())
+            {
+                for (const auto & change : command.settings_changes)
+                    if (change.name != "upsert_maintenance_target_bytes" && change.name != "prewarm_mark_cache"
+                        && change.name != "prewarm_primary_key_cache" && change.name != "columns_to_prewarm_mark_cache"
+                        && change.name != "min_bytes_to_prewarm_caches")
+                        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree cannot alter setting {}", change.name);
+                continue;
+            }
             if ((command.type != AlterCommand::MODIFY_TTL && command.type != AlterCommand::REMOVE_TTL
                 && command.type != AlterCommand::ADD_COLUMN && command.type != AlterCommand::DROP_COLUMN
                 && command.type != AlterCommand::ADD_INDEX && command.type != AlterCommand::DROP_INDEX
@@ -4866,6 +4875,8 @@ void MergeTreeData::checkAlterIsPossible(const AlterCommands & commands, Context
         auto new_metadata = *old_metadata;
         auto settings = *getSettings();
         commands.apply(new_metadata, local_context, settings[MergeTreeSetting::share_nested_offsets]);
+        if (commands.isSettingsAlter() && new_metadata.settings_changes)
+            settings.applyChanges(new_metadata.settings_changes->as<const ASTSetQuery &>().changes, local_context, /*is_loading_from_existing_metadata=*/false);
         validateUpsertMergeTreeMetadata(new_metadata, merging_params.upsert_version_column, settings);
         checkTTLExpressions(new_metadata, *old_metadata);
     }

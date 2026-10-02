@@ -253,67 +253,75 @@ Pipe StorageMergeTree::alterPartition(
                      const UpsertReadSnapshotPtr & removal_snapshot)
     {
         UpsertReadSnapshotPtr retired_snapshot;
-        /// Never hold another table's schema lock while waiting for this one: an insert can visit both through a view.
-        auto schema_lock = target.tryLockTimed(target.upsert_schema_lock, RWLockImpl::Write,
-            query_context->getCurrentQueryId(), settings[Setting::lock_acquire_timeout]);
-        std::lock_guard ttl_lock(target.upsert_ttl_mutex);
-        std::vector<String> reset;
-        const auto current_snapshot = target.getUpsertReadSnapshotForQuery();
-        for (const auto & partition : partitions)
-            if (!removal_snapshot || current_snapshot->visibility->getPartitionCSN(partition)
-                == removal_snapshot->visibility->getPartitionCSN(partition))
-                reset.push_back(partition);
-        std::vector<std::unique_ptr<PlainCommittingBlockHolder>> block_holders;
-        auto lock = target.lockParts();
-        if (target.upsert_fenced)
-            throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree is fenced pending restart and recovery");
-        for (size_t i = 0; i < imported.temporary.size(); ++i)
-        {
-            block_holders.push_back(target.fillNewPartName(imported.temporary[i]->part, lock));
-            imported.records[i].final_name = imported.temporary[i]->part->name;
-        }
-        std::vector<String> removed_names;
-        for (const auto & part : removed)
-            removed_names.push_back(part->name);
-        auto prepared = target.upsert_store->preparePartition(std::move(imported.records), imported.rows, removed_names, reset, detached, partitions);
         NameSet accepted;
-        for (const auto & record : prepared.added_parts)
-            accepted.insert(record.final_name);
-        DataPartsVector added;
-        for (const auto & temporary : imported.temporary)
-            if (accepted.contains(temporary->part->name))
-                added.push_back(temporary->part);
-        auto read_snapshot = target.prepareUpsertReadSnapshot(prepared.snapshot, nullptr, removed, lock, added);
-        bool persist_started = false;
-        try
         {
-            MutableDataPartsVector accepted_parts;
+            /// Never hold another table's schema lock while waiting for this one: an insert can visit both through a view.
+            auto schema_lock = target.tryLockTimed(target.upsert_schema_lock, RWLockImpl::Write,
+                query_context->getCurrentQueryId(), settings[Setting::lock_acquire_timeout]);
+            std::lock_guard ttl_lock(target.upsert_ttl_mutex);
+            std::vector<String> reset;
+            const auto current_snapshot = target.getUpsertReadSnapshotForQuery();
+            for (const auto & partition : partitions)
+                if (!removal_snapshot || current_snapshot->visibility->getPartitionCSN(partition)
+                    == removal_snapshot->visibility->getPartitionCSN(partition))
+                    reset.push_back(partition);
+            std::vector<std::unique_ptr<PlainCommittingBlockHolder>> block_holders;
+            auto lock = target.lockParts();
+            if (target.upsert_fenced)
+                throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree is fenced pending restart and recovery");
+            for (size_t i = 0; i < imported.temporary.size(); ++i)
+            {
+                block_holders.push_back(target.fillNewPartName(imported.temporary[i]->part, lock));
+                imported.records[i].final_name = imported.temporary[i]->part->name;
+            }
+            std::vector<String> removed_names;
+            for (const auto & part : removed)
+                removed_names.push_back(part->name);
+            auto prepared = target.upsert_store->preparePartition(std::move(imported.records), imported.rows, removed_names, reset, detached, partitions);
+
+            for (const auto & record : prepared.added_parts)
+                accepted.insert(record.final_name);
+            DataPartsVector added;
             for (const auto & temporary : imported.temporary)
                 if (accepted.contains(temporary->part->name))
-                    accepted_parts.push_back(temporary->part);
-            target.commitUpsertParts(accepted_parts, [&]()
+                    added.push_back(temporary->part);
+            auto read_snapshot = target.prepareUpsertReadSnapshot(prepared.snapshot, nullptr, removed, lock, added);
+            bool persist_started = false;
+            try
             {
-                persist_started = true;
-                target.upsert_store->append(prepared);
-            }, lock);
-            target.removePartsFromWorkingSet(nullptr, removed, true, lock);
-            target.upsert_store->publish(prepared);
-            retired_snapshot = target.publishUpsertReadSnapshot(std::move(read_snapshot));
-            target.notifyUpsertMaintenance();
-            target.upsert_maintenance_cursor.reset();
-        }
-        catch (...)
-        {
-            if (!persist_started && !target.upsert_fenced)
+                MutableDataPartsVector accepted_parts;
+                for (const auto & temporary : imported.temporary)
+                    if (accepted.contains(temporary->part->name))
+                        accepted_parts.push_back(temporary->part);
+                target.commitUpsertParts(accepted_parts, [&]()
+                {
+                    persist_started = true;
+                    target.upsert_store->append(prepared);
+                }, lock);
+                target.removePartsFromWorkingSet(nullptr, removed, true, lock);
+                target.upsert_store->publish(prepared);
+                retired_snapshot = target.publishUpsertReadSnapshot(std::move(read_snapshot));
+                target.notifyUpsertMaintenance();
+                target.upsert_maintenance_cursor.reset();
+                for (const auto & retired : removed)
+                    target.upsert_saturated_parts.erase(retired->name);
+            }
+            catch (...)
+            {
+                if (!persist_started && !target.upsert_fenced)
+                    throw;
+                for (auto & temporary : imported.temporary)
+                    if (accepted.contains(temporary->part->name))
+                        temporary->part->is_temp = false;
+                target.upsert_fenced = true;
                 throw;
-            for (auto & temporary : imported.temporary)
-                if (accepted.contains(temporary->part->name))
-                    temporary->part->is_temp = false;
-            target.upsert_fenced = true;
-            throw;
+            }
+            if (target.upsert_maintenance_task)
+                target.upsert_maintenance_task->schedule();
         }
-        if (target.upsert_maintenance_task)
-            target.upsert_maintenance_task->schedule();
+        for (const auto & temporary : imported.temporary)
+            if (accepted.contains(temporary->part->name))
+                target.prewarmUpsertPartCaches(*temporary);
     };
 
     PartitionCommandsResultInfo results;
