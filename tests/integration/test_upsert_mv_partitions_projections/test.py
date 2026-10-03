@@ -1,4 +1,5 @@
 import json
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -238,12 +239,18 @@ def test_attach_recovery():
             if not committed:
                 node.query("ALTER TABLE attach_recover ATTACH PARTITION 1")
             assert node.query("SELECT value FROM attach_recover") == "one\n"
-            assert (
-                node.query(
-                    "SELECT count() FROM system.detached_parts WHERE table='attach_recover'"
-                )
-                == "0\n"
+            # Successful `ATTACH` schedules cleanup after publication.
+            detached_query = (
+                "SELECT name,reason FROM system.detached_parts "
+                "WHERE database=currentDatabase() AND table='attach_recover' ORDER BY name"
             )
+            deadline = time.monotonic() + 60
+            while True:
+                detached = node.query(detached_query)
+                if not detached:
+                    break
+                assert time.monotonic() < deadline, detached
+                time.sleep(0.1)
         finally:
             node.query(f"SYSTEM DISABLE FAILPOINT {point}")
             drop("attach_recover")

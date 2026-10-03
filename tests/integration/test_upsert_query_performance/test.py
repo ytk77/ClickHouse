@@ -40,6 +40,41 @@ def create(name, extra=""):
     )
 
 
+def test_background_rewrite_evaluates_defaults_and_conditional_ttl():
+    for wide_part_threshold in (0, 10000000):
+        name = "query_rewrite_context"
+        node.query(
+            f"""CREATE TABLE {name} (id UInt64, expires DateTime, category UInt8)
+            ENGINE=UpsertMergeTree ORDER BY id UNIQUE KEY id
+            TTL expires DELETE WHERE category=1
+            SETTINGS min_bytes_for_wide_part={wide_part_threshold}, min_rows_for_wide_part=0"""
+        )
+        try:
+            node.query(f"SYSTEM STOP MERGES {name}")
+            node.query(
+                f"INSERT INTO {name} VALUES (1,1,1),(2,1,2)",
+                settings={"log_queries": 1},
+            )
+            node.query(
+                f"INSERT INTO {name} VALUES (3,4102444800,1),(4,1,2)",
+                settings={"log_queries": 1},
+            )
+            node.query(f"""ALTER TABLE {name}
+                ADD COLUMN s Nullable(String) DEFAULT if(id%2=0,NULL,toString(id+1)),
+                ADD COLUMN m UInt64 MATERIALIZED id*10""")
+            node.query(f"SYSTEM START MERGES {name}")
+            wait_for(f"SELECT count() FROM {name}", lambda x: x == "3")
+            wait_for(
+                f"SELECT count() FROM system.parts WHERE active AND database=currentDatabase() AND table='{name}'",
+                lambda x: x == "1",
+            )
+            assert node.query(f"SELECT id,s,m FROM {name} ORDER BY id") == (
+                "2\t\\N\t20\n3\t4\t30\n4\t\\N\t40\n"
+            )
+        finally:
+            node.query(f"DROP TABLE {name} SYNC")
+
+
 def test_target_settings_persist_and_reject_invalid_values():
     assert (
         node.query(

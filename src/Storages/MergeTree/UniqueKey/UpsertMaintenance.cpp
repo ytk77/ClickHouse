@@ -666,7 +666,10 @@ void StorageMergeTree::runUpsertMaintenance()
             upsert_maintenance_schedule.admissionSucceeded();
             phase = "rewriting source parts";
             diagnostic_part = sources.front();
-            auto thread_group = ThreadGroup::createForMergeMutate(getContext());
+            /// Give factory usage tracking and `DEFAULT`/`TTL` expressions a query context owned by this merge.
+            auto rewrite_context = Context::createCopy(getContext()->getBackgroundContext());
+            rewrite_context->makeQueryContextForMerge(*getSettings());
+            auto thread_group = ThreadGroup::createForMergeMutate(rewrite_context);
             thread_group->memory_tracker.setMetric(CurrentMetrics::UpsertMaintenanceMemoryTracking);
             SCOPE_EXIT({
                 ProfileEvents::increment(ProfileEvents::UpsertMaintenancePeakMemoryBytes, thread_group->memory_tracker.getPeak());
@@ -675,7 +678,7 @@ void StorageMergeTree::runUpsertMaintenance()
             });
             ThreadGroupSwitcher switcher(thread_group, ThreadName::MERGE_MUTATE, /*allow_existing_group=*/true);
             ProfileEvents::increment(ProfileEvents::UpsertMaintenanceRewritesStarted);
-            did_work = rewriteUpsertParts(sources, metadata, getContext(), apply_ttl, {}, max_source_bytes, true);
+            did_work = rewriteUpsertParts(sources, metadata, rewrite_context, apply_ttl, {}, max_source_bytes, true);
             if (did_work)
                 upsert_maintenance_schedule.rewriteSucceeded();
         }
