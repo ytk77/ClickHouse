@@ -2859,13 +2859,8 @@ ReadFromMergeTree::AnalysisResultPtr ReadFromMergeTree::selectRangesToRead(
 
     if (upsert_snapshot)
     {
+        /// Recovered payloads use native read checksums and the background sweep; destructive uses verify fully.
         upsert_snapshot->checkVerification();
-        /// Partition metadata is authenticated at open; verify selected payloads before index or column reads.
-        for (const auto & range : res_parts)
-        {
-            const auto * part = range.data_part->isProjectionPart() ? range.data_part->getParentPart() : range.data_part.get();
-            upsert_snapshot->verifyPart(part->name, part->getDeleteBitmapCacheIdentity());
-        }
     }
 
     res_parts = MergeTreeDataSelectExecutor::filterPartsByStatistics(

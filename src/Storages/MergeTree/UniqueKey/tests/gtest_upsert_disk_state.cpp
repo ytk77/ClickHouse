@@ -11,6 +11,12 @@
 #include <Storages/MergeTree/UniqueKey/UpsertMetrics.h>
 #include <Common/ProfileEvents.h>
 
+namespace DB::ErrorCodes
+{
+extern const int CANNOT_OPEN_FILE;
+extern const int CORRUPTED_DATA;
+}
+
 #if USE_ROCKSDB
 #include <rocksdb/db.h>
 #include <rocksdb/write_batch.h>
@@ -34,7 +40,7 @@ protected:
         std::filesystem::remove_all(directory);
     }
     StateStore::Prepared prepare(StateStore & store, const std::vector<std::pair<String, UInt64>> & values,
-        const String & partition = "p", Token token = {})
+        const String & partition = "p", Token token = {}, bool with_column_payload = false)
     {
         const auto id = newObjectID();
         PartRows rows;
@@ -51,6 +57,8 @@ protected:
         const auto path = directory / part.temporary_name;
         std::filesystem::create_directory(path);
         createDurableFile(path / ROWS_FILE, encodePartRows(rows));
+        if (with_column_payload)
+            createDurableFile(path / "data.bin", "original");
         part.files_hash = hashPartDirectory(path, true, &part.files_inventory);
         return store.prepare(partition, std::move(part), rows);
     }
@@ -945,7 +953,16 @@ TEST_F(UpsertDiskStateTest, InventoryCorruptionCannotAuthorizeMetadata)
     std::unique_ptr<rocksdb::DB> database(raw);
     ASSERT_TRUE(database->Put(rocksdb::WriteOptions{}, "V" + identity, "forged").ok());
     database.reset();
-    EXPECT_THROW((StateStore(directory, incarnation, true, true)), Exception);
+    try
+    {
+        StateStore reopened(directory, incarnation, true, true);
+        FAIL() << "Expected committed inventory hash rejection";
+    }
+    catch (const Exception & error)
+    {
+        EXPECT_EQ(error.code(), ErrorCodes::CORRUPTED_DATA);
+        EXPECT_NE(error.message().find("authenticated inventory or metadata mismatch"), String::npos);
+    }
 }
 
 TEST_F(UpsertDiskStateTest, LegacyInventoryIsEstablishedOnlyAfterFullVerification)
@@ -968,6 +985,7 @@ TEST_F(UpsertDiskStateTest, LegacyInventoryIsEstablishedOnlyAfterFullVerificatio
     {
         StateStore reopened(directory, incarnation, true, true);
         EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::UpsertRecoveryParts] - full_before, 1);
+        EXPECT_EQ(reopened.loadPartRows(name).size(), 1);
         EXPECT_NO_THROW(reopened.snapshot()->verifyPart(name, identity));
     }
     const auto metadata_before = ProfileEvents::global_counters[ProfileEvents::UpsertRecoveryMetadataParts];
@@ -1065,6 +1083,113 @@ TEST_F(UpsertDiskStateTest, OldSnapshotVerifiesItsPayloadAfterRetirement)
     reopened.append(truncated);
     reopened.publish(truncated);
     EXPECT_NO_THROW(old->verifyPart(source, identity));
+}
+
+TEST_F(UpsertDiskStateTest, NewPartLineageMustMatchItsCommitDespiteValidCRC)
+{
+    StateStore store(directory, incarnation, false, true);
+    auto prepared = prepare(store, {{"key", 10}});
+    const auto name = prepared.record.final_name;
+    const auto path = directory / name / ROWS_FILE;
+    commit(store, prepared);
+    auto rows = decodePartRows(readBoundedFile(path, MAX_RECORD_BYTES));
+    rows.front().key = "bad";
+    const auto bytes = encodePartRows(rows);
+    ASSERT_EQ(bytes.size(), std::filesystem::file_size(path));
+    ASSERT_NO_THROW(decodePartRows(bytes));
+    std::filesystem::remove(path);
+    createDurableFile(path, bytes);
+    try
+    {
+        store.loadPartRows(name);
+        FAIL() << "Expected committed lineage hash rejection";
+    }
+    catch (const Exception & error)
+    {
+        EXPECT_EQ(error.code(), ErrorCodes::CORRUPTED_DATA);
+        EXPECT_NE(error.message().find("authenticated sidecar mismatch"), String::npos);
+    }
+    EXPECT_THROW(store.snapshot()->checkVerification(), Exception);
+    EXPECT_THROW(store.checkAdmission(), Exception);
+}
+
+TEST_F(UpsertDiskStateTest, PreviouslyVerifiedLineageIsAuthenticatedAgainAtUse)
+{
+    String name;
+    String identity;
+    {
+        StateStore store(directory, incarnation, false, true);
+        auto prepared = prepare(store, {{"key", 10}});
+        name = prepared.record.final_name;
+        identity = objectName(prepared.record.part);
+        commit(store, prepared);
+    }
+    StateStore reopened(directory, incarnation, true, true);
+    reopened.snapshot()->verifyPart(name, identity);
+    const auto path = directory / name / ROWS_FILE;
+    auto rows = decodePartRows(readBoundedFile(path, MAX_RECORD_BYTES));
+    rows.front().value.row.version = 20;
+    const auto bytes = encodePartRows(rows);
+    ASSERT_EQ(bytes.size(), std::filesystem::file_size(path));
+    ASSERT_NO_THROW(decodePartRows(bytes));
+    std::filesystem::remove(path);
+    createDurableFile(path, bytes);
+    try
+    {
+        reopened.loadPartRows(name);
+        FAIL() << "Expected committed lineage hash rejection";
+    }
+    catch (const Exception & error)
+    {
+        EXPECT_EQ(error.code(), ErrorCodes::CORRUPTED_DATA);
+        EXPECT_NE(error.message().find("authenticated sidecar mismatch"), String::npos);
+    }
+    EXPECT_THROW(reopened.snapshot()->checkVerification(), Exception);
+}
+
+TEST_F(UpsertDiskStateTest, LineageReadDoesNotScanUnrelatedPayloadOrCompleteRecovery)
+{
+    String name;
+    String identity;
+    {
+        StateStore store(directory, incarnation, false, true);
+        auto prepared = prepare(store, {{"key", 10}}, "p", {}, true);
+        name = prepared.record.final_name;
+        identity = objectName(prepared.record.part);
+        commit(store, prepared);
+    }
+    StateStore reopened(directory, incarnation, true, true);
+    const auto path = directory / name / "data.bin";
+    std::filesystem::remove(path);
+    createDurableFile(path, "modified");
+    const auto before = ProfileEvents::global_counters[ProfileEvents::UpsertPayloadVerificationParts];
+    EXPECT_EQ(reopened.loadPartRows(name).size(), 1);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::UpsertPayloadVerificationParts], before);
+    EXPECT_NO_THROW(reopened.snapshot()->checkVerification());
+    EXPECT_THROW(reopened.snapshot()->verifyPart(name, identity, true), Exception);
+}
+
+TEST_F(UpsertDiskStateTest, LineageOpenErrorPropagatesWithoutFencing)
+{
+    StateStore store(directory, incarnation, false, true);
+    auto prepared = prepare(store, {{"key", 10}});
+    const auto name = prepared.record.final_name;
+    commit(store, prepared);
+    const auto path = directory / name / ROWS_FILE;
+    const auto saved = directory / "saved_rows.bin";
+    std::filesystem::rename(path, saved);
+    try
+    {
+        store.loadPartRows(name);
+        FAIL() << "Expected sidecar open exception";
+    }
+    catch (const Exception & error)
+    {
+        EXPECT_EQ(error.code(), ErrorCodes::CANNOT_OPEN_FILE);
+    }
+    EXPECT_NO_THROW(store.snapshot()->checkVerification());
+    std::filesystem::rename(saved, path);
+    EXPECT_EQ(store.loadPartRows(name).size(), 1);
 }
 
 #endif

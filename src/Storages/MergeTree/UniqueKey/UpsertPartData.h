@@ -79,5 +79,7 @@ void writePartIndex(
 ObjectID hashPartDirectory(const String & path, bool sync_files, String * inventory = nullptr);
 /// Authenticate the inventory, names, sizes and planner metadata without reading column payloads.
 void verifyPartMetadata(const String & path, ObjectID expected, const String & inventory);
+/// Read bounded sidecar bytes and authenticate exactly those bytes against a previously authenticated inventory.
+String readInventoryFile(const String & part_path, const String & relative, const String & inventory, size_t max_bytes);
 }
 }

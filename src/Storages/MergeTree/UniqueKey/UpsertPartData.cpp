@@ -354,6 +354,7 @@ void writePartIndex(
         writer.addUpsertEncoded(rows[row].key, encodeIndexValue(rows[row].value));
     writer.finalizeToStorage();
 
+    /// `UpsertMergeTree` uses the state database for winner lookups; any future `SST` reader must authenticate its inventory entry.
     ReadBufferFromFile sst(std::filesystem::path(storage.getFullPath()) / SSTIndexWriter::FILE_NAME);
     HashingReadBuffer sst_hash(sst);
     sst_hash.ignoreAll();
@@ -362,24 +363,29 @@ void writePartIndex(
 
 namespace
 {
+using InventoryFiles = std::map<String, std::pair<UInt64, ObjectID>>;
+
+InventoryFiles parseInventoryFiles(const String & inventory)
+{
+    InventoryFiles files;
+    BinaryReader in{inventory};
+    while (!in.bytes.empty())
+    {
+        const auto name = in.string();
+        if (name.ends_with('/'))
+            continue;
+        const auto size = in.number();
+        const auto digest = in.id();
+        if (!files.emplace(name, std::make_pair(size, digest)).second)
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "Duplicate UpsertMergeTree inventory entry");
+    }
+    return files;
+}
+
 ObjectID hashPartDirectoryImpl(const String & path, bool sync_files, String * result_inventory, const String * trusted_inventory)
 {
     namespace fs = std::filesystem;
-    std::map<String, std::pair<UInt64, ObjectID>> expected_files;
-    if (trusted_inventory)
-    {
-        BinaryReader in{*trusted_inventory};
-        while (!in.bytes.empty())
-        {
-            const auto name = in.string();
-            if (name.ends_with('/'))
-                continue;
-            const auto size = in.number();
-            const auto digest = in.id();
-            if (!expected_files.emplace(name, std::make_pair(size, digest)).second)
-                throw Exception(ErrorCodes::CORRUPTED_DATA, "Duplicate UpsertMergeTree inventory entry");
-        }
-    }
+    const auto expected_files = trusted_inventory ? parseInventoryFiles(*trusted_inventory) : InventoryFiles{};
     if (fs::is_symlink(path) || !fs::is_directory(path))
         throw Exception(ErrorCodes::CORRUPTED_DATA, "Invalid UpsertMergeTree part directory {}", path);
     std::vector<fs::path> files;
@@ -478,5 +484,18 @@ void verifyPartMetadata(const String & path, ObjectID expected, const String & i
     if (inventory.empty() || inventory.size() > MAX_RECORD_BYTES || hashLogRecord(inventory) != expected
         || hashPartDirectoryImpl(path, false, nullptr, &inventory) != expected)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree authenticated inventory or metadata mismatch for {}", path);
+}
+
+String readInventoryFile(const String & part_path, const String & relative, const String & inventory, size_t max_bytes)
+{
+    const auto files = parseInventoryFiles(inventory);
+    const auto expected = files.find(relative);
+    if (expected == files.end())
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree inventory lacks sidecar {}", relative);
+    auto bytes = readBoundedFile(std::filesystem::path(part_path) / relative, max_bytes);
+    /// `hashLogRecord` uses the same `SipHash` digest as the complete part inventory.
+    if (bytes.size() != expected->second.first || hashLogRecord(bytes) != expected->second.second)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree authenticated sidecar mismatch for {}", relative);
+    return bytes;
 }
 }

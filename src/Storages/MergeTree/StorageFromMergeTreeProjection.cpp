@@ -48,7 +48,7 @@ void StorageFromMergeTreeProjection::read(
         if (merge_tree.merging_params.upsert)
         {
             if (snapshot_data.upsert_snapshot)
-                snapshot_data.upsert_snapshot->verifyPart(part.data_part->name, part.data_part->getDeleteBitmapCacheIdentity());
+                snapshot_data.upsert_snapshot->checkVerification();
             const auto mask = snapshot_data.upsert_snapshot
                 ? snapshot_data.upsert_snapshot->getMask(part.data_part->getDeleteBitmapCacheIdentity()) : nullptr;
             if (!mask || !mask->empty())

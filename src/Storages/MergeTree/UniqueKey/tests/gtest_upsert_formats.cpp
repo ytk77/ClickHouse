@@ -12,6 +12,11 @@
 #include <limits>
 #include <filesystem>
 
+namespace DB::ErrorCodes
+{
+extern const int CORRUPTED_DATA;
+}
+
 using namespace DB;
 using namespace DB::Upsert;
 
@@ -401,4 +406,38 @@ TEST(UpsertPartInventory, RejectsMissingTruncatedAndAdditionalFiles)
     EXPECT_THROW(verifyPartMetadata(directory, digest, inventory), Exception);
     std::filesystem::remove(directory / "extra.bin");
     EXPECT_THROW(verifyPartMetadata(directory, digest, inventory + "x"), Exception);
+}
+
+TEST(UpsertPartInventory, SidecarReadMatchesCommittedBytesAndRequiresInventoryEntry)
+{
+    const auto directory = std::filesystem::path("tmp") / ("upsert_inventory_" + objectName(newObjectID()));
+    std::filesystem::create_directories(directory);
+    SCOPE_EXIT({ std::filesystem::remove_all(directory); });
+    createDurableFile(directory / ROWS_FILE, "original");
+    String inventory;
+    hashPartDirectory(directory, true, &inventory);
+    EXPECT_EQ(readInventoryFile(directory, ROWS_FILE, inventory, MAX_RECORD_BYTES), "original");
+    try
+    {
+        readInventoryFile(directory, "missing.bin", inventory, MAX_RECORD_BYTES);
+        FAIL() << "Expected missing inventory entry rejection";
+    }
+    catch (const Exception & error)
+    {
+        EXPECT_EQ(error.code(), ErrorCodes::CORRUPTED_DATA);
+        EXPECT_NE(error.message().find("inventory lacks sidecar"), String::npos);
+    }
+    EXPECT_THROW(readInventoryFile(directory, ROWS_FILE, "", MAX_RECORD_BYTES), Exception);
+    std::filesystem::remove(directory / ROWS_FILE);
+    createDurableFile(directory / ROWS_FILE, "modified");
+    try
+    {
+        readInventoryFile(directory, ROWS_FILE, inventory, MAX_RECORD_BYTES);
+        FAIL() << "Expected committed sidecar hash rejection";
+    }
+    catch (const Exception & error)
+    {
+        EXPECT_EQ(error.code(), ErrorCodes::CORRUPTED_DATA);
+        EXPECT_NE(error.message().find("authenticated sidecar mismatch"), String::npos);
+    }
 }

@@ -55,6 +55,7 @@ extern const char upsert_log_throw_after_sync[];
 extern const char upsert_log_throw_after_append[];
 extern const char upsert_pause_before_state_write[];
 extern const char upsert_pause_after_state_sync[];
+extern const char upsert_pause_payload_verification[];
 }
 
 namespace DB::Upsert
@@ -230,6 +231,7 @@ struct Database
             const auto record = decodePartCommit(*encoded);
             if (objectName(record.part) != identity)
                 throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree verification identity mismatch for {}", name);
+            FailPointInjection::pauseFailPoint(FailPoints::upsert_pause_payload_verification);
             ProfileEventTimeIncrement<Microseconds> timer(ProfileEvents::UpsertPayloadVerificationMicroseconds);
             if (hashPartDirectory(std::filesystem::path(table_path) / name, false) != record.files_hash)
                 throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree authenticated files mismatch for {}", name);
@@ -780,22 +782,37 @@ void DiskState::close()
 
 PartRows DiskState::loadPartRows(const String & name) const
 {
-    auto value = impl->database->get("A" + name);
-    if (!value)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree maintenance source is not authorized");
-    const auto record = decodePartCommit(*value);
-    impl->current->verifyPart(name, objectName(record.part));
-    auto rows = decodePartRows(readBoundedFile(std::filesystem::path(impl->table_path) / name / ROWS_FILE, MAX_RECORD_BYTES));
-    if (rows.size() != record.rows)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree maintenance source row count mismatch");
-    const auto csn = impl->database->integer("O" + objectName(record.part));
-    for (auto & row : rows)
+    impl->database->checkVerification();
+    try
     {
-        if (row.value.row.self_binding && row.value.row.operation_id != record.part)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree maintenance source has invalid SELF lineage");
-        row.value.row = row.value.row.resolve(csn);
+        auto value = impl->database->get("A" + name);
+        if (!value)
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree maintenance source is not authorized");
+        const auto record = decodePartCommit(*value);
+        const auto inventory = impl->database->get("V" + objectName(record.part));
+        /// Commit, recovery and retirement maintain matching authorization and inventory records.
+        if (!inventory || hashLogRecord(*inventory) != record.files_hash)
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree maintenance source lacks its authenticated inventory");
+        /// Authenticate the bytes being decoded even for new or previously verified parts, without the sweep mutex.
+        auto rows = decodePartRows(readInventoryFile(std::filesystem::path(impl->table_path) / name, ROWS_FILE, *inventory, MAX_RECORD_BYTES));
+        if (rows.size() != record.rows)
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree maintenance source row count mismatch");
+        const auto csn = impl->database->integer("O" + objectName(record.part));
+        for (auto & row : rows)
+        {
+            if (row.value.row.self_binding && row.value.row.operation_id != record.part)
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree maintenance source has invalid SELF lineage");
+            row.value.row = row.value.row.resolve(csn);
+        }
+        impl->database->checkVerification();
+        return rows;
     }
-    return rows;
+    catch (const Exception & error)
+    {
+        if (error.code() == ErrorCodes::CORRUPTED_DATA)
+            impl->database->verification_failed = true;
+        throw;
+    }
 }
 
 void DiskState::pruneRetired()
