@@ -390,6 +390,13 @@ StateStore::Prepared StateStore::prepareTruncate()
     return disk->prepareTruncate();
 }
 
+void StateStore::finishTruncate()
+{
+    if (!disk)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Legacy UpsertMergeTree does not authorize truncation");
+    disk->finishTruncate();
+}
+
 StateStore::Prepared StateStore::preparePartition(
     std::vector<PartCommit> additions, const std::vector<ValidatedPartRows> & rows,
     const std::vector<String> & removed, const std::vector<String> & reset_partitions, const std::vector<String> & detached,

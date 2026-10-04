@@ -56,6 +56,7 @@ extern const char upsert_log_throw_after_append[];
 extern const char upsert_pause_before_state_write[];
 extern const char upsert_pause_after_state_sync[];
 extern const char upsert_pause_payload_verification[];
+extern const char upsert_pause_before_truncate_compaction[];
 }
 
 namespace DB::Upsert
@@ -162,6 +163,7 @@ struct RecoveredPayload
 };
 
 constexpr auto recovery_retired_directory = "upsert_recovery_retired";
+constexpr auto truncate_compaction_key = "truncate_compaction_pending";
 
 void putInventory(rocksdb::WriteBatch & batch, const PartCommit & part)
 {
@@ -765,6 +767,8 @@ DiskState::DiskState(const String & table_path, ObjectID incarnation, bool attac
     }
     if (impl->database->get("identity") != identity)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree disk state incarnation or protocol mismatch");
+    /// Finish interrupted truncation before publishing snapshots or admitting new writes.
+    finishTruncate();
     impl->recover();
 }
 
@@ -1295,10 +1299,39 @@ StateStore::Prepared DiskState::prepareTruncate()
         check(batch.DeleteRange(String(1, space), String(1, space + 1)));
     batch.Put("part_count", number(0));
     batch.Put("retry_bytes", number(0));
+    /// Keep cleanup restartable even if the process stops after the atomic truncation batch.
+    batch.Put(truncate_compaction_key, number(1));
     checkBatchBudget(batch);
     result.disk->masks = std::make_shared<DiskMaskSnapshot>(impl->database);
     result.snapshot = impl->newSnapshot(result.disk->masks);
     return result;
+}
+
+void DiskState::finishTruncate()
+{
+    impl->database->checkVerification();
+    const auto pending = impl->database->get(truncate_compaction_key);
+    if (!pending)
+        return;
+    if (*pending != number(1))
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree invalid truncate compaction marker");
+
+    FailPointInjection::pauseFailPoint(FailPoints::upsert_pause_before_truncate_compaction);
+    ProfileEventTimeIncrement<Microseconds> timer(ProfileEvents::UpsertTruncateCompactionMicroseconds);
+    /// `DeleteRange` only hides old keys. Drain their compaction debt before the next bulk load.
+    /// `CompactRange` retains versions needed by pinned readers; never delete their files directly.
+    rocksdb::CompactRangeOptions options;
+    options.exclusive_manual_compaction = true;
+    options.bottommost_level_compaction = rocksdb::BottommostLevelCompaction::kForceOptimized;
+    options.allow_write_stall = true;
+    {
+        MemoryTrackerBlockerInThread blocker(VariableContext::User);
+        check(impl->database->db->CompactRange(options, nullptr, nullptr));
+    }
+    rocksdb::WriteBatch batch;
+    batch.Delete(truncate_compaction_key);
+    impl->database->write(batch);
+    ProfileEvents::increment(ProfileEvents::UpsertTruncateCompactions);
 }
 
 StateStore::Prepared DiskState::preparePartition(
@@ -1651,6 +1684,10 @@ StateStore::Prepared DiskState::prepareMerge(const String &, PartCommit, const P
     std::unreachable();
 }
 StateStore::Prepared DiskState::prepareTruncate()
+{
+    std::unreachable();
+}
+void DiskState::finishTruncate()
 {
     std::unreachable();
 }

@@ -107,6 +107,8 @@
     M(UpsertStateWriteMicroseconds, "Time spent synchronously persisting `UpsertMergeTree` state batches.", ValueType::Microseconds) \
     M(UpsertStateWriteBytes, "Bytes in durable `UpsertMergeTree` state batches.", ValueType::Bytes) \
     M(UpsertStateWrites, "Number of durable `UpsertMergeTree` state batches.", ValueType::Number) \
+    M(UpsertTruncateCompactions, "Number of completed `UpsertMergeTree` state compactions after truncation, including recovery.", ValueType::Number) \
+    M(UpsertTruncateCompactionMicroseconds, "Time spent compacting `UpsertMergeTree` state after truncation, including recovery.", ValueType::Microseconds) \
     M(UpsertCommitLockWaitMicroseconds, "Time waiting for the `UpsertMergeTree` insert commit lock.", ValueType::Microseconds) \
     M(UpsertCommitLockHoldMicroseconds, "Time holding the `UpsertMergeTree` insert commit lock.", ValueType::Microseconds) \
     M(UpsertSnapshotBuildMicroseconds, "Time spent constructing `UpsertMergeTree` read snapshots.", ValueType::Microseconds) \

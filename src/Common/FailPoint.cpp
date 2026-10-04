@@ -37,6 +37,7 @@ static struct InitFiu
     ONCE(upsert_log_throw_after_sync) \
     PAUSEABLE(upsert_pause_background_verification) \
     PAUSEABLE(upsert_pause_payload_verification) \
+    PAUSEABLE(upsert_pause_before_truncate_compaction) \
     PAUSEABLE_ONCE(upsert_pause_before_state_write) \
     PAUSEABLE_ONCE(upsert_pause_after_state_sync) \
     ONCE(upsert_throw_after_rename) \

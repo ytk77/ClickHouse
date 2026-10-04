@@ -46,7 +46,7 @@ String encodePartCommit(const PartCommit & record);
 PartCommit decodePartCommit(std::string_view bytes);
 
 /// Protocol dispatch for legacy parts-only state and disk-backed state with atomic retirement.
-/// Public operations require the table's parts lock, except recovery before publication.
+/// Public operations require the table's parts lock, except recovery and the serialized `finishTruncate` cleanup.
 class StateStore
 {
     struct Winner
@@ -108,6 +108,8 @@ public:
         const String & partition, PartCommit part, const PartRows & rows, const std::vector<String> & sources,
         const PartRows & expired = {}, bool retire_sources = true, const MergeInput * input = nullptr);
     Prepared prepareTruncate();
+    /// Requires writer exclusion, but must run outside the parts lock after publication.
+    void finishTruncate();
     Prepared preparePartition(
         std::vector<PartCommit> additions, const std::vector<ValidatedPartRows> & rows,
         const std::vector<String> & removed, const std::vector<String> & reset_partitions, const std::vector<String> & detached,

@@ -730,6 +730,145 @@ TEST_F(UpsertDiskStateTest, MaskCacheKeepsPinnedVersionsAcrossOverwriteAndTrunca
     EXPECT_TRUE(old->getMask(id)->empty());
 }
 
+TEST_F(UpsertDiskStateTest, TruncateCompactionReclaimsUnpinnedStateBeforeReload)
+{
+    const auto before = ProfileEvents::global_counters[ProfileEvents::UpsertTruncateCompactions];
+    {
+        StateStore store(directory, incarnation, false, true);
+        std::vector<std::pair<String, UInt64>> values;
+        for (size_t i = 0; i < 20000; ++i)
+            values.emplace_back("key" + std::to_string(i), 10);
+        auto part = prepare(store, values);
+        commit(store, part);
+    }
+    {
+        rocksdb::DB * raw = nullptr;
+        ASSERT_TRUE(rocksdb::DB::Open(rocksdb::Options{}, (directory / "upsert_state_v2").string(), &raw).ok());
+        std::unique_ptr<rocksdb::DB> database(raw);
+        /// Establish actual old SSTs, so cleanup cannot pass by dropping only memtable entries.
+        ASSERT_TRUE(database->Flush(rocksdb::FlushOptions{}).ok());
+        rocksdb::TablePropertiesCollection properties;
+        ASSERT_TRUE(database->GetPropertiesOfAllTables(&properties).ok());
+        UInt64 entries = 0;
+        for (const auto & [name, table] : properties)
+            entries += table->num_entries;
+        ASSERT_GE(entries, 20000);
+    }
+    {
+        StateStore store(directory, incarnation, true, true);
+        {
+            auto truncated = store.prepareTruncate();
+            store.append(truncated);
+            store.publish(truncated);
+        }
+        store.finishTruncate();
+        EXPECT_EQ(store.authorizedPartCount(), 0);
+        EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::UpsertTruncateCompactions] - before, 1);
+        store.finishTruncate();
+        EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::UpsertTruncateCompactions] - before, 1);
+    }
+    {
+        rocksdb::DB * raw = nullptr;
+        ASSERT_TRUE(rocksdb::DB::Open(rocksdb::Options{}, (directory / "upsert_state_v2").string(), &raw).ok());
+        std::unique_ptr<rocksdb::DB> database(raw);
+        rocksdb::TablePropertiesCollection properties;
+        ASSERT_TRUE(database->GetPropertiesOfAllTables(&properties).ok());
+        UInt64 entries = 0;
+        for (const auto & [name, table] : properties)
+            entries += table->num_entries;
+        /// Only catalog metadata, the retirement record and range boundaries remain in the SSTs.
+        EXPECT_LT(entries, 64);
+        String value;
+        EXPECT_TRUE(database->Get(rocksdb::ReadOptions{}, "truncate_compaction_pending", &value).IsNotFound());
+    }
+    StateStore reopened(directory, incarnation, true, true);
+    auto replacement = prepare(reopened, {{"key0", 1}});
+    ASSERT_TRUE(replacement.produces_part);
+    commit(reopened, replacement);
+    EXPECT_EQ(reopened.loadPartRows(replacement.record.final_name).size(), 1);
+}
+
+TEST_F(UpsertDiskStateTest, TruncateCompactionPreservesPinnedMasks)
+{
+    Resources resources;
+    resources.mask_cache_bytes = 0;
+    StateStore store(directory, incarnation, false, true, {}, resources);
+    String identity;
+    {
+        auto first = prepare(store, {{"key", 10}});
+        identity = objectName(first.record.part);
+        commit(store, first);
+    }
+    const auto original = store.snapshot();
+    {
+        auto second = prepare(store, {{"key", 20}});
+        commit(store, second);
+    }
+    const auto overwritten = store.snapshot();
+    {
+        auto truncated = store.prepareTruncate();
+        store.append(truncated);
+        store.publish(truncated);
+    }
+    store.finishTruncate();
+    ASSERT_TRUE(original->getMask(identity));
+    EXPECT_TRUE(original->getMask(identity)->empty());
+    ASSERT_TRUE(overwritten->getMask(identity));
+    EXPECT_TRUE(overwritten->getMask(identity)->contains(0));
+    EXPECT_FALSE(store.snapshot()->getMask(identity));
+    auto replacement = prepare(store, {{"key", 1}});
+    EXPECT_TRUE(replacement.produces_part);
+    commit(store, replacement);
+    EXPECT_TRUE(original->getMask(identity)->empty());
+    EXPECT_TRUE(overwritten->getMask(identity)->contains(0));
+}
+
+TEST_F(UpsertDiskStateTest, RecoveryFinishesDurableUnpublishedTruncateCompaction)
+{
+    {
+        StateStore store(directory, incarnation, false, true);
+        auto part = prepare(store, {{"key", 10}});
+        commit(store, part);
+        auto truncated = store.prepareTruncate();
+        store.append(truncated);
+        /// Simulate process loss after the durable batch, before publication and cleanup.
+    }
+    const auto before = ProfileEvents::global_counters[ProfileEvents::UpsertTruncateCompactions];
+    {
+        StateStore reopened(directory, incarnation, true, true);
+        EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::UpsertTruncateCompactions] - before, 1);
+        EXPECT_EQ(reopened.authorizedPartCount(), 0);
+        auto part = prepare(reopened, {{"key", 1}});
+        ASSERT_TRUE(part.produces_part);
+        commit(reopened, part);
+    }
+    StateStore reopened(directory, incarnation, true, true);
+    EXPECT_EQ(reopened.authorizedPartCount(), 1);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::UpsertTruncateCompactions] - before, 1);
+}
+
+TEST_F(UpsertDiskStateTest, InvalidTruncateCompactionMarkerFailsClosed)
+{
+    {
+        StateStore store(directory, incarnation, false, true);
+    }
+    rocksdb::DB * raw = nullptr;
+    ASSERT_TRUE(rocksdb::DB::Open(rocksdb::Options{}, (directory / "upsert_state_v2").string(), &raw).ok());
+    std::unique_ptr<rocksdb::DB> database(raw);
+    ASSERT_TRUE(database->Put(rocksdb::WriteOptions{}, "truncate_compaction_pending", "invalid").ok());
+    database.reset();
+    try
+    {
+        StateStore reopened(directory, incarnation, true, true);
+        FAIL() << "Expected malformed truncate compaction marker rejection";
+    }
+    catch (const Exception & error)
+    {
+        EXPECT_EQ(error.code(), ErrorCodes::CORRUPTED_DATA);
+        EXPECT_NE(error.message().find("invalid truncate compaction marker"), String::npos);
+    }
+}
+
 TEST_F(UpsertDiskStateTest, MaskCacheTracksPartialRelocationExpirationAndRetirement)
 {
     String source_id;

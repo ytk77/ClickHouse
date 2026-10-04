@@ -15,6 +15,8 @@ extern const Event UpsertStatePrepareMicroseconds;
 extern const Event UpsertStateWriteMicroseconds;
 extern const Event UpsertStateWriteBytes;
 extern const Event UpsertStateWrites;
+extern const Event UpsertTruncateCompactions;
+extern const Event UpsertTruncateCompactionMicroseconds;
 extern const Event UpsertCommitLockWaitMicroseconds;
 extern const Event UpsertCommitLockHoldMicroseconds;
 extern const Event UpsertSnapshotBuildMicroseconds;

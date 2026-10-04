@@ -143,7 +143,21 @@ masks and parts. The entire batch is checked against the state budget before com
 Once recovered payload verification permits reclamation, recovery or background cleanup removes retired payloads and synchronizes their containing directories before clearing their
 `R` records. This ordering also permits native part-name reuse after an empty table restarts,
 without leaving a stale retirement authorization that could conflict with a later insert.
-The disk-state format and table manifest are unchanged.
+
+After publication, `TRUNCATE` releases its own retired snapshot references and the parts lock,
+but retains writer exclusion while a synchronous `RocksDB` compaction reclaims obsolete index
+entries. This completes a cleanup pass before an immediate bulk reload. `TRUNCATE` can
+therefore take longer; the cleanup work is moved before new ingestion,
+not eliminated. Versions pinned by existing readers remain valid and can delay physical
+reclamation. Normal ingestion can still encounter compaction pressure.
+
+The truncation batch also persists `truncate_compaction_pending`. Cleanup forces bottom-level
+compaction and removes this marker synchronously only after success. A restart with the
+marker completes compaction before recovery publishes the table; failure propagates. A
+failure during live cleanup fences new writes until recovery. Ordinary opens without the
+marker do not trigger this compaction. The part format and table manifest are unchanged.
+`UpsertTruncateCompactions` and `UpsertTruncateCompactionMicroseconds` record completed
+cleanups and elapsed cleanup time, including recovery attempts.
 
 ### Why retain a 32-MiB internal unit {#disk-state-input-unit-budget}
 

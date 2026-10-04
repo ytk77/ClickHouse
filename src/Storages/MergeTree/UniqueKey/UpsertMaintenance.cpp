@@ -1183,11 +1183,11 @@ void StorageMergeTree::truncateUpsert(ContextPtr query_context)
     if (query_context->getCurrentTransaction())
         throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree does not support explicit transactions");
     std::lock_guard operation_lock(upsert_operation_mutex);
+    /// Keep new inserts excluded until the old state's compaction debt has been drained.
+    auto schema_lock = tryLockTimed(upsert_schema_lock, RWLockImpl::Write,
+        query_context->getCurrentQueryId(), query_context->getSettingsRef()[Setting::lock_acquire_timeout]);
     {
         UpsertReadSnapshotPtr retired_snapshot;
-        /// Wait for whole insert pipelines, including prepared parts and token admission checks.
-        auto schema_lock = tryLockTimed(upsert_schema_lock, RWLockImpl::Write,
-            query_context->getCurrentQueryId(), query_context->getSettingsRef()[Setting::lock_acquire_timeout]);
         std::lock_guard ttl_lock(upsert_ttl_mutex);
         auto lock = lockParts();
         if (upsert_fenced)
@@ -1220,6 +1220,18 @@ void StorageMergeTree::truncateUpsert(ContextPtr query_context)
             upsert_fenced = true;
             throw;
         }
+    }
+    try
+    {
+        /// Release local pre-truncate snapshots and the parts lock before the blocking compaction.
+        upsert_store->finishTruncate();
+    }
+    catch (...)
+    {
+        /// The logical truncation is durable; recovery must finish cleanup before accepting writes.
+        auto lock = lockParts();
+        upsert_fenced = true;
+        throw;
     }
     /// Existing readers keep their parts and masks pinned until they finish.
     clearOldPartsFromFilesystem(false, false);
