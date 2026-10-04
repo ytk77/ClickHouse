@@ -10,6 +10,7 @@
 #include <Common/FailPoint.h>
 #include <Common/logger_useful.h>
 #include <Common/CurrentMemoryTracker.h>
+#include <Common/MemoryTrackerBlockerInThread.h>
 #include <Common/threadPoolCallbackRunner.h>
 #include <deque>
 #include "config.h"
@@ -180,6 +181,18 @@ struct Database
     std::map<String, std::shared_ptr<RecoveredPayload>> recovered_payloads;
     std::atomic<size_t> pending_payloads{0};
     std::atomic<bool> verification_failed{false};
+
+    void write(rocksdb::WriteBatch & batch) const
+    {
+        /// The caller's `WriteBatch` and prepared payload remain charged to its query.
+        CurrentMemoryTracker::check();
+        rocksdb::WriteOptions options;
+        options.sync = true;
+        /// `RocksDB` owns memtables beyond this call and frees them on background threads.
+        /// Charge its internal allocations globally, avoiding cumulative query usage during `INSERT SELECT`.
+        MemoryTrackerBlockerInThread blocker(VariableContext::User);
+        check(db->Write(options, &batch));
+    }
 
     void checkVerification() const
     {
@@ -514,9 +527,9 @@ struct DiskState::Impl
                     throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree inventory mismatch for {}", record.final_name);
                 if (!inventory)
                 {
-                    rocksdb::WriteOptions write;
-                    write.sync = true;
-                    check(database->db->Put(write, inventory_key, authenticated_inventory));
+                    rocksdb::WriteBatch batch;
+                    batch.Put(inventory_key, authenticated_inventory);
+                    database->write(batch);
                 }
                 payload->verified = true;
                 ProfileEvents::increment(ProfileEvents::UpsertRecoveryParts);
@@ -624,9 +637,7 @@ struct DiskState::Impl
             /// Part names may be reused after restarting an empty table. Forget retirement only after durable deletion.
             rocksdb::WriteBatch batch;
             check(batch.DeleteRange("R", "S"));
-            rocksdb::WriteOptions write;
-            write.sync = true;
-            check(database->db->Write(write, &batch));
+            database->write(batch);
         }
         /// Consumed detached inputs are reclaimed only after their import is durable.
         bool consumed_detached = false;
@@ -653,9 +664,7 @@ struct DiskState::Impl
             syncDirectory(detached_path);
             rocksdb::WriteBatch batch;
             check(batch.DeleteRange("D", "E"));
-            rocksdb::WriteOptions write;
-            write.sync = true;
-            check(database->db->Write(write, &batch));
+            database->write(batch);
         }
         /// A preparation without a durable import remains available for another attachment attempt.
         if (fs::is_directory(detached_path))
@@ -748,9 +757,7 @@ DiskState::DiskState(const String & table_path, ObjectID incarnation, bool attac
         batch.Put("identity", identity);
         batch.Put("part_count", number(0));
         batch.Put("retry_bytes", number(0));
-        rocksdb::WriteOptions write;
-        write.sync = true;
-        check(database->Write(write, &batch));
+        impl->database->write(batch);
         syncDirectory(path);
         syncDirectory(table_path);
     }
@@ -876,9 +883,7 @@ void DiskState::pruneRetired()
         batch.Put("retry_bytes", number(retry_bytes));
         /// Deletion must survive a power loss before forgetting its durable authorization.
         syncDirectory(impl->table_path);
-        rocksdb::WriteOptions write;
-        write.sync = true;
-        check(impl->database->db->Write(write, &batch));
+        impl->database->write(batch);
     }
 }
 
@@ -1555,12 +1560,10 @@ void DiskState::append(const StateStore::Prepared & prepared)
     if (mask_updates.changes != prepared.disk->mask_changes)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree mask changes differ from the state batch");
 #endif
-    rocksdb::WriteOptions options;
-    options.sync = true;
     FailPointInjection::pauseFailPoint(FailPoints::upsert_pause_before_state_write);
     {
         ProfileEventTimeIncrement<Microseconds> timer(ProfileEvents::UpsertStateWriteMicroseconds);
-        check(impl->database->db->Write(options, &prepared.disk->batch));
+        impl->database->write(prepared.disk->batch);
         ProfileEvents::increment(ProfileEvents::UpsertStateWrites);
         ProfileEvents::increment(ProfileEvents::UpsertStateWriteBytes, prepared.disk->batch.GetDataSize());
     }
