@@ -17,6 +17,8 @@
 #include <limits>
 #include <utility>
 #include <chrono>
+#include <atomic>
+#include <mutex>
 
 #if USE_ROCKSDB
 #include <rocksdb/cache.h>
@@ -148,12 +150,91 @@ String encodeMask(const DeleteBitmap & mask)
     return out.str();
 }
 
+struct RecoveredPayload
+{
+    ObjectID identity{};
+    std::mutex mutex;
+    bool verified = false;
+    std::atomic<bool> pending{false};
+    std::exception_ptr failure;
+};
+
+constexpr auto recovery_retired_directory = "upsert_recovery_retired";
+
+void putInventory(rocksdb::WriteBatch & batch, const PartCommit & part)
+{
+    if (part.files_inventory.empty() || hashLogRecord(part.files_inventory) != part.files_hash)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree prepared part lacks its authenticated inventory");
+    batch.Put("V" + objectName(part.part), part.files_inventory);
+    checkBatchBudget(batch);
+}
+
 struct Database
 {
     std::unique_ptr<rocksdb::DB> db;
     std::unique_ptr<DeleteBitmapCache> mask_cache;
     MaskVersions mask_versions;
     UInt64 mask_generation = 0;
+    String table_path;
+    /// Immutable after recovery; bounded by the number of parts present at open, including pinned old versions.
+    std::map<String, std::shared_ptr<RecoveredPayload>> recovered_payloads;
+    std::atomic<size_t> pending_payloads{0};
+    std::atomic<bool> verification_failed{false};
+
+    void checkVerification() const
+    {
+        if (verification_failed)
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree payload verification failed; table requires recovery");
+    }
+
+    void completeRecovery(RecoveredPayload & payload)
+    {
+        if (payload.pending.exchange(false))
+            --pending_payloads;
+    }
+
+    void verifyPart(const String & name, const String & identity, const rocksdb::Snapshot * cut, bool force)
+    {
+        checkVerification();
+        const auto it = recovered_payloads.find(name);
+        const auto payload = it != recovered_payloads.end() && objectName(it->second->identity) == identity ? it->second : nullptr;
+        if (!payload && !force)
+            return; /// Parts created during this open were fully authenticated before their durable commit.
+        std::unique_lock<std::mutex> lock;
+        if (payload)
+        {
+            lock = std::unique_lock(payload->mutex);
+            if (payload->failure)
+                std::rethrow_exception(payload->failure);
+            if (payload->verified && !force)
+                return;
+        }
+        try
+        {
+            const auto encoded = get("A" + name, cut);
+            if (!encoded)
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree snapshot lacks part authorization for {}", name);
+            const auto record = decodePartCommit(*encoded);
+            if (objectName(record.part) != identity)
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree verification identity mismatch for {}", name);
+            ProfileEventTimeIncrement<Microseconds> timer(ProfileEvents::UpsertPayloadVerificationMicroseconds);
+            if (hashPartDirectory(std::filesystem::path(table_path) / name, false) != record.files_hash)
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree authenticated files mismatch for {}", name);
+            ProfileEvents::increment(ProfileEvents::UpsertPayloadVerificationParts);
+            if (payload)
+            {
+                payload->verified = true;
+                completeRecovery(*payload);
+            }
+        }
+        catch (...)
+        {
+            if (payload)
+                payload->failure = std::current_exception();
+            verification_failed = true;
+            throw;
+        }
+    }
 
     std::optional<String> get(const String & key, const rocksdb::Snapshot * snapshot = nullptr) const
     {
@@ -244,6 +325,16 @@ public:
         cut = database->db->GetSnapshot();
         if (!cut)
             throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree could not pin its disk snapshot");
+    }
+    void checkVerification() const override
+    {
+        database->checkVerification();
+    }
+    void verifyPart(const String & name, const String & identity, bool force) const override
+    {
+        if (!cut)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree verification snapshot was read before commit");
+        database->verifyPart(name, identity, cut, force);
     }
     UInt64 getPartitionCSN(const String & partition) const override
     {
@@ -396,7 +487,7 @@ struct DiskState::Impl
             pending.front().get();
             pending.pop_front();
         };
-        auto verify = [this](const PartCommit & record)
+        auto verify = [this](const PartCommit & record, const std::shared_ptr<RecoveredPayload> & payload)
         {
             namespace fs = std::filesystem;
             const fs::path final = fs::path(table_path) / record.final_name;
@@ -404,8 +495,32 @@ struct DiskState::Impl
             const bool final_exists = fs::exists(final);
             if (final_exists == fs::exists(temporary))
                 throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree requires exactly one authorized payload for {}", record.final_name);
-            if (hashPartDirectory(final_exists ? final : temporary, false) != record.files_hash)
-                throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree authenticated files mismatch for {}", record.final_name);
+            const auto inventory_key = "V" + objectName(record.part);
+            auto inventory = database->get(inventory_key);
+            if (final_exists && inventory)
+            {
+                verifyPartMetadata(final, record.files_hash, *inventory);
+                payload->pending = true;
+                ++database->pending_payloads;
+                ProfileEvents::increment(ProfileEvents::UpsertRecoveryMetadataParts);
+            }
+            else
+            {
+                /// Legacy parts need one full verification before their inventory can become trusted.
+                String authenticated_inventory;
+                if (hashPartDirectory(final_exists ? final : temporary, false, &authenticated_inventory) != record.files_hash)
+                    throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree authenticated files mismatch for {}", record.final_name);
+                if (inventory && *inventory != authenticated_inventory)
+                    throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree inventory mismatch for {}", record.final_name);
+                if (!inventory)
+                {
+                    rocksdb::WriteOptions write;
+                    write.sync = true;
+                    check(database->db->Put(write, inventory_key, authenticated_inventory));
+                }
+                payload->verified = true;
+                ProfileEvents::increment(ProfileEvents::UpsertRecoveryParts);
+            }
             const auto encoded_mask = database->get("M" + objectName(record.part));
             if (!encoded_mask)
                 throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree authorized part is missing its visibility mask");
@@ -418,7 +533,6 @@ struct DiskState::Impl
                 fs::rename(temporary, final);
                 syncDirectory(table_path);
             }
-            ProfileEvents::increment(ProfileEvents::UpsertRecoveryParts);
         };
         for (iterator->Seek("A"); iterator->Valid() && iterator->key().starts_with("A"); iterator->Next())
         {
@@ -428,9 +542,12 @@ struct DiskState::Impl
             database->mask_versions.set(objectName(record.part), 0);
             if (pending.size() == resources.recovery_threads)
                 finish_front();
+            auto verification = std::make_shared<RecoveredPayload>();
+            verification->identity = record.part;
+            database->recovered_payloads.emplace(record.final_name, verification);
             pending.emplace_back();
             pending.back() = scheduleFromThreadPoolUnsafe<void>(
-                [verify, payload = std::move(record)] { verify(payload); }, pool, ThreadName::DEFAULT_THREAD_POOL);
+                [verify, authorization = std::move(record), verification] { verify(authorization, verification); }, pool, ThreadName::DEFAULT_THREAD_POOL);
             ++found;
         }
         while (!pending.empty())
@@ -439,20 +556,45 @@ struct DiskState::Impl
         if (found != part_count)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree durable part count differs from its catalog");
         bool had_retired_parts = false;
-        /// Validate the active recovery root before reclaiming anything it superseded.
+        /// Keep superseded payloads outside native loading until the recovered root is fully verified.
+        const auto retained_root = fs::path(table_path) / recovery_retired_directory;
+        if (fs::is_symlink(retained_root))
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "Symbolic link replaces UpsertMergeTree retained recovery payloads");
         for (iterator->Seek("R"); iterator->Valid() && iterator->key().starts_with("R"); iterator->Next())
         {
             const auto record = decodePartCommit(iterator->value().ToStringView());
             if (!record.rows || iterator->key().ToString() != "R" + record.final_name || database->get("A" + record.final_name))
                 throw Exception(ErrorCodes::CORRUPTED_DATA, "Invalid UpsertMergeTree retirement authorization");
             /// No pre-restart reader can retain this retired payload. Partial deletion is retryable.
-            const auto path = fs::path(table_path) / record.final_name;
-            if (fs::is_symlink(path))
+            const auto final_path = fs::path(table_path) / record.final_name;
+            const auto deletion_path = fs::path(table_path) / ("delete_tmp_" + record.final_name);
+            if (fs::exists(final_path) && fs::exists(deletion_path))
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "Ambiguous UpsertMergeTree retired payload paths");
+            const auto path = fs::exists(deletion_path) ? deletion_path : final_path;
+            if (fs::is_symlink(final_path) || fs::is_symlink(deletion_path))
                 throw Exception(ErrorCodes::CORRUPTED_DATA, "Symbolic link replaces a retired UpsertMergeTree part");
-            fs::remove_all(path);
-            had_retired_parts = true;
+            const auto retained = retained_root / record.final_name;
+            if (fs::is_symlink(retained) || (fs::exists(path) && fs::exists(retained)))
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "Ambiguous UpsertMergeTree retained recovery payload");
+            if (database->pending_payloads)
+            {
+                if (fs::exists(path))
+                {
+                    fs::create_directories(retained_root);
+                    fs::rename(path, retained);
+                    syncDirectory(retained_root);
+                }
+            }
+            else
+            {
+                fs::remove_all(path);
+                fs::remove_all(retained);
+                had_retired_parts = true;
+            }
         }
         check(iterator->status());
+        if (fs::exists(retained_root))
+            syncDirectory(retained_root);
         syncDirectory(table_path);
         for (const auto & entry : fs::directory_iterator(table_path))
         {
@@ -499,8 +641,11 @@ struct DiskState::Impl
             const auto path = detached_path / name;
             if (fs::is_symlink(path))
                 throw Exception(ErrorCodes::CORRUPTED_DATA, "Symbolic link replaces an UpsertMergeTree detached part");
-            fs::remove_all(path);
-            consumed_detached = true;
+            if (!database->pending_payloads)
+            {
+                fs::remove_all(path);
+                consumed_detached = true;
+            }
         }
         check(iterator->status());
         if (consumed_detached)
@@ -518,6 +663,8 @@ struct DiskState::Impl
             for (const auto & entry : fs::directory_iterator(detached_path))
             {
                 const auto name = entry.path().filename().string();
+                if (database->get("D" + name))
+                    continue;
                 if (!name.starts_with("attaching_")
                     || !MergeTreePartInfo::tryParsePartName(name.substr(10), MERGE_TREE_DATA_MIN_FORMAT_VERSION_WITH_CUSTOM_PARTITIONING))
                     continue;
@@ -550,6 +697,7 @@ DiskState::DiskState(const String & table_path, ObjectID incarnation, bool attac
     namespace fs = std::filesystem;
     resources.validate();
     impl->table_path = table_path;
+    impl->database->table_path = table_path;
     impl->resources = resources;
     if (resources.mask_cache_bytes)
         impl->database->mask_cache = std::make_unique<DeleteBitmapCache>("LRU", CurrentMetrics::UpsertMaskCacheBytes,
@@ -629,6 +777,7 @@ PartRows DiskState::loadPartRows(const String & name) const
     if (!value)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree maintenance source is not authorized");
     const auto record = decodePartCommit(*value);
+    impl->current->verifyPart(name, objectName(record.part));
     auto rows = decodePartRows(readBoundedFile(std::filesystem::path(impl->table_path) / name / ROWS_FILE, MAX_RECORD_BYTES));
     if (rows.size() != record.rows)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree maintenance source row count mismatch");
@@ -644,6 +793,8 @@ PartRows DiskState::loadPartRows(const String & name) const
 
 void DiskState::pruneRetired()
 {
+    impl->database->checkVerification();
+    const bool can_reclaim = impl->database->pending_payloads == 0;
     rocksdb::ReadOptions options;
     options.fill_cache = false;
     std::unique_ptr<rocksdb::Iterator> iterator(impl->database->db->NewIterator(options));
@@ -652,21 +803,33 @@ void DiskState::pruneRetired()
     iterator->Seek(impl->retirement_cursor);
     if (impl->retirement_cursor != "R" && iterator->Valid() && iterator->key().ToString() == impl->retirement_cursor)
         iterator->Next();
-    for (; iterator->Valid() && iterator->key().starts_with("R") && examined < 128; iterator->Next(), ++examined)
+    for (; iterator->Valid() && iterator->key().starts_with("R") && examined < 128 && can_reclaim; iterator->Next(), ++examined)
     {
         auto record = decodePartCommit(iterator->value().ToStringView());
         if (!record.rows || iterator->key().ToString() != "R" + record.final_name)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "Invalid UpsertMergeTree retirement authorization");
         impl->retirement_cursor = iterator->key().ToString();
         if (!std::filesystem::exists(std::filesystem::path(impl->table_path) / record.final_name))
+        {
+            const auto retained_root = std::filesystem::path(impl->table_path) / recovery_retired_directory;
+            const auto retained = retained_root / record.final_name;
+            if (std::filesystem::is_symlink(retained_root) || std::filesystem::is_symlink(retained))
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "Symbolic link replaces UpsertMergeTree retained recovery payload");
+            if (std::filesystem::exists(retained))
+            {
+                std::filesystem::remove_all(retained);
+                syncDirectory(retained_root);
+            }
+            batch.Delete("V" + objectName(record.part));
             batch.Delete(iterator->key());
+        }
     }
     check(iterator->status());
     if (!iterator->Valid() || !iterator->key().starts_with("R"))
         impl->retirement_cursor = "R";
     bool removed_detached = false;
     const auto detached_path = std::filesystem::path(impl->table_path) / "detached";
-    for (iterator->Seek("D"), examined = 0; iterator->Valid() && iterator->key().starts_with("D") && examined < 128; iterator->Next(), ++examined)
+    for (iterator->Seek("D"), examined = 0; iterator->Valid() && iterator->key().starts_with("D") && examined < 128 && can_reclaim; iterator->Next(), ++examined)
     {
         const auto name = iterator->key().ToString().substr(1);
         if (!name.starts_with("attaching_")
@@ -731,6 +894,7 @@ UInt64 DiskState::authorizedPartCount() const
 
 void DiskState::checkAdmission() const
 {
+    impl->database->checkVerification();
     if (std::filesystem::space(impl->table_path).available < maintenance_disk_reserve)
         throw Exception(ErrorCodes::LIMIT_EXCEEDED, "UpsertMergeTree is preserving free disk space for maintenance");
 }
@@ -881,6 +1045,7 @@ StateStore::Prepared DiskState::prepare(const String & partition, PartCommit par
         if (authorizedPart(part.final_name))
             throw Exception(ErrorCodes::CORRUPTED_DATA, "Reused UpsertMergeTree final part name");
         batch.Put("A" + part.final_name, result.payload);
+        putInventory(batch, part);
         result.disk->putMask(objectName(part.part), *dead);
         batch.Put("part_count", number(impl->part_count + 1));
         batch.Put("O" + objectName(result.operation_id), number(result.csn));
@@ -1017,6 +1182,7 @@ StateStore::Prepared DiskState::prepareMerge(
         {
             batch.Put("R" + name, *authorization);
             batch.Delete("A" + name);
+            batch.Delete("V" + objectName(source.part));
             result.disk->deleteMask(objectName(source.part));
             batch.Delete("O" + objectName(source.part));
         }
@@ -1049,6 +1215,7 @@ StateStore::Prepared DiskState::prepareMerge(
         if (info.getPartitionId() != partition || authorizedPart(part.final_name))
             throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree merge output partition or name mismatch");
         batch.Put("A" + part.final_name, result.payload);
+        putInventory(batch, part);
         result.disk->putMask(objectName(part.part), *dead);
         batch.Put("O" + objectName(part.part), number(result.csn));
     }
@@ -1102,7 +1269,7 @@ StateStore::Prepared DiskState::prepareTruncate()
     /// Clear active authorizations, sequence counters, token expiry, masks, operation bindings, tokens and winners.
     /// Range tombstones preserve the old masks for readers holding a pre-truncate `RocksDB` snapshot.
     result.disk->clearMasks();
-    for (const char space : {'A', 'C', 'E', 'O', 'T', 'W'})
+    for (const char space : {'A', 'C', 'E', 'O', 'T', 'V', 'W'})
         check(batch.DeleteRange(String(1, space), String(1, space + 1)));
     batch.Put("part_count", number(0));
     batch.Put("retry_bytes", number(0));
@@ -1161,6 +1328,7 @@ StateStore::Prepared DiskState::preparePartition(
         source.token.accepted = source.rows;
         batch.Put("R" + name, encodePartCommit(source));
         batch.Delete("A" + name);
+        batch.Delete("V" + objectName(source.part));
         result.disk->deleteMask(objectName(source.part));
         batch.Delete("O" + objectName(source.part));
         result.retired_parts.push_back(name);
@@ -1324,6 +1492,7 @@ StateStore::Prepared DiskState::preparePartition(
         const auto payload = encodePartCommit(part);
         decodePartCommit(payload);
         batch.Put("A" + part.final_name, payload);
+        putInventory(batch, part);
         result.added_parts.push_back(std::move(part));
         checkBatchBudget(batch);
     }
@@ -1346,6 +1515,7 @@ StateStore::Prepared DiskState::preparePartition(
 
 void DiskState::append(const StateStore::Prepared & prepared)
 {
+    impl->database->checkVerification();
     if (!prepared.disk || prepared.disk->durable)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Invalid or already committed UpsertMergeTree disk preparation");
     if (prepared.disk->catalog_change)
@@ -1395,6 +1565,12 @@ void DiskState::append(const StateStore::Prepared & prepared)
         ProfileEvents::increment(ProfileEvents::UpsertStateWriteBytes, prepared.disk->batch.GetDataSize());
     }
     prepared.disk->durable = true;
+    for (const auto & name : prepared.retired_parts)
+    {
+        const auto it = impl->database->recovered_payloads.find(name);
+        if (it != impl->database->recovered_payloads.end())
+            impl->database->completeRecovery(*it->second);
+    }
     FailPointInjection::pauseFailPoint(FailPoints::upsert_pause_after_state_sync);
     fiu_do_on(FailPoints::upsert_log_throw_after_append,
     {

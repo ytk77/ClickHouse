@@ -161,6 +161,9 @@ private:
     std::unique_ptr<MergeTreeDeduplicationLog> deduplication_log;
     std::unique_ptr<Upsert::StateStore> upsert_store;
     BackgroundSchedulePoolTaskHolder upsert_maintenance_task;
+    BackgroundSchedulePoolTaskHolder upsert_verification_task;
+    std::optional<MergeTreePartInfo> upsert_verification_cursor;
+    void runUpsertVerification();
     /// Accessed only by the single table maintenance task; resume after the previous selected unit.
     std::optional<MergeTreePartInfo> upsert_maintenance_cursor;
     DataPartPtr upsert_maintenance_pending;

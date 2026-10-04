@@ -409,7 +409,10 @@ bool analyzeProjectionCandidate(
         projection_query_info,
         top_k_filter_info,
         context,
-        context->getSettingsRef()[Setting::max_threads]);
+        context->getSettingsRef()[Setting::max_threads],
+        nullptr,
+        true,
+        assert_cast<const MergeTreeData::SnapshotData &>(*storage_snapshot->data).upsert_snapshot);
 
     /// If projection analysis exceeded limits, skip this candidate
     if (!projection_result_ptr->isUsable())
@@ -512,7 +515,9 @@ void filterPartsAndCollectProjectionCandidates(
         reading.getTopKFilterInfo(),
         context,
         context->getSettingsRef()[Setting::max_threads],
-        nullptr);
+        nullptr,
+        true,
+        assert_cast<const MergeTreeData::SnapshotData &>(*reading.getStorageSnapshot()->data).upsert_snapshot);
 
     /// Projection has no filtering effect, skip it
     if (projection_result_ptr->selected_marks == projection_marks_to_read)

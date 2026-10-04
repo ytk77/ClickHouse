@@ -2181,7 +2181,8 @@ ReadFromMergeTree::AnalysisResultPtr ReadFromMergeTree::selectRangesToRead(bool 
         find_exact_ranges,
         is_parallel_reading_from_replicas,
         allow_query_condition_cache,
-        supportsSkipIndexesOnDataRead());
+        supportsSkipIndexesOnDataRead(),
+        assert_cast<const MergeTreeData::SnapshotData &>(*storage_snapshot->data).upsert_snapshot);
 
     return analyzed_result_ptr;
 }
@@ -2208,7 +2209,8 @@ ReadFromMergeTree::AnalysisResultPtr ReadFromMergeTree::estimateRangesToReadWith
         /*find_exact_ranges=*/false,
         is_parallel_reading_from_replicas,
         /*allow_query_condition_cache_=*/false,
-        supportsSkipIndexesOnDataRead());
+        supportsSkipIndexesOnDataRead(),
+        assert_cast<const MergeTreeData::SnapshotData &>(*storage_snapshot->data).upsert_snapshot);
 }
 
 namespace
@@ -2750,9 +2752,13 @@ ReadFromMergeTree::AnalysisResultPtr ReadFromMergeTree::selectRangesToRead(
     bool find_exact_ranges,
     bool is_parallel_reading_from_replicas_,
     bool allow_query_condition_cache_,
-    bool supports_skip_indexes_on_data_read)
+    bool supports_skip_indexes_on_data_read,
+    const Upsert::SnapshotPtr & upsert_snapshot)
 {
     ProfileEvents::increment(ProfileEvents::IndexAnalysisRounds);
+
+    if (data.merging_params.upsert && !upsert_snapshot)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree index analysis requires its pinned visibility snapshot");
 
     AnalysisResult result;
     RangesInDataParts res_parts;
@@ -2850,6 +2856,17 @@ ReadFromMergeTree::AnalysisResultPtr ReadFromMergeTree::selectRangesToRead(
         max_block_numbers_to_read.get(),
         log,
         result.index_stats);
+
+    if (upsert_snapshot)
+    {
+        upsert_snapshot->checkVerification();
+        /// Partition metadata is authenticated at open; verify selected payloads before index or column reads.
+        for (const auto & range : res_parts)
+        {
+            const auto * part = range.data_part->isProjectionPart() ? range.data_part->getParentPart() : range.data_part.get();
+            upsert_snapshot->verifyPart(part->name, part->getDeleteBitmapCacheIdentity());
+        }
+    }
 
     res_parts = MergeTreeDataSelectExecutor::filterPartsByStatistics(
         res_parts, metadata_snapshot, query_info_, mutations_snapshot, context_, log, result.index_stats);

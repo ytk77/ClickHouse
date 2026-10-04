@@ -35,6 +35,8 @@ struct PartCommit
     String temporary_name;
     String final_name;
     ObjectID files_hash{};
+    /// Optional in-memory inventory, persisted separately by the disk-state protocol.
+    String files_inventory;
     UInt64 rows = 0;
     std::vector<UInt32> dead;
     std::vector<Kill> kills;

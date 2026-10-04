@@ -20,7 +20,7 @@ Partition data-version maps are initialized lazily once per immutable root and s
 
 Maintenance traverses at most 256 new candidates per tick from the native ordered index, plus at most one small candidate carried across a scan boundary. Its cursor advances over healthy and oversized parts as well as candidates selected for rewriting. This removes full-table candidate copying and traverses a finite backlog in rounds. A continuously growing hot partition can still delay later partitions when ingestion outpaces maintenance. It does not provide a fixed TTL latency independent of the number of parts, nor a priority scheduler for compaction debt. A complete idle scan backs off from 1 second to at most 30 seconds. A healthy cycle with new publications uses a 1-second cooldown before another full scan; an in-flight notification can request an earlier pass. Publications and schema changes wake an idle task. Tables with any TTL retain a maximum 1-second idle delay, including while TTL merges are stopped; this bounds the extra delay when time advances or TTL merges restart. Completing a cycle can still require multiple slices and rewrites. Even without rewrite work, a full pass needs roughly `ceil(P / 256)` ticks, normally spaced 100 ms apart, plus scheduling/lock wait time. TTL expiration therefore has no fixed 1-second completion guarantee; actual rewrites, throttling and contention can extend the delay substantially. Candidates that exceed the current unit budget remain ahead of the cursor for the next tick; carried candidates never move the cursor backwards.
 
-A maintenance `CORRUPTED_DATA` exception fences the table, increments `UpsertMaintenanceCorruptionFailures`, and logs the phase, candidate part when available, and cause. `UpsertMaintenanceFailures` also counts other maintenance exceptions. It does not repeatedly retry a corrupt candidate while silently preventing later parts from progressing. While fenced, TTL maintenance and new reads/writes stop. Restart performs full verification; actual corruption must be repaired before recovery can succeed.
+A maintenance `CORRUPTED_DATA` exception fences the table, increments `UpsertMaintenanceCorruptionFailures`, and logs the phase, candidate part when available, and cause. `UpsertMaintenanceFailures` also counts other maintenance exceptions. It does not repeatedly retry a corrupt candidate while silently preventing later parts from progressing. While fenced, TTL maintenance and new reads/writes stop. Restart repeats metadata verification, with full payload verification before first use or in the background. A successful attach alone does not certify payload integrity; actual corruption must be repaired before that payload can pass verification.
 
 ## Visibility cache {#visibility-cache}
 
@@ -42,7 +42,7 @@ All settings have defaults. Ordinary `CREATE TABLE`, `INSERT` and `SELECT` requi
 | `upsert_background_jobs` | 2 | `RocksDB` background-job budget |
 | `upsert_max_open_files` | 128 | `RocksDB` open-file budget |
 | `upsert_partitioned_filters` | true | Partitioned index and Bloom-filter blocks |
-| `upsert_recovery_threads` | 4 | Maximum outstanding payload-verification workers |
+| `upsert_recovery_threads` | 4 | Maximum outstanding startup-verification workers |
 
 These are performance budgets, not changes to synchronous durability. WAL flushing thresholds and cache capacity are not hard limits on all process memory or disk use. Resources across multiple tables must still fit the server's capacity. Default cache capacities plus configured write buffers total approximately 144 MiB per table; this is potential configured consumption, not a claim that all those bytes are always resident. It also excludes other memory such as part metadata and query buffers. **A multi-table sharding rollout requires an explicit aggregate resource budget; this implementation supplies no server-wide cache or memtable quota.**
 
@@ -52,7 +52,17 @@ The resource validator identifies the invalid setting, value and allowed range. 
 
 The durable state format is unchanged, but table metadata containing new explicit settings is not understood by older binaries. Those tables cannot simply be attached after downgrade. `ALTER RESET SETTING` is currently unsupported on `UpsertMergeTree`; do not assume it can remove this compatibility barrier. Validate a data migration to an older-compatible table definition before downgrading.
 
-Recovery verifies every authorized payload and visibility mask before publishing the table. Its queue is bounded by `upsert_recovery_threads`, and all workers finish before recovery can release database state or reclaim retired data. A verification exception fails recovery. Parallel verification is limited by aggregate storage bandwidth; it does not promise speedup proportional to thread count.
+Recovery verifies every authorized part's authenticated inventory, file names and sizes, metadata contents, and visibility mask before publishing the table. Full hashing of column and lineage `.bin` files and `unique_key_index.sst` is deferred until first use or a separate background sweep. Parts without a persisted inventory, and authorized temporary parts awaiting rename, still require full startup verification. The startup queue is bounded by `upsert_recovery_threads`; all workers finish before native loading. A startup verification exception fails recovery.
+
+### Staged payload verification {#staged-payload-verification}
+
+Queries verify each selected part before its indexes, projections or readers can consume payloads. Partition pruning uses authenticated metadata before this verification; a point lookup within a selected partition can still hash every part in that partition. Verification is per complete part, not per column or block. Concurrent first readers share one verification result. Maintenance and partition operations also verify sources before using them. New parts are fully authenticated and synchronized before their durable authorization, so they do not need another first-read scan during the same open.
+
+A dedicated background task starts after one second, pins and verifies one active part per slice outside the parts lock, and waits 100 ms between slices. After a complete pass it waits 24 hours before starting another full sweep. The task shares the table operation mutex with schema and partition operations. One large part can therefore delay those operations and shutdown; ordinary inserts do not take that mutex. The task has no separate byte-rate limit, and hashing competes with query and write I/O. Continuous ingestion can extend a sweep; the interval is not a deadline for detecting corruption.
+
+A payload verification failure is sticky for that open and rejects subsequent reads and writes. An attach that succeeds with deferred payloads is not proof that those payloads are intact. While recovered payloads remain pending, superseded sources found at startup are retained outside native part loading, and consumed detached inputs remain unavailable for reuse. Cleanup resumes only after pending verification is complete or the corresponding active data is explicitly retired. The verification map is bounded by the number of parts present at open, including entries required by old pinned snapshots; it does not grow with subsequent inserts.
+
+Existing disk-state tables need one full startup scan to establish missing inventories. Later starts avoid bulk payload hashing, but still enumerate every file, read metadata, validate masks, and load native part metadata. This does not remove part-count overhead or establish a startup speedup without workload measurements. See [disk-state recovery](/development/upsert-merge-tree-disk-state#disk-state-staged-recovery) for persistence and cleanup details.
 
 ## Query part size and cache prewarming {#query-part-size-prewarming}
 
@@ -251,6 +261,8 @@ not a full Docker integration, ASan or TSan run.
 
 ## Measurements {#measurements}
 
+`UpsertRecoveryMetadataParts` counts startup metadata verifications; `UpsertRecoveryParts` counts full startup verifications for legacy or temporary parts. `UpsertPayloadVerificationParts` counts successful first-use and background full verifications, and `UpsertPayloadVerificationMicroseconds` records their hashing time, including failed attempts. These are process-wide counters, not per-table pending-part gauges.
+
 The `Upsert`-prefixed events in `system.events` and applicable query `ProfileEvents` distinguish winner lookup, mask loading/encoding, state preparation, synchronous state writes, insert commit-lock waiting/holding, snapshot construction, maintenance candidate visits, and recovery. `UpsertMaskCacheHits` and `UpsertMaskCacheMisses` describe decoded-mask reuse. Independent `CurrentMetrics` named `UpsertMaskCacheBytes` and `UpsertMaskCacheEntries` report retained upsert mask caches without combining them with the legacy unique-key cache. They aggregate all upsert tables, not individual tables. `UpsertCatalogVersionsMicroseconds` and `UpsertCatalogRangesMicroseconds` measure query-side map lookup/initialization and range selection/materialization, including wait time. `UpsertCatalogNodesAllocated` (named `UpsertSnapshotPartsVisited` in the initial evaluation logs) counts nodes allocated during tree construction, including balancing nodes; it is not the table's active-part count.
 
 Use a baseline binary and the candidate with the same SQL, data, and settings. Record active parts and physical rows as well as latency: background maintenance can change these between runs. Small sample counts and concurrent build activity are insufficient for production tail-latency claims.
@@ -263,7 +275,7 @@ Use a baseline binary and the candidate with the same SQL, data, and settings. R
 4. Compare insert and overwrite duration, point/range queries, snapshot-work counters, physical/live row ratio, and recovery correctness.
 5. Reserve time for failures and regression tests. Report incomplete or timed-out cases rather than extrapolating them to 10 billion rows.
 
-Large physical parts, framed lineage, chunked durable masks, resumable many-to-one activation, group commit, disk-paged metadata, and deferred verification require separate protocol work. The current disk format and full startup verification remain in force. The larger architecture and migration requirements are described in [continuous ingestion](/development/upsert-merge-tree-continuous-ingestion).
+Large physical parts, framed lineage, chunked durable masks, resumable many-to-one activation, group commit, and disk-paged metadata require separate protocol work. Staged verification adds an authenticated inventory to the state database while preserving existing part payloads and their authorization hashes. The larger architecture and migration requirements are described in [continuous ingestion](/development/upsert-merge-tree-continuous-ingestion).
 
 ## Reproduce the local evaluation {#reproduce-local-evaluation}
 
@@ -420,3 +432,11 @@ The Release build passed, followed by 88 scoped C++ tests and 15 new integration
 The initial final integration run passed 14 of 15 cases: resource validation preceded manifest creation but still followed directory creation. Moving validation before directory creation fixed the same-name retry; the subsequent full 15-case run passed. The built binary also contained the independent `OverwriteCache` memory-setting change from the primary checkout; the upsert patch is kept in its own branch.
 
 This is not the full Docker suite or an ASan/TSan run. Deterministic cancellation during a long rewrite at server shutdown, the exact post-import cleanup failure window, and all remote parallel-replica modes remain untested. The temporary-directory regression constructs the interrupted-deletion state; it does not kill the process during the native rename.
+
+## Staged verification validation on 2026-10-04 {#staged-verification-validation-20261004}
+
+The release server and standard unit-test target compiled successfully. A scoped executable linked from the compiled `Upsert` test objects and product libraries passed all 98 tests. The full unit-test executable stopped during global setup at the existing `Silk` fiber `io_uring` assertion, before running tests. This does not establish a passing full unit suite.
+
+All 61 integration cases passed against an isolated local server through the local integration adapter, covering staged verification, scalability, materialized views, partitions, projections, schema changes and TTL recovery. The five new cases verify metadata-only attachment, partition-scoped first use with both analyzers, same-size payload corruption before query results, background verification without a data query, and background corruption fencing while queries exclude the damaged partition. C++ coverage also checks shared concurrent verification, old pinned snapshots, legacy inventory establishment, temporary-part rollforward, metadata tampering and retained retirement sources, including interrupted native deletion.
+
+These are local checks, not the full Docker integration suite or an ASan/TSan run. No production server was upgraded or restarted, and no production startup speedup was measured.

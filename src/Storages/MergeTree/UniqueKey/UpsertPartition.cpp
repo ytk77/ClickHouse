@@ -149,6 +149,8 @@ Pipe StorageMergeTree::alterPartition(
                 return part->info.getPartitionId() != partition;
             });
         }
+        for (const auto & part : parts)
+            snapshot->visibility->verifyPart(part->name, part->getDeleteBitmapCacheIdentity());
         return parts;
     };
     auto reset_partitions = [&](StorageMergeTree & table, const PartitionCommand & command, const DataPartsVector & parts)
@@ -174,6 +176,8 @@ Pipe StorageMergeTree::alterPartition(
         size_t estimated_state = 0;
         for (const auto & part : parts)
         {
+            if (visibility)
+                visibility->verifyPart(part->name, part->getDeleteBitmapCacheIdentity());
             auto import_context = Context::createCopy(query_context);
             size_t key_limit = settings[Setting::unique_key_max_encoded_size];
             const auto lineage_path = std::filesystem::path(part->getDataPartStorage().getFullPath()) / Upsert::ROWS_FILE;
@@ -231,7 +235,7 @@ Pipe StorageMergeTree::alterPartition(
                     Upsert::PartCommit authorization;
                     authorization.part = {UUIDHelpers::getHighBytes(temporary->part->uuid), UUIDHelpers::getLowBytes(temporary->part->uuid)};
                     authorization.temporary_name = temporary->part->getDataPartStorage().getPartDirectory();
-                    authorization.files_hash = Upsert::hashPartDirectory(path, true);
+                    authorization.files_hash = Upsert::hashPartDirectory(path, true, &authorization.files_inventory);
                     authorization.rows = temporary->part->rows_count;
                     Upsert::syncDirectory(std::filesystem::path(path).parent_path());
                     imported.rows.emplace_back(std::move(rows), authorization.part);

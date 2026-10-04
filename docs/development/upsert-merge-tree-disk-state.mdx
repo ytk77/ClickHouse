@@ -50,8 +50,9 @@ Only these survivors, rather than every removed row, consume per-winner batch sp
 `DETACH` and `FREEZE` synchronize a checksummed visibility record and each copied
 payload through the containing disk root before source removal or success. `ATTACH`
 synchronizes input renames in the detached directory, then records consumed `attaching_` directories in namespace `D` in the same
-batch as their new payload authorization. Recovery first validates and completes the
-active catalog, then deletes consumed detached inputs and synchronizes the detached
+batch as their new payload authorization. Recovery first validates metadata and completes the
+active catalog. Consumed detached inputs remain reserved while recovered payload verification
+is pending. Once it completes, cleanup deletes these inputs and synchronizes the detached
 directory before forgetting their `D` entries. Uncommitted attaching directories are
 restored for a later attempt. This prevents a committed import from leaving a reusable
 input after interruption. Normal maintenance also reclaims committed detached inputs.
@@ -63,6 +64,18 @@ and their visibility sidecars are selected from the same pinned snapshot.
 
 Cross-table `MOVE` uses a destination import followed by a source removal. There is no
 cross-database atomic batch; interruption between these steps can leave both copies.
+
+### Staged recovery verification {#disk-state-staged-recovery}
+
+Preparation persists the canonical inventory in namespace `V` in the same synchronous batch as its `A` authorization. The inventory uses the existing digest input: sorted relative directory names, followed by sorted file names, sizes and content hashes. Its root hash must equal the existing `PartCommit::files_hash`. Part serialization, hash semantics and native column encodings are unchanged. Retirement removes the corresponding inventory; old database snapshots retain their authorization for pinned readers.
+
+For an authorized final part with an inventory, startup authenticates that inventory and checks every path, file size and metadata digest. It rejects missing or additional files, symlinks, truncated files and altered metadata. Content hashing of `.bin` files, including lineage, and `unique_key_index.sst` is deferred. Visibility masks and catalog counts are still validated before native loading. A missing inventory requires a full scan against the original authorization before a synchronously persisted inventory can be trusted. An authorized temporary part also requires full verification before its rename is completed.
+
+First use verifies an entire selected part against the authorization in the reader's pinned database snapshot. Concurrent readers share the result. Verification occurs before payload-dependent index pruning, projection selection and column reads; partition pruning may first exclude parts using authenticated metadata. Sources used by maintenance or partition operations follow the same rule. A separate background task scans active parts and periodically rechecks previously verified payloads. A verification failure prevents subsequent reads, writes and retirement cleanup until recovery; successful metadata-only attachment does not repair corrupt data.
+
+Recovery moves retired directories into `upsert_recovery_retired` with durable directory barriers while any recovered payload remains pending. These directories do not participate in native part loading. Their `R` records remain until pending verification is complete and the retained directory has been deleted and synchronized. Consumed detached inputs keep their `D` records and cannot become reusable inputs while waiting. Explicit retirement of an active part removes its pending obligation, while an older pinned snapshot still verifies its own payload before reading. Retry-token expiry continues during deferred verification.
+
+The inventory is additive state readable by this version without rewriting existing payloads. Before downgrading to a disk-state binary that lacks staged verification, finish verification and retirement cleanup: older versions do not know how to reclaim `upsert_recovery_retired`. The legacy `parts_sync_v1` recovery path is unchanged. This implementation still enumerates all files and eagerly loads native metadata at startup; first access to an unverified partition can pay substantial hashing I/O. It does not provide block-level verification, a background bandwidth limit, or remote object storage support.
 
 ### Grouped payload synchronization {#disk-state-grouped-payload-synchronization}
 
@@ -121,11 +134,11 @@ Atomicity is per slice and partition. A later invalid row, cancellation, or writ
 `TRUNCATE TABLE` uses one synchronized `RocksDB` batch across all partitions. Each active
 `A` authorization becomes a compact `R` retirement record with its payload identity; historical
 kills, dead offsets and retry tokens are unnecessary for file reclamation. Range tombstones
-clear `A`, `C`, `E`, `M`, `O`, `T` and `W`, and reset `part_count` and `retry_bytes`. The table
+clear `A`, `C`, `E`, `M`, `O`, `T`, `V` and `W`, and reset `part_count` and `retry_bytes`. The table
 incarnation and existing retirement records remain intact. Snapshot readers retain their old
 masks and parts. The entire batch is checked against the state budget before committing.
 
-Recovery removes retired payloads and synchronizes the table directory before clearing their
+Once recovered payload verification permits reclamation, recovery or background cleanup removes retired payloads and synchronizes their containing directories before clearing their
 `R` records. This ordering also permits native part-name reuse after an empty table restarts,
 without leaving a stale retirement authorization that could conflict with a later insert.
 The disk-state format and table manifest are unchanged.
@@ -204,6 +217,7 @@ All integer fields are unsigned little-endian. Length-delimited strings use a fo
 | `C`, partition | Eight-byte last committed partition sequence |
 | `W`, partition, encoded key | Physical part identity plus length-delimited `IndexValue`, including the original resolved winner tuple |
 | `A`, final part name | Versioned `PartCommit`, authenticating the immutable payload |
+| `V`, printable part identity | Canonical directory/file inventory authenticated by the existing `PartCommit` payload hash |
 | `M`, printable part identity | Checksummed serialized `DeleteBitmap` |
 | `T`, partition, token, unit | Payload hash, original accepted-row count (including zero), and eight-byte expiration time |
 | `O`, printable operation identity | Original commit sequence |
@@ -218,7 +232,7 @@ Namespace boundaries and length delimiters prevent ambiguous keys even when user
 
 There is one state database per table, with a block cache, bounded write buffers, a bounded open-file cache, and shared background maintenance threads. There is no per-partition open log or resident winner map. A write batch contains only affected keys and masks; it does not clone the partition's historical index.
 
-Readers pin a database snapshot together with their native parts. A mask lookup reads that exact sequence, including after newer updates or database flushes. Snapshot ownership keeps the database alive until readers release it. Attach iterates part authorizations without constructing a second full in-memory authorization map and verifies the immutable payloads before native loading.
+Readers pin a database snapshot together with their native parts. A mask lookup reads that exact sequence, including after newer updates or database flushes. Snapshot ownership keeps the database alive until readers release it. Attach iterates part authorizations without retaining a second full authorization map. It verifies metadata before native loading and retains a small verification state per initially active part for shared first-use checks; complete authorization records remain in the database.
 
 Read publication uses MVCC: while a writer prepares, synchronizes or renames its payload, new queries can acquire the previous fully published version. The native part ranges and matching database snapshot switch together, so a reader cannot combine new masks with old parts. The publication mutex only copies or swaps a shared pointer; allocation, filesystem I/O and destruction of old versions run outside it. The empty mutation snapshot also avoids the parts lock because this engine executes supported mutations through its own replacement protocol and rejects patch parts. Each storage read pins a consistent version. Separate references to the table in a self-join or subquery can acquire different versions; explicit SQL transactions are unsupported.
 
@@ -250,7 +264,7 @@ Each task resumes after the last selected source in native part order and wraps 
 
 At commit, each currently live source identity must map to the same output identity or an explicitly evaluated expiration identity. A source row superseded during the build is marked dead in the output; an expired source identity superseded by a concurrent insert does not delete that newer winner. Missing, invented or duplicated identities are exceptions. Winner positions change without changing their original version, write sequence or ordinal. The atomic database batch deletes expired winner keys and replaces source authorizations with output authorization and retirement records; fully dead or expired inputs can produce no output. Expiration retains no version floor and does not remove retry tokens. See [row expiration](/development/upsert-merge-tree#upsert-row-expiration) for the SQL contract.
 
-Native part retirement completes before publishing the new read version. Native reference counting protects readers of earlier versions. Physical deletion precedes forgetting the retirement record. After process restart, prior reader pins no longer exist, and the durable retirement record authorizes completing interrupted deletion before native loading. Recovery validates the active payloads and masks before reclamation; it also removes uncommitted engine preparations after rolling forward all authorized payloads. The active catalog no longer requires deleted historical payloads to recover.
+Native part retirement completes before publishing the new read version. Native reference counting protects readers of earlier versions. Physical deletion precedes forgetting the retirement record. After process restart, prior reader pins no longer exist. Retired payloads are excluded from native loading and retained until verification of the recovered active root permits reclamation. Recovery validates metadata and masks before publication; it also removes uncommitted engine preparations after rolling forward all authorized payloads. The active catalog no longer requires deleted historical payloads to recover.
 
 Tokens retain their result for 86,400 seconds according to the server clock. A one-GiB accounted retry budget rejects new token state rather than expiring valid tokens early. The background task removes expired entries in bounded batches and protects a newer reuse of the same token from an older expiration entry. Operation bindings are retained for active parts and removed atomically with their retirement; merged rows already contain resolved original lineage. No-op writes do not allocate permanent operation bindings.
 

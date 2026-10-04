@@ -83,7 +83,8 @@ public:
         ContextPtr context,
         size_t num_streams,
         PartitionIdToMaxBlockPtr max_block_numbers_to_read = nullptr,
-        bool use_query_condition_cache = true) const;
+        bool use_query_condition_cache = true,
+        Upsert::SnapshotPtr upsert_snapshot = {}) const;
 
     static MarkRanges markRangesFromPKRange(
         const RangesInDataPart & part_with_ranges,

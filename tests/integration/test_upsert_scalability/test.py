@@ -278,7 +278,7 @@ def test_maintenance_corruption_fences_and_recovery_revalidates():
         assert after > before
     finally:
         node.query("SYSTEM DISABLE FAILPOINT upsert_maintenance_corrupt_candidate")
-    # The injected error changes no payload; real recovery must still verify it before opening.
+    # The injected error changes no payload; recovery and first use must still verify it.
     node.restart_clickhouse(kill=True)
     assert node.query("SELECT * FROM scale_corrupt_candidate").strip() == "1"
     node.query("DROP TABLE scale_corrupt_candidate SYNC")

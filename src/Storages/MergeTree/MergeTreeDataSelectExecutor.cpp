@@ -1795,7 +1795,8 @@ ReadFromMergeTree::AnalysisResultPtr MergeTreeDataSelectExecutor::estimateNumMar
     ContextPtr context,
     size_t num_streams,
     PartitionIdToMaxBlockPtr max_block_numbers_to_read,
-    bool use_query_condition_cache) const
+    bool use_query_condition_cache,
+    Upsert::SnapshotPtr upsert_snapshot) const
 {
     size_t total_parts = parts.size();
     if (total_parts == 0)
@@ -1820,7 +1821,8 @@ ReadFromMergeTree::AnalysisResultPtr MergeTreeDataSelectExecutor::estimateNumMar
         /*find_exact_ranges*/false,
         /*is_parallel_reading_from_replicas*/false,
         use_query_condition_cache,
-        /*supports_skip_indexes_on_data_read*/false);
+        /*supports_skip_indexes_on_data_read*/false,
+        std::move(upsert_snapshot));
 }
 
 QueryPlanStepPtr MergeTreeDataSelectExecutor::readFromParts(

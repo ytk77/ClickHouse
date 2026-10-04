@@ -40,7 +40,7 @@ protected:
         const auto path = directory / part.temporary_name;
         std::filesystem::create_directory(path);
         createDurableFile(path / ROWS_FILE, encodePartRows(rows));
-        part.files_hash = hashPartDirectory(path, true);
+        part.files_hash = hashPartDirectory(path, true, &part.files_inventory);
         return store.prepare(partition, std::move(part), rows);
     }
     void commit(StateStore & store, StateStore::Prepared & prepared)

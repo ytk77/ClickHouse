@@ -388,7 +388,7 @@ std::unique_ptr<Upsert::PreparedInsert> StorageMergeTree::prepareUpsertBlock(
     Upsert::PartCommit authorization;
     authorization.part = {UUIDHelpers::getHighBytes(part->uuid), UUIDHelpers::getLowBytes(part->uuid)};
     authorization.temporary_name = part->getDataPartStorage().getPartDirectory();
-    authorization.files_hash = Upsert::hashPartDirectory(path, true);
+    authorization.files_hash = Upsert::hashPartDirectory(path, true, &authorization.files_inventory);
     authorization.rows = part->rows_count;
     authorization.token = std::move(token);
     Upsert::syncDirectory(std::filesystem::path(path) / "..");

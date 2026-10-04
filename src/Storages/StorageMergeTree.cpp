@@ -294,6 +294,13 @@ void StorageMergeTree::startup()
 {
     if (merging_params.upsert)
     {
+        if (upsert_store->usesDiskState())
+        {
+            upsert_verification_task = getContext()->getSchedulePool().createTask(
+                getStorageID(), "UpsertMergeTree::verification", [this] { runUpsertVerification(); });
+            upsert_verification_task->activate();
+            upsert_verification_task->scheduleAfter(1000);
+        }
         if (upsert_store->usesDiskState() && !isTableReadonly())
         {
             upsert_maintenance_task = getContext()->getSchedulePool().createTask(
@@ -350,6 +357,8 @@ void StorageMergeTree::flushAndPrepareForShutdown()
     if (flush_called.exchange(true))
         return;
 
+    if (upsert_verification_task)
+        upsert_verification_task->deactivate();
     if (upsert_maintenance_task)
         upsert_maintenance_task->deactivate();
 

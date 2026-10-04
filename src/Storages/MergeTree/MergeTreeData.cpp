@@ -10450,7 +10450,8 @@ UInt64 MergeTreeData::estimateNumberOfRowsToRead(
         /// interaction the gate is supposed to prevent. The estimate is a throwaway analysis, so simply
         /// do not touch the cache here; the read that actually executes runs its own analysis with the
         /// gate that matches its final shape.
-        /*use_query_condition_cache=*/false);
+        /*use_query_condition_cache=*/false,
+        snapshot_data.upsert_snapshot);
 
     UInt64 total_rows = result_ptr->selected_rows;
     if (query_info.trivial_limit > 0 && query_info.trivial_limit < total_rows)
@@ -12170,6 +12171,7 @@ RangesInDataPartsPtr MergeTreeData::SnapshotData::getParts(
 {
     if (!upsert_catalog)
         return parts;
+    upsert_snapshot->checkVerification();
     if (query_info && query_info->filter_actions_dag && context && metadata->hasPartitionKey()
         && context->getSettingsRef()[Setting::use_partition_pruning])
     {
@@ -12293,6 +12295,7 @@ MergeTreeData::UpsertReadSnapshotPtr MergeTreeData::getUpsertReadSnapshotForQuer
     auto snapshot = getUpsertReadSnapshot();
     if (upsert_fenced || !snapshot)
         throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree is fenced pending recovery");
+    snapshot->visibility->checkVerification();
     return snapshot;
 }
 

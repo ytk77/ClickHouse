@@ -56,6 +56,7 @@ extern const int CANNOT_ALLOCATE_MEMORY;
 namespace DB::FailPoints
 {
 extern const char upsert_pause_before_merge_commit[];
+extern const char upsert_pause_background_verification[];
 extern const char upsert_maintenance_corrupt_candidate[];
 extern const char upsert_ttl_pause_after_manifest_upgrade[];
 extern const char upsert_ttl_pause_after_metadata_commit[];
@@ -423,6 +424,62 @@ void StorageMergeTree::notifyUpsertMaintenance()
         upsert_maintenance_task->schedule();
 }
 
+void StorageMergeTree::runUpsertVerification()
+{
+    if (upsert_fenced || shutdown_called || flush_called)
+        return;
+    bool verifying = false;
+    try
+    {
+        FailPointInjection::pauseFailPoint(FailPoints::upsert_pause_background_verification);
+        if (upsert_fenced || shutdown_called || flush_called)
+            return;
+        auto table_lock = lockForShare(RWLockImpl::NO_QUERY, Poco::Timespan(5, 0));
+        std::unique_lock operation_lock(upsert_operation_mutex, std::try_to_lock);
+        if (!operation_lock.owns_lock())
+        {
+            upsert_verification_task->scheduleAfter(1000);
+            return;
+        }
+        DataPartPtr part;
+        Upsert::SnapshotPtr snapshot;
+        {
+            auto lock = lockParts();
+            if (upsert_fenced)
+                return;
+            const auto active = getDataPartsStateRange(DataPartState::Active);
+            const auto next = upsert_verification_cursor
+                ? data_parts_by_state_and_info.upper_bound(DataPartStateAndInfo{DataPartState::Active, *upsert_verification_cursor})
+                : active.begin();
+            if (next == active.end())
+            {
+                upsert_store->pruneRetired();
+                upsert_verification_cursor.reset();
+                upsert_verification_task->scheduleAfter(86400000);
+                return;
+            }
+            part = *next;
+            snapshot = upsert_store->snapshot();
+        }
+        /// Pin one part and release the writer lock throughout the full scan.
+        verifying = true;
+        snapshot->verifyPart(part->name, part->getDeleteBitmapCacheIdentity(), true);
+        upsert_verification_cursor = part->info;
+        upsert_verification_task->scheduleAfter(100);
+    }
+    catch (...)
+    {
+        if (verifying || getCurrentExceptionCode() == ErrorCodes::CORRUPTED_DATA)
+        {
+            upsert_fenced = true;
+            tryLogCurrentException(log, "UpsertMergeTree background payload verification failed; table fenced pending recovery");
+            return;
+        }
+        tryLogCurrentException(log, "Could not schedule UpsertMergeTree background payload verification");
+        upsert_verification_task->scheduleAfter(1000);
+    }
+}
+
 void StorageMergeTree::runUpsertMaintenance()
 {
     if (upsert_fenced || shutdown_called || flush_called)
@@ -725,7 +782,9 @@ bool StorageMergeTree::rewriteUpsertParts(const DataPartsVector & sources, const
     const auto now = time(nullptr);
     const auto policy_checksum = Upsert::ttlPolicyChecksum(*metadata);
     const auto partition = sources.front()->info.getPartitionId();
-    Upsert::SnapshotPtr snapshot;
+    Upsert::SnapshotPtr snapshot = getUpsertReadSnapshotForQuery()->visibility;
+    for (const auto & source : sources)
+        snapshot->verifyPart(source->name, source->getDeleteBitmapCacheIdentity());
     std::vector<Upsert::PartRows> lineage;
     {
         auto lock = lockParts();
@@ -786,7 +845,7 @@ bool StorageMergeTree::rewriteUpsertParts(const DataPartsVector & sources, const
             output_rows = Upsert::decodePartRows(Upsert::readBoundedFile(std::filesystem::path(path) / Upsert::ROWS_FILE, Upsert::MAX_RECORD_BYTES));
             authorization.part = {UUIDHelpers::getHighBytes(part->uuid), UUIDHelpers::getLowBytes(part->uuid)};
             authorization.temporary_name = part->getDataPartStorage().getPartDirectory();
-            authorization.files_hash = Upsert::hashPartDirectory(path, true);
+            authorization.files_hash = Upsert::hashPartDirectory(path, true, &authorization.files_inventory);
             authorization.rows = part->rows_count;
             Upsert::syncDirectory(std::filesystem::path(path) / "..");
         }

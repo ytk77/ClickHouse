@@ -76,6 +76,8 @@ void writePartIndex(
     size_t max_key_bytes, ContextPtr context, MergeTreeDataPartChecksums & checksums);
 
 /// Authenticate all immutable part files, including sidecars. Optional barriers precede authorization.
-ObjectID hashPartDirectory(const String & path, bool sync_files);
+ObjectID hashPartDirectory(const String & path, bool sync_files, String * inventory = nullptr);
+/// Authenticate the inventory, names, sizes and planner metadata without reading column payloads.
+void verifyPartMetadata(const String & path, ObjectID expected, const String & inventory);
 }
 }

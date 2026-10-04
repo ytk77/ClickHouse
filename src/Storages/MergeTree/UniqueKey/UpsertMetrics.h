@@ -38,4 +38,7 @@ extern const Event UpsertPartCachePrewarms;
 extern const Event UpsertPartCachePrewarmFailures;
 extern const Event UpsertRecoveryMicroseconds;
 extern const Event UpsertRecoveryParts;
+extern const Event UpsertRecoveryMetadataParts;
+extern const Event UpsertPayloadVerificationParts;
+extern const Event UpsertPayloadVerificationMicroseconds;
 }

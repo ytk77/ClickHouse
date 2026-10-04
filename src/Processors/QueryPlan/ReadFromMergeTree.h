@@ -332,7 +332,8 @@ public:
         bool find_exact_ranges,
         bool is_parallel_reading_from_replicas_,
         bool allow_query_condition_cache_,
-        bool supports_skip_indexes_on_data_read);
+        bool supports_skip_indexes_on_data_read,
+        const Upsert::SnapshotPtr & upsert_snapshot);
 
 
     AnalysisResultPtr selectRangesToRead(bool find_exact_ranges = false) const;

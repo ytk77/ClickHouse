@@ -360,9 +360,26 @@ void writePartIndex(
     checksums.addFile(SSTIndexWriter::FILE_NAME, sst_hash.count(), sst_hash.getHash());
 }
 
-ObjectID hashPartDirectory(const String & path, bool sync_files)
+namespace
+{
+ObjectID hashPartDirectoryImpl(const String & path, bool sync_files, String * result_inventory, const String * trusted_inventory)
 {
     namespace fs = std::filesystem;
+    std::map<String, std::pair<UInt64, ObjectID>> expected_files;
+    if (trusted_inventory)
+    {
+        BinaryReader in{*trusted_inventory};
+        while (!in.bytes.empty())
+        {
+            const auto name = in.string();
+            if (name.ends_with('/'))
+                continue;
+            const auto size = in.number();
+            const auto digest = in.id();
+            if (!expected_files.emplace(name, std::make_pair(size, digest)).second)
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "Duplicate UpsertMergeTree inventory entry");
+        }
+    }
     if (fs::is_symlink(path) || !fs::is_directory(path))
         throw Exception(ErrorCodes::CORRUPTED_DATA, "Invalid UpsertMergeTree part directory {}", path);
     std::vector<fs::path> files;
@@ -387,6 +404,20 @@ ObjectID hashPartDirectory(const String & path, bool sync_files)
         inventory.string(fs::relative(directory, path).string() + "/");
     for (const auto & file : files)
     {
+        const auto relative = fs::relative(file, path).string();
+        if (trusted_inventory)
+        {
+            const auto expected = expected_files.find(relative);
+            if (expected == expected_files.end() || fs::file_size(file) != expected->second.first)
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree inventory size or name mismatch for {}", file.string());
+            if (file.extension() == ".bin" || file.filename() == SSTIndexWriter::FILE_NAME)
+            {
+                inventory.string(relative);
+                inventory.number(expected->second.first);
+                inventory.id(expected->second.second);
+                continue;
+            }
+        }
         const int fd = ::open(file.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
         if (fd < 0)
             ErrnoException::throwFromPath(ErrorCodes::CANNOT_OPEN_FILE, file.string(), "Cannot authenticate UpsertMergeTree part file");
@@ -430,6 +461,22 @@ ObjectID hashPartDirectory(const String & path, bool sync_files)
         for (auto it = directories.rbegin(); it != directories.rend(); ++it)
             syncDirectory(it->string());
     }
-    return hashLogRecord(inventory.bytes);
+    const auto digest = hashLogRecord(inventory.bytes);
+    if (result_inventory)
+        *result_inventory = std::move(inventory.bytes);
+    return digest;
+}
+}
+
+ObjectID hashPartDirectory(const String & path, bool sync_files, String * inventory)
+{
+    return hashPartDirectoryImpl(path, sync_files, inventory, nullptr);
+}
+
+void verifyPartMetadata(const String & path, ObjectID expected, const String & inventory)
+{
+    if (inventory.empty() || inventory.size() > MAX_RECORD_BYTES || hashLogRecord(inventory) != expected
+        || hashPartDirectoryImpl(path, false, nullptr, &inventory) != expected)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree authenticated inventory or metadata mismatch for {}", path);
 }
 }

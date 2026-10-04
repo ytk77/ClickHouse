@@ -6,6 +6,10 @@
 #include <gtest/gtest.h>
 #include <filesystem>
 #include <fstream>
+#include <future>
+#include <barrier>
+#include <Storages/MergeTree/UniqueKey/UpsertMetrics.h>
+#include <Common/ProfileEvents.h>
 
 #if USE_ROCKSDB
 #include <rocksdb/db.h>
@@ -47,7 +51,7 @@ protected:
         const auto path = directory / part.temporary_name;
         std::filesystem::create_directory(path);
         createDurableFile(path / ROWS_FILE, encodePartRows(rows));
-        part.files_hash = hashPartDirectory(path, true);
+        part.files_hash = hashPartDirectory(path, true, &part.files_inventory);
         return store.prepare(partition, std::move(part), rows);
     }
     void commit(StateStore & store, StateStore::Prepared & prepared)
@@ -76,7 +80,7 @@ protected:
             const auto path = directory / part.temporary_name;
             std::filesystem::create_directory(path);
             createDurableFile(path / ROWS_FILE, encodePartRows(rows));
-            part.files_hash = hashPartDirectory(path, true);
+            part.files_hash = hashPartDirectory(path, true, &part.files_inventory);
         }
         return store.prepareMerge("p", std::move(part), rows, sources, expired, retire_sources, input);
     }
@@ -868,6 +872,199 @@ TEST_F(UpsertDiskStateTest, ClosePreservesPinnedReadersAndReleasesDatabaseLock)
     /// Opening the same path proves that the original database handle and its lock are gone.
     StateStore reopened(directory, incarnation, true, true);
     EXPECT_EQ(reopened.authorizedPartCount(), 1);
+}
+
+
+TEST_F(UpsertDiskStateTest, RecoveryDefersSameSizePayloadCorruptionAndFencesOnRead)
+{
+    String name;
+    String identity;
+    {
+        StateStore store(directory, incarnation, false, true);
+        auto part = prepare(store, {{"key", 10}});
+        name = part.record.final_name;
+        identity = objectName(part.record.part);
+        commit(store, part);
+    }
+    std::fstream file(directory / name / ROWS_FILE, std::ios::in | std::ios::out | std::ios::binary);
+    file.put('X');
+    file.close();
+    StateStore reopened(directory, incarnation, true, true);
+    EXPECT_EQ(reopened.authorizedPartCount(), 1);
+    EXPECT_THROW(reopened.snapshot()->verifyPart(name, identity), Exception);
+    EXPECT_THROW(reopened.snapshot()->checkVerification(), Exception);
+    EXPECT_THROW(reopened.checkAdmission(), Exception);
+    EXPECT_THROW(reopened.pruneRetired(), Exception);
+}
+
+TEST_F(UpsertDiskStateTest, ConcurrentReadersSharePayloadVerification)
+{
+    String name;
+    String identity;
+    {
+        StateStore store(directory, incarnation, false, true);
+        auto part = prepare(store, {{"key", 10}});
+        name = part.record.final_name;
+        identity = objectName(part.record.part);
+        commit(store, part);
+    }
+    StateStore reopened(directory, incarnation, true, true);
+    const auto snapshot = reopened.snapshot();
+    const auto before = ProfileEvents::global_counters[ProfileEvents::UpsertPayloadVerificationParts];
+    std::barrier<> start(3);
+    auto reader = [&]
+    {
+        start.arrive_and_wait();
+        snapshot->verifyPart(name, identity);
+    };
+    auto first = std::async(std::launch::async, reader);
+    auto second = std::async(std::launch::async, reader);
+    start.arrive_and_wait();
+    EXPECT_NO_THROW(first.get());
+    EXPECT_NO_THROW(second.get());
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::UpsertPayloadVerificationParts] - before, 1);
+    snapshot->verifyPart(name, identity);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::UpsertPayloadVerificationParts] - before, 1);
+    std::fstream file(directory / name / ROWS_FILE, std::ios::in | std::ios::out | std::ios::binary);
+    file.put('X');
+    file.close();
+    EXPECT_THROW(snapshot->verifyPart(name, identity, true), Exception);
+}
+
+TEST_F(UpsertDiskStateTest, InventoryCorruptionCannotAuthorizeMetadata)
+{
+    String identity;
+    {
+        StateStore store(directory, incarnation, false, true);
+        auto part = prepare(store, {{"key", 10}});
+        identity = objectName(part.record.part);
+        commit(store, part);
+    }
+    rocksdb::DB * raw = nullptr;
+    ASSERT_TRUE(rocksdb::DB::Open(rocksdb::Options{}, (directory / "upsert_state_v2").string(), &raw).ok());
+    std::unique_ptr<rocksdb::DB> database(raw);
+    ASSERT_TRUE(database->Put(rocksdb::WriteOptions{}, "V" + identity, "forged").ok());
+    database.reset();
+    EXPECT_THROW((StateStore(directory, incarnation, true, true)), Exception);
+}
+
+TEST_F(UpsertDiskStateTest, LegacyInventoryIsEstablishedOnlyAfterFullVerification)
+{
+    String name;
+    String identity;
+    {
+        StateStore store(directory, incarnation, false, true);
+        auto part = prepare(store, {{"key", 10}});
+        name = part.record.final_name;
+        identity = objectName(part.record.part);
+        commit(store, part);
+    }
+    rocksdb::DB * raw = nullptr;
+    ASSERT_TRUE(rocksdb::DB::Open(rocksdb::Options{}, (directory / "upsert_state_v2").string(), &raw).ok());
+    std::unique_ptr<rocksdb::DB> database(raw);
+    ASSERT_TRUE(database->Delete(rocksdb::WriteOptions{}, "V" + identity).ok());
+    database.reset();
+    const auto full_before = ProfileEvents::global_counters[ProfileEvents::UpsertRecoveryParts];
+    {
+        StateStore reopened(directory, incarnation, true, true);
+        EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::UpsertRecoveryParts] - full_before, 1);
+        EXPECT_NO_THROW(reopened.snapshot()->verifyPart(name, identity));
+    }
+    const auto metadata_before = ProfileEvents::global_counters[ProfileEvents::UpsertRecoveryMetadataParts];
+    StateStore reopened(directory, incarnation, true, true);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::UpsertRecoveryParts] - full_before, 1);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::UpsertRecoveryMetadataParts] - metadata_before, 1);
+}
+
+TEST_F(UpsertDiskStateTest, RecoveryRetainsSourcesUntilReplacementVerification)
+{
+    String source;
+    String output;
+    String identity;
+    {
+        StateStore store(directory, incarnation, false, true);
+        auto first = prepare(store, {{"key", 10}});
+        source = first.record.final_name;
+        commit(store, first);
+        auto part = merge(store, store.loadPartRows(source), {source});
+        output = part.record.final_name;
+        identity = objectName(part.record.part);
+        commit(store, part);
+    }
+    /// Native cleanup may have renamed its source before the process stopped.
+    std::filesystem::rename(directory / source, directory / ("delete_tmp_" + source));
+    const auto retained = directory / "upsert_recovery_retired" / source;
+    {
+        StateStore reopened(directory, incarnation, true, true);
+        EXPECT_FALSE(std::filesystem::exists(directory / source));
+        EXPECT_TRUE(std::filesystem::exists(retained / ROWS_FILE));
+        reopened.pruneRetired();
+        EXPECT_TRUE(std::filesystem::exists(retained / ROWS_FILE));
+    }
+    StateStore reopened(directory, incarnation, true, true);
+    EXPECT_TRUE(std::filesystem::exists(retained / ROWS_FILE));
+    reopened.snapshot()->verifyPart(output, identity);
+    reopened.pruneRetired();
+    EXPECT_FALSE(std::filesystem::exists(retained));
+}
+
+TEST_F(UpsertDiskStateTest, CorruptReplacementCannotReclaimRetainedSource)
+{
+    String source;
+    String output;
+    String identity;
+    {
+        StateStore store(directory, incarnation, false, true);
+        auto first = prepare(store, {{"key", 10}});
+        source = first.record.final_name;
+        commit(store, first);
+        auto part = merge(store, store.loadPartRows(source), {source});
+        output = part.record.final_name;
+        identity = objectName(part.record.part);
+        commit(store, part);
+    }
+    std::fstream file(directory / output / ROWS_FILE, std::ios::in | std::ios::out | std::ios::binary);
+    file.put('X');
+    file.close();
+    StateStore reopened(directory, incarnation, true, true);
+    EXPECT_THROW(reopened.snapshot()->verifyPart(output, identity), Exception);
+    EXPECT_THROW(reopened.pruneRetired(), Exception);
+    EXPECT_TRUE(std::filesystem::exists(directory / "upsert_recovery_retired" / source / ROWS_FILE));
+}
+
+TEST_F(UpsertDiskStateTest, AuthorizedTemporaryPayloadStillRequiresFullVerification)
+{
+    String temporary;
+    {
+        StateStore store(directory, incarnation, false, true);
+        auto part = prepare(store, {{"key", 10}});
+        temporary = part.record.temporary_name;
+        store.append(part);
+    }
+    std::fstream file(directory / temporary / ROWS_FILE, std::ios::in | std::ios::out | std::ios::binary);
+    file.put('X');
+    file.close();
+    EXPECT_THROW((StateStore(directory, incarnation, true, true)), Exception);
+    EXPECT_TRUE(std::filesystem::exists(directory / temporary));
+}
+
+TEST_F(UpsertDiskStateTest, OldSnapshotVerifiesItsPayloadAfterRetirement)
+{
+    String source;
+    String identity;
+    {
+        StateStore store(directory, incarnation, false, true);
+        auto first = prepare(store, {{"key", 10}});
+        source = first.record.final_name;
+        identity = objectName(first.record.part);
+        commit(store, first);
+    }
+    StateStore reopened(directory, incarnation, true, true);
+    const auto old = reopened.snapshot();
+    auto truncated = reopened.prepareTruncate();
+    reopened.append(truncated);
+    reopened.publish(truncated);
+    EXPECT_NO_THROW(old->verifyPart(source, identity));
 }
 
 #endif

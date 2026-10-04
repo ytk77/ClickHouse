@@ -215,7 +215,7 @@ void UniqueKeyDenseIndexOps::ensureValidDenseIndex(MutableDataPartPtr & part, bo
     if (!metadata_snapshot || !metadata_snapshot->hasUniqueKey())
         return;
 
-    /// The commit coordinator authenticates every `UpsertMergeTree` file before native loading.
+    /// `UpsertMergeTree` authenticates metadata at open and payloads before use or background verification.
     /// Rebuilding through the legacy four-byte value writer would destroy durable lineage.
     if (data.merging_params.upsert)
         return;

@@ -7,6 +7,7 @@
 #include <DataTypes/DataTypesNumber.h>
 #include <Parsers/ASTIdentifier.h>
 #include <Common/Exception.h>
+#include <Common/scope_guard_safe.h>
 #include <gtest/gtest.h>
 #include <limits>
 #include <filesystem>
@@ -361,4 +362,43 @@ TEST_F(UpsertTTLManifestTest, MutableSchemaUpgradesFixedTTLManifest)
     enableMutableSchema(directory, "default", metadata, "");
     metadata.table_ttl = {};
     EXPECT_EQ(initialize(true, disk_state), incarnation);
+}
+
+TEST(UpsertPartInventory, AuthenticatesMetadataAndDefersOnlyPayloadContents)
+{
+    const auto directory = std::filesystem::path("tmp") / ("upsert_inventory_" + objectName(newObjectID()));
+    std::filesystem::create_directories(directory);
+    SCOPE_EXIT({ std::filesystem::remove_all(directory); });
+    createDurableFile(directory / "data.bin", "payload");
+    createDurableFile(directory / "count.txt", "1234567");
+    String inventory;
+    const auto digest = hashPartDirectory(directory, true, &inventory);
+    EXPECT_NO_THROW(verifyPartMetadata(directory, digest, inventory));
+    std::filesystem::remove(directory / "data.bin");
+    createDurableFile(directory / "data.bin", "changed");
+    EXPECT_NO_THROW(verifyPartMetadata(directory, digest, inventory));
+    EXPECT_NE(hashPartDirectory(directory, false), digest);
+    std::filesystem::remove(directory / "count.txt");
+    createDurableFile(directory / "count.txt", "7654321");
+    EXPECT_THROW(verifyPartMetadata(directory, digest, inventory), Exception);
+}
+
+TEST(UpsertPartInventory, RejectsMissingTruncatedAndAdditionalFiles)
+{
+    const auto directory = std::filesystem::path("tmp") / ("upsert_inventory_" + objectName(newObjectID()));
+    std::filesystem::create_directories(directory);
+    SCOPE_EXIT({ std::filesystem::remove_all(directory); });
+    createDurableFile(directory / "data.bin", "payload");
+    String inventory;
+    const auto digest = hashPartDirectory(directory, true, &inventory);
+    std::filesystem::remove(directory / "data.bin");
+    EXPECT_THROW(verifyPartMetadata(directory, digest, inventory), Exception);
+    createDurableFile(directory / "data.bin", "short");
+    EXPECT_THROW(verifyPartMetadata(directory, digest, inventory), Exception);
+    std::filesystem::remove(directory / "data.bin");
+    createDurableFile(directory / "data.bin", "payload");
+    createDurableFile(directory / "extra.bin", "payload");
+    EXPECT_THROW(verifyPartMetadata(directory, digest, inventory), Exception);
+    std::filesystem::remove(directory / "extra.bin");
+    EXPECT_THROW(verifyPartMetadata(directory, digest, inventory + "x"), Exception);
 }

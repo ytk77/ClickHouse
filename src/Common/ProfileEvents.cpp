@@ -129,6 +129,9 @@
     M(UpsertMaintenanceCorruptionFailures, "Maintenance corruption detections that fence an `UpsertMergeTree` table.", ValueType::Number) \
     M(UpsertMaintenanceCandidates, "Part candidates inspected by `UpsertMergeTree` maintenance.", ValueType::Number) \
     M(UpsertRecoveryMicroseconds, "Time spent recovering and verifying `UpsertMergeTree` disk state.", ValueType::Microseconds) \
+    M(UpsertRecoveryMetadataParts, "Authorized parts whose inventory and metadata were verified without reading column payloads during `UpsertMergeTree` recovery.", ValueType::Number) \
+    M(UpsertPayloadVerificationParts, "Full `UpsertMergeTree` payload verifications completed after recovery.", ValueType::Number) \
+    M(UpsertPayloadVerificationMicroseconds, "Time spent on full `UpsertMergeTree` payload verification after recovery.", ValueType::Microseconds) \
     M(UpsertRecoveryParts, "Authorized parts fully verified during `UpsertMergeTree` recovery.", ValueType::Number) \
     M(UniqueKeyBitmapLoadMicroseconds, "Time spent reading and deserializing UNIQUE KEY delete-bitmap sidecar files on a DeleteBitmapCache miss.", ValueType::Microseconds) \
     M(UniqueKeyBitmapUpdates, "Number of UNIQUE KEY delete-bitmap sidecar files written (one per supersession / DELETE commit).", ValueType::Number) \
