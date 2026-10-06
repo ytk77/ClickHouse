@@ -167,6 +167,9 @@ private:
     /// Accessed only by the single table maintenance task; resume after the previous selected unit.
     std::optional<MergeTreePartInfo> upsert_maintenance_cursor;
     DataPartPtr upsert_maintenance_pending;
+    UInt64 upsert_maintenance_effective_target = 0;
+    UInt64 upsert_maintenance_unadmittable = 0;
+    UInt64 upsert_maintenance_yields = 0;
     /// Budget-cut outputs are complete at this target. Protected by `upsert_operation_mutex`;
     /// entries are removed with their active parts and rebuilt through compaction after restart.
     std::unordered_map<String, size_t> upsert_saturated_parts;
@@ -178,11 +181,13 @@ private:
     void mutateUpsert(const MutationCommands & commands, ContextPtr context);
     void truncateUpsert(ContextPtr context);
     bool rewriteUpsertParts(const DataPartsVector & sources, const StorageMetadataPtr & metadata,
-        ContextPtr context, bool apply_ttl, const MutationCommands & commands = {}, size_t max_output_bytes = 32U << 20, bool remember_budget_cuts = false);
+        ContextPtr context, bool apply_ttl, const MutationCommands & commands = {}, size_t max_output_bytes = 32U << 20,
+        bool remember_budget_cuts = false, bool * yielded = nullptr);
     bool upsertPartNeedsSchemaRewrite(const DataPartPtr & part, const StorageMetadataPtr & metadata, ContextPtr context) const;
     void reconcileUpsertParts(const StorageMetadataPtr & metadata, ContextPtr context);
     /// Serialize part rewrites and schema changes; inserts still prepare and commit concurrently.
     std::mutex upsert_operation_mutex;
+    std::atomic<UInt64> upsert_foreground_waiters{0};
     RWLock upsert_schema_lock = RWLockImpl::create();
     /// Serialize policy publication with maintenance commit, without blocking part preparation or readers.
     std::mutex upsert_ttl_mutex;

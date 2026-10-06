@@ -1343,9 +1343,23 @@ const VersionToSettingsChangesMap & getMergeTreeSettingsChangesHistory()
     static std::once_flag initialized_flag;
     std::call_once(initialized_flag, [&]
     {
+        addSettingsChanges(merge_tree_settings_changes_history, "26.8.1.1",
+        {
+            {"upsert_maintenance_target_bytes", 268435456, 4294967296ULL, "Increase the default background rewrite target for `UpsertMergeTree` to 4 GiB to reduce part counts."},
+        });
+
         addSettingsChanges(merge_tree_settings_changes_history, "26.8",
         {
             {"upsert_maintenance_target_bytes", 33554432, 268435456, "Increase the default background rewrite target for `UpsertMergeTree` to 256 MiB to reduce part counts."},
+            {"upsert_index_cache_bytes", 64ULL << 20, 64ULL << 20, "New resource setting for `UpsertMergeTree`."},
+            {"upsert_write_buffer_bytes", 16ULL << 20, 16ULL << 20, "New resource setting for `UpsertMergeTree`."},
+            {"upsert_write_buffer_count", 3, 3, "New resource setting for `UpsertMergeTree`."},
+            {"upsert_wal_bytes", 64ULL << 20, 64ULL << 20, "New resource setting for `UpsertMergeTree`."},
+            {"upsert_background_jobs", 2, 2, "New resource setting for `UpsertMergeTree`."},
+            {"upsert_max_open_files", 128, 128, "New resource setting for `UpsertMergeTree`."},
+            {"upsert_recovery_threads", 4, 4, "New resource setting for `UpsertMergeTree`."},
+            {"upsert_mask_cache_bytes", 32ULL << 20, 32ULL << 20, "New resource setting for `UpsertMergeTree`."},
+            {"upsert_partitioned_filters", true, true, "New setting for `UpsertMergeTree`."},
             {"packed_skip_index_max_bytes", 0, 1024 * 1024, "Promote to BETA and enable by default: pack skip-index substreams whose serialized on-disk size is at most 1 MiB into a single `skp_idx.packed` archive per part, cutting object count and read requests on object storage. Larger substreams keep the standalone `skp_idx_<name>.idx2` / `.mrk2` layout. Set to 0 to restore the previous behavior (no packing)."},
             {"compute_exact_num_defaults_for_sparse_columns", false, true, "Promote to BETA and enable by default: compute the exact per-column `num_defaults` counter during inserts and merges (instead of the sampling estimate), so `optimize_trivial_count_with_sparsity_filter` and sparsity-based pruning can rely on it."},
             {"allow_experimental_adaptive_codec_selection", false, false, "New setting."},

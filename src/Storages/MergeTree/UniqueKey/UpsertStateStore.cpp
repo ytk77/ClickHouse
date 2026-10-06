@@ -412,11 +412,18 @@ StateStore::Prepared StateStore::preparePartition(
     return disk->preparePartition(std::move(additions), rows, removed, reset_partitions, detached, cleared_partitions);
 }
 
-PartRows StateStore::loadPartRows(const String & name) const
+PartRows StateStore::loadPartRows(const String & name, PartCommit * authorization) const
 {
     if (!disk)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Legacy UpsertMergeTree does not authorize maintenance reads");
-    return disk->loadPartRows(name);
+    return disk->loadPartRows(name, authorization);
+}
+
+void StateStore::validateRetirement(const String & partition, const std::vector<String> & sources, const MergeInput & input) const
+{
+    if (!disk)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Legacy UpsertMergeTree does not authorize retirement validation");
+    disk->validateRetirement(partition, sources, input);
 }
 
 void StateStore::pruneRetired()

@@ -267,7 +267,8 @@ struct Database
 
     /// Bound temporary lookup memory independently of the input unit size.
     template <typename Callback>
-    void forEachWinner(const String & partition, const PartRows & rows, Callback && callback, const std::vector<UInt32> * offsets = nullptr) const
+    void forEachWinner(const String & partition, const PartRows & rows, Callback && callback,
+        const std::vector<UInt32> * offsets = nullptr, bool fill_cache = true) const
     {
         constexpr size_t lookup_batch_size = 1024;
         const auto key_prefix = prefix('W', partition);
@@ -295,7 +296,9 @@ struct Database
             {
                 ProfileEventTimeIncrement<Microseconds> timer(ProfileEvents::UpsertWinnerLookupMicroseconds);
                 ProfileEvents::increment(ProfileEvents::UpsertWinnerLookupKeys, count);
-                db->MultiGet(rocksdb::ReadOptions{}, db->DefaultColumnFamily(), count, slices.data(), values.data(), statuses.data());
+                rocksdb::ReadOptions options;
+                options.fill_cache = fill_cache;
+                db->MultiGet(options, db->DefaultColumnFamily(), count, slices.data(), values.data(), statuses.data());
             }
             for (size_t i = 0; i < count; ++i)
             {
@@ -794,7 +797,7 @@ void DiskState::close()
 }
 
 
-PartRows DiskState::loadPartRows(const String & name) const
+PartRows DiskState::loadPartRows(const String & name, PartCommit * authorization) const
 {
     impl->database->checkVerification();
     try
@@ -802,7 +805,7 @@ PartRows DiskState::loadPartRows(const String & name) const
         auto value = impl->database->get("A" + name);
         if (!value)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree maintenance source is not authorized");
-        const auto record = decodePartCommit(*value);
+        auto record = decodePartCommit(*value);
         const auto inventory = impl->database->get("V" + objectName(record.part));
         /// Commit, recovery and retirement maintain matching authorization and inventory records.
         if (!inventory || hashLogRecord(*inventory) != record.files_hash)
@@ -819,7 +822,49 @@ PartRows DiskState::loadPartRows(const String & name) const
             row.value.row = row.value.row.resolve(csn);
         }
         impl->database->checkVerification();
+        if (authorization)
+        {
+            record.dead.clear();
+            record.kills.clear();
+            record.token = {};
+            record.token.accepted = record.rows;
+            *authorization = std::move(record);
+        }
         return rows;
+    }
+    catch (const Exception & error)
+    {
+        if (error.code() == ErrorCodes::CORRUPTED_DATA)
+            impl->database->verification_failed = true;
+        throw;
+    }
+}
+
+void DiskState::validateRetirement(const String & partition, const std::vector<String> & sources, const StateStore::MergeInput & input) const
+{
+    impl->database->checkVerification();
+    if (!input.authorizations || input.authorizations->size() != sources.size() || input.lineage.size() != sources.size())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree retirement validation requires authenticated source lineage");
+    try
+    {
+        for (size_t i = 0; i < sources.size(); ++i)
+        {
+            const auto & source = (*input.authorizations)[i];
+            if (source.final_name != sources[i] || source.rows != input.lineage[i].size())
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree retirement source lineage identity mismatch");
+            impl->database->forEachWinner(partition, input.lineage[i], [&](const PartRow &, const String &, std::optional<std::string_view> value)
+            {
+                if (!value)
+                    return;
+                BinaryReader in{*value};
+                const auto winner_part = in.id();
+                decodeIndexValue(in.string());
+                in.end();
+                if (winner_part == source.part)
+                    throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree fully masked retirement source retains a winner");
+            }, nullptr, false);
+        }
+        impl->database->checkVerification();
     }
     catch (const Exception & error)
     {
@@ -1180,6 +1225,14 @@ StateStore::Prepared DiskState::prepareMerge(
         if (!authorization)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree merge source is no longer active");
         auto source = decodePartCommit(*authorization);
+        if (input && input->authorizations)
+        {
+            if (input->authorizations->size() != sources.size())
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree source authorization count mismatch");
+            const auto & original = (*input->authorizations)[source_index];
+            if (source.part != original.part || source.files_hash != original.files_hash || source.rows != original.rows)
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree source authorization changed after its lineage was loaded");
+        }
         const auto info = MergeTreePartInfo::fromPartName(name, MERGE_TREE_DATA_MIN_FORMAT_VERSION_WITH_CUSTOM_PARTITIONING);
         if (info.getPartitionId() != partition)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree merge crosses SQL partitions");
@@ -1197,56 +1250,62 @@ StateStore::Prepared DiskState::prepareMerge(
             throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree rewrite source is absent from its read snapshot");
         DeleteBitmap rewritten_mask;
         rewritten_mask.merge(*source_mask);
-        impl->database->forEachWinner(partition, source_rows, [&](const PartRow & row, const String & key, std::optional<std::string_view> value)
+        const bool masked_retirement = retire_sources && input && input->authorizations && rows.empty() && expired.empty();
+        if (masked_retirement && source_mask->cardinality() != source.rows)
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree retirement source is not fully masked");
+        if (!masked_retirement)
         {
-            auto it = output.find(row.key);
-            /// A partial rewrite leaves masked copies of the same lineage in an active source.
-            /// Only the copy visible when the payload was read can authorize an output or expiration.
-            const bool was_visible = !original_mask || !original_mask->contains(row.value.row_offset);
-            const bool maps_to_output = was_visible && it != output.end() && it->second->value.row == row.value.row;
-            auto expiration = expirations.find(row.key);
-            const bool expires = was_visible && expiration != expirations.end() && expiration->second->value == row.value;
-            if (maps_to_output && !mapped_output.insert(row.key).second)
-                throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree merge maps an output identity twice");
-            if (expires && !mapped_expirations.insert(row.key).second)
-                throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree merge maps an expiration identity twice");
-            if (!value)
+            impl->database->forEachWinner(partition, source_rows, [&](const PartRow & row, const String & key, std::optional<std::string_view> value)
             {
-                /// An earlier `TTL` commit can remove the winner while superseded physical rows still await reclamation.
-                if (source_mask->contains(row.value.row_offset) && !maps_to_output && !expires)
-                    return;
-                throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree merge source has no durable winner");
-            }
-            BinaryReader in{*value};
-            const auto winner_part = in.id();
-            const auto winner = decodeIndexValue(in.string());
-            in.end();
-            if (winner_part == source.part && winner.row_offset == row.value.row_offset)
-            {
-                if (!retire_sources && !maps_to_output && !expires)
-                    return;
-                if ((!maps_to_output && !expires) || winner.row != row.value.row || source_mask->contains(row.value.row_offset))
-                    throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree merge omitted or changed a live source identity");
-                if (expires)
-                    batch.Delete(key);
-                else
+                auto it = output.find(row.key);
+                /// A partial rewrite leaves masked copies of the same lineage in an active source.
+                /// Only the copy visible when the payload was read can authorize an output or expiration.
+                const bool was_visible = !original_mask || !original_mask->contains(row.value.row_offset);
+                const bool maps_to_output = was_visible && it != output.end() && it->second->value.row == row.value.row;
+                auto expiration = expirations.find(row.key);
+                const bool expires = was_visible && expiration != expirations.end() && expiration->second->value == row.value;
+                if (maps_to_output && !mapped_output.insert(row.key).second)
+                    throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree merge maps an output identity twice");
+                if (expires && !mapped_expirations.insert(row.key).second)
+                    throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree merge maps an expiration identity twice");
+                if (!value)
                 {
-                    BinaryWriter updated;
-                    updated.id(part.part);
-                    updated.string(encodeIndexValue(it->second->value));
-                    batch.Put(key, updated.bytes);
-                    if (chunked)
-                        dead->remove(it->second->value.row_offset);
+                    /// An earlier `TTL` commit can remove the winner while superseded physical rows still await reclamation.
+                    if (source_mask->contains(row.value.row_offset) && !maps_to_output && !expires)
+                        return;
+                    throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree merge source has no durable winner");
                 }
-                rewritten_mask.add(row.value.row_offset);
-                checkBatchBudget(batch);
-            }
-            else if (maps_to_output)
-            {
-                /// A concurrent upsert superseded this exact source row after the merge snapshot.
-                dead->add(it->second->value.row_offset);
-            }
-        }, retire_sources ? nullptr : &input->offsets[source_index]);
+                BinaryReader in{*value};
+                const auto winner_part = in.id();
+                const auto winner = decodeIndexValue(in.string());
+                in.end();
+                if (winner_part == source.part && winner.row_offset == row.value.row_offset)
+                {
+                    if (!retire_sources && !maps_to_output && !expires)
+                        return;
+                    if ((!maps_to_output && !expires) || winner.row != row.value.row || source_mask->contains(row.value.row_offset))
+                        throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree merge omitted or changed a live source identity");
+                    if (expires)
+                        batch.Delete(key);
+                    else
+                    {
+                        BinaryWriter updated;
+                        updated.id(part.part);
+                        updated.string(encodeIndexValue(it->second->value));
+                        batch.Put(key, updated.bytes);
+                        if (chunked)
+                            dead->remove(it->second->value.row_offset);
+                    }
+                    rewritten_mask.add(row.value.row_offset);
+                    checkBatchBudget(batch);
+                }
+                else if (maps_to_output)
+                {
+                    /// A concurrent upsert superseded this exact source row after the merge snapshot.
+                    dead->add(it->second->value.row_offset);
+                }
+            }, retire_sources ? nullptr : &input->offsets[source_index]);
+        }
         if (retire_sources)
         {
             /// Retirement authenticates the payload; historical winner changes and tokens stay in their own state.
@@ -1778,7 +1837,11 @@ void DiskState::finishTruncate()
 {
     std::unreachable();
 }
-PartRows DiskState::loadPartRows(const String &) const
+PartRows DiskState::loadPartRows(const String &, PartCommit *) const
+{
+    std::unreachable();
+}
+void DiskState::validateRetirement(const String &, const std::vector<String> &, const StateStore::MergeInput &) const
 {
     std::unreachable();
 }

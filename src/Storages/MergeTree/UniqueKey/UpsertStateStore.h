@@ -48,7 +48,8 @@ String encodePartCommit(const PartCommit & record);
 PartCommit decodePartCommit(std::string_view bytes);
 
 /// Protocol dispatch for legacy parts-only state and disk-backed state with atomic retirement.
-/// Public operations require the table's parts lock, except recovery and the serialized `finishTruncate` cleanup.
+/// Public operations require the table's parts lock, except immutable lineage reads, retirement validation,
+/// recovery and the serialized `finishTruncate` cleanup. Reads require pinned sources and exclusion of source retirement.
 class StateStore
 {
     struct Winner
@@ -99,25 +100,28 @@ public:
     Prepared prepare(const String & partition, PartCommit part, const PartRows & rows);
     Prepared prepare(const String & partition, PartCommit part, const ValidatedPartRows & rows);
     /// Immutable lineage loaded by `loadPartRows` while the sources are pinned and serialized against retirement.
-    /// Intermediate commits use the selected offsets; final retirement checks every source row.
+    /// Intermediate commits use selected offsets. Authenticated identities guard out-of-lock lineage loads.
     struct MergeInput
     {
         SnapshotPtr snapshot;
         const std::vector<PartRows> & lineage;
         const std::vector<std::vector<UInt32>> & offsets;
+        const std::vector<PartCommit> * authorizations = nullptr;
     };
     Prepared prepareMerge(
         const String & partition, PartCommit part, const PartRows & rows, const std::vector<String> & sources,
         const PartRows & expired = {}, bool retire_sources = true, const MergeInput * input = nullptr,
         std::optional<bool> complete_output = std::nullopt);
     Prepared prepareTruncate();
-    /// Requires writer exclusion, but must run outside the parts lock after publication.
+    /// Requires exclusion of source retirement, but must run outside the parts lock after publication.
     void finishTruncate();
     Prepared preparePartition(
         std::vector<PartCommit> additions, const std::vector<ValidatedPartRows> & rows,
         const std::vector<String> & removed, const std::vector<String> & reset_partitions, const std::vector<String> & detached,
         const std::vector<String> & cleared_partitions);
-    PartRows loadPartRows(const String & name) const;
+    PartRows loadPartRows(const String & name, PartCommit * authorization = nullptr) const;
+    /// Scan winners outside the parts lock after sources are fully masked, with retirement excluded.
+    void validateRetirement(const String & partition, const std::vector<String> & sources, const MergeInput & input) const;
     void pruneRetired();
     void append(const Prepared & prepared);
     void publish(Prepared & prepared) noexcept;

@@ -1,5 +1,6 @@
 #include <Storages/StorageMergeTree.h>
 #include <Storages/MergeTree/UniqueKey/UpsertStateStore.h>
+#include <Storages/MergeTree/UniqueKey/UpsertOperationWait.h>
 #include <Storages/MergeTree/UniqueKey/UpsertTableManifest.h>
 #include <Storages/MergeTree/UniqueKey/UpsertDurableFile.h>
 #include <Storages/MergeTree/UniqueKey/UpsertBinary.h>
@@ -337,6 +338,7 @@ Pipe StorageMergeTree::alterPartition(
         StoragePtr other_storage;
         StorageMergeTree * other = nullptr;
         TableLockHolder other_lifetime;
+        Upsert::ForegroundOperationWait foreground_wait(upsert_foreground_waiters);
         std::unique_lock operation_lock(upsert_operation_mutex, std::defer_lock);
         std::unique_lock<std::mutex> other_operation;
         if (transfer)
@@ -351,12 +353,15 @@ Pipe StorageMergeTree::alterPartition(
                 throw Exception(ErrorCodes::BAD_ARGUMENTS, "UpsertMergeTree partition transfers require a different disk_state_v2 UpsertMergeTree table");
             other_lifetime = other->lockForShare(query_context->getCurrentQueryId(), settings[Setting::lock_acquire_timeout]);
             other_operation = std::unique_lock(other->upsert_operation_mutex, std::defer_lock);
+            Upsert::ForegroundOperationWait other_wait(other->upsert_foreground_waiters);
             std::lock(operation_lock, other_operation);
+            other_wait.acquired();
             if (other->upsert_fenced)
                 throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree transfer table is fenced pending recovery");
         }
         else
             operation_lock.lock();
+        foreground_wait.acquired();
         if (upsert_fenced)
             throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree is fenced pending restart and recovery");
         const auto metadata = getInMemoryMetadataPtr(query_context, true);

@@ -4,6 +4,8 @@
 #include <Storages/MergeTree/UniqueKey/UpsertTableManifest.h>
 #include <Storages/MergeTree/UniqueKey/UpsertDurableFile.h>
 #include <Storages/MergeTree/UniqueKey/UpsertStateStore.h>
+#include <Storages/MergeTree/UniqueKey/UpsertMaintenanceMemory.h>
+#include <Storages/MergeTree/UniqueKey/UpsertOperationWait.h>
 #include <Storages/StorageInMemoryMetadata.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <Parsers/ASTIdentifier.h>
@@ -21,6 +23,42 @@ extern const int CORRUPTED_DATA;
 
 using namespace DB;
 using namespace DB::Upsert;
+
+TEST(UpsertMaintenanceMemoryTest, UsesConfiguredLimitsIndependentlyOfCurrentUsage)
+{
+    EXPECT_EQ(maintenanceMemoryCeiling(0, 0), std::numeric_limits<UInt64>::max());
+    EXPECT_EQ(maintenanceMemoryCeiling(-1, 1ULL << 30), 1ULL << 30);
+    EXPECT_EQ(maintenanceMemoryCeiling(2ULL << 30, 1ULL << 30), 1ULL << 30);
+    EXPECT_EQ(maintenanceEffectiveTarget(4ULL << 30, std::numeric_limits<UInt64>::max()), 4ULL << 30);
+    EXPECT_EQ(maintenanceEffectiveTarget(4ULL << 30, 32ULL << 30), 2ULL << 30);
+    EXPECT_EQ(maintenanceEffectiveTarget(4ULL << 30, 1ULL << 30), 64ULL << 20);
+    EXPECT_EQ(maintenanceEffectiveTarget(4ULL << 30, 128ULL << 20), 32ULL << 20);
+    EXPECT_EQ(maintenanceEffectiveTarget(32ULL << 20, std::numeric_limits<UInt64>::max()), 32ULL << 20);
+}
+
+TEST(UpsertMaintenanceMemoryTest, ForegroundWaitCountsOnlyPendingAcquisitions)
+{
+    std::atomic<UInt64> waiting{0};
+    const auto before = CurrentMetrics::get(CurrentMetrics::UpsertForegroundOperationWaiters);
+    {
+        ForegroundOperationWait first(waiting);
+        EXPECT_EQ(waiting.load(), 1);
+        EXPECT_EQ(CurrentMetrics::get(CurrentMetrics::UpsertForegroundOperationWaiters), before + 1);
+        {
+            ForegroundOperationWait second(waiting);
+            EXPECT_EQ(waiting.load(), 2);
+            EXPECT_EQ(CurrentMetrics::get(CurrentMetrics::UpsertForegroundOperationWaiters), before + 2);
+            first.acquired();
+            first.acquired();
+            EXPECT_EQ(waiting.load(), 1);
+        }
+        EXPECT_EQ(waiting.load(), 0);
+    }
+    EXPECT_EQ(waiting.load(), 0);
+    ForegroundOperationWait disabled(waiting, false);
+    EXPECT_EQ(waiting.load(), 0);
+    EXPECT_EQ(CurrentMetrics::get(CurrentMetrics::UpsertForegroundOperationWaiters), before);
+}
 
 namespace
 {

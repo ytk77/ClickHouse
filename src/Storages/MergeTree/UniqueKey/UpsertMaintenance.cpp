@@ -1,6 +1,9 @@
 #include <Storages/MergeTree/UniqueKey/UpsertMetrics.h>
 #include <Storages/StorageMergeTree.h>
 #include <Storages/MergeTree/UniqueKey/UpsertStateStore.h>
+#include <Storages/MergeTree/UniqueKey/UpsertMaintenanceMemory.h>
+#include <Storages/MergeTree/UniqueKey/UpsertOperationWait.h>
+#include <Storages/MergeTree/UniqueKey/UpsertBinary.h>
 #include <Storages/MergeTree/UniqueKey/UpsertDurableFile.h>
 #include <Storages/MergeTree/UniqueKey/UpsertTableManifest.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
@@ -57,6 +60,7 @@ extern const int CANNOT_ALLOCATE_MEMORY;
 namespace DB::FailPoints
 {
 extern const char upsert_pause_before_merge_commit[];
+extern const char upsert_pause_before_rewrite_read[];
 extern const char upsert_pause_background_verification[];
 extern const char upsert_maintenance_corrupt_candidate[];
 extern const char upsert_ttl_pause_after_manifest_upgrade[];
@@ -309,9 +313,11 @@ void StorageMergeTree::alterUpsertMetadata(const AlterCommands & commands, Conte
         return command.type != AlterCommand::MODIFY_TTL && command.type != AlterCommand::REMOVE_TTL;
     });
     RWLockImpl::LockHolder schema_lock;
+    Upsert::ForegroundOperationWait foreground_wait(upsert_foreground_waiters, changes_schema);
     std::unique_lock operation_lock(upsert_operation_mutex, std::defer_lock);
     if (changes_schema)
         operation_lock.lock();
+    foreground_wait.acquired();
     const auto old_metadata = getInMemoryMetadataPtr(local_context, true);
     auto new_metadata = *old_metadata;
     commands.apply(new_metadata, local_context, (*getSettings())[MergeTreeSetting::share_nested_offsets]);
@@ -437,6 +443,12 @@ void StorageMergeTree::runUpsertVerification()
         if (upsert_fenced || shutdown_called || flush_called)
             return;
         auto table_lock = lockForShare(RWLockImpl::NO_QUERY, Poco::Timespan(5, 0));
+        if (upsert_foreground_waiters.load(std::memory_order_relaxed))
+        {
+            ProfileEvents::increment(ProfileEvents::UpsertMaintenanceYields);
+            upsert_verification_task->scheduleAfter(1000);
+            return;
+        }
         std::unique_lock operation_lock(upsert_operation_mutex, std::try_to_lock);
         if (!operation_lock.owns_lock())
         {
@@ -525,13 +537,28 @@ void StorageMergeTree::runUpsertMaintenance()
             if (upsert_fenced)
                 return;
         }
+        if (upsert_foreground_waiters.load(std::memory_order_relaxed))
+        {
+            ProfileEvents::increment(ProfileEvents::UpsertMaintenanceYields);
+            upsert_maintenance_task->scheduleAfter(1000);
+            return;
+        }
         std::unique_lock operation_lock(upsert_operation_mutex, std::try_to_lock);
         if (!operation_lock.owns_lock())
         {
             upsert_maintenance_task->scheduleAfter(1000);
             return;
         }
-        const size_t max_source_bytes = (*getSettings())[MergeTreeSetting::upsert_maintenance_target_bytes];
+        const UInt64 configured_target = (*getSettings())[MergeTreeSetting::upsert_maintenance_target_bytes];
+        const UInt64 memory_ceiling = Upsert::maintenanceMemoryCeiling(
+            background_memory_tracker.getSoftLimit(), total_memory_tracker.getHardLimit());
+        const size_t max_source_bytes = Upsert::maintenanceEffectiveTarget(configured_target, memory_ceiling);
+        if (upsert_maintenance_effective_target != max_source_bytes)
+        {
+            LOG_INFO(log, "UpsertMergeTree maintenance effective target {} bytes (configured {} bytes, memory ceiling {} bytes)",
+                max_source_bytes, configured_target, memory_ceiling);
+            upsert_maintenance_effective_target = max_source_bytes;
+        }
         phase = "cleaning retired payloads";
         clearOldPartsFromFilesystem(false, false);
         {
@@ -648,6 +675,19 @@ void StorageMergeTree::runUpsertMaintenance()
                     advance_cursor(candidate);
                     continue;
                 }
+                const auto single_estimate = estimateRewriteMemory({candidate}, max_source_bytes);
+                if (single_estimate > memory_ceiling)
+                {
+                    if (worthy())
+                        break;
+                    ProfileEvents::increment(ProfileEvents::UpsertMaintenanceUnadmittableParts);
+                    const auto denials = ++upsert_maintenance_unadmittable;
+                    if ((denials & (denials - 1)) == 0)
+                        LOG_WARNING(log, "UpsertMergeTree source {} cannot fit configured memory ceiling {} (estimate {}); skipping it so other parts can progress",
+                            candidate->name, memory_ceiling, single_estimate);
+                    advance_cursor(candidate);
+                    continue;
+                }
                 /// Do not repeatedly rewrite a large healthy prefix for a trickle of new rows.
                 /// Small tails accumulate into their own tier before joining a larger part.
                 /// An urgent source can start its own run; it never needs a size-matched partner.
@@ -679,6 +719,20 @@ void StorageMergeTree::runUpsertMaintenance()
                     needs_rewrite = true;
                     advance_cursor(candidate);
                     break;
+                }
+                auto prospective = sources;
+                prospective.push_back(candidate);
+                if (estimateRewriteMemory(prospective, max_source_bytes) > memory_ceiling)
+                {
+                    if (worthy())
+                        break;
+                    /// An unusual lineage density can exceed the static target's allowance.
+                    /// A single viable candidate starts a new run; no oversized prefix blocks later work.
+                    sources.clear();
+                    bytes = 0;
+                    rows = 0;
+                    lineage_bytes = 0;
+                    needs_rewrite = false;
                 }
                 advance_cursor(candidate);
                 needs_rewrite |= rewrite;
@@ -726,7 +780,18 @@ void StorageMergeTree::runUpsertMaintenance()
             });
             ThreadGroupSwitcher switcher(thread_group, ThreadName::MERGE_MUTATE, /*allow_existing_group=*/true);
             ProfileEvents::increment(ProfileEvents::UpsertMaintenanceRewritesStarted);
-            did_work = rewriteUpsertParts(sources, metadata, rewrite_context, apply_ttl, {}, max_source_bytes, true);
+            bool yielded = false;
+            did_work = rewriteUpsertParts(sources, metadata, rewrite_context, apply_ttl, {}, max_source_bytes, true, &yielded);
+            if (yielded)
+            {
+                if (!did_work)
+                {
+                    upsert_maintenance_cursor = previous_cursor;
+                    upsert_maintenance_pending = previous_pending;
+                }
+                upsert_maintenance_task->scheduleAfter(1000);
+                return;
+            }
             if (did_work)
                 upsert_maintenance_schedule.rewriteSucceeded();
         }
@@ -768,8 +833,24 @@ void StorageMergeTree::runUpsertMaintenance()
 }
 
 bool StorageMergeTree::rewriteUpsertParts(const DataPartsVector & sources, const StorageMetadataPtr & metadata,
-    ContextPtr query_context, bool apply_ttl, const MutationCommands & commands, size_t max_output_bytes, bool remember_budget_cuts)
+    ContextPtr query_context, bool apply_ttl, const MutationCommands & commands, size_t max_output_bytes,
+    bool remember_budget_cuts, bool * yielded)
 {
+    bool did_work = false;
+    const auto yield_to_foreground = [&]
+    {
+        if (!remember_budget_cuts || !upsert_foreground_waiters.load(std::memory_order_relaxed))
+            return false;
+        ProfileEvents::increment(ProfileEvents::UpsertMaintenanceYields);
+        if (yielded)
+            *yielded = true;
+        const auto yields = ++upsert_maintenance_yields;
+        if ((yields & (yields - 1)) == 0)
+            LOG_INFO(log, "UpsertMergeTree maintenance yielded {} times to waiting foreground operations", yields);
+        return true;
+    };
+    if (yield_to_foreground())
+        return false;
     const auto now = time(nullptr);
     const auto policy_checksum = Upsert::ttlPolicyChecksum(*metadata);
     const auto partition = sources.front()->info.getPartitionId();
@@ -777,13 +858,24 @@ bool StorageMergeTree::rewriteUpsertParts(const DataPartsVector & sources, const
     for (const auto & source : sources)
         snapshot->verifyPart(source->name, source->getDeleteBitmapCacheIdentity());
     std::vector<Upsert::PartRows> lineage;
+    std::vector<Upsert::PartCommit> source_authorizations(sources.size());
+    for (size_t i = 0; i < sources.size(); ++i)
+    {
+        if (yield_to_foreground())
+            return false;
+        lineage.push_back(upsert_store->loadPartRows(sources[i]->name, &source_authorizations[i]));
+    }
     {
         auto lock = lockParts();
         if (upsert_fenced)
             throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree is fenced pending restart and recovery");
         snapshot = upsert_store->snapshot();
-        for (const auto & source : sources)
-            lineage.push_back(upsert_store->loadPartRows(source->name));
+    }
+    if (remember_budget_cuts)
+    {
+        FailPointInjection::pauseFailPoint(FailPoints::upsert_pause_before_rewrite_read);
+        if (yield_to_foreground())
+            return false;
     }
     auto context = Context::createCopy(query_context);
     size_t largest_encoded_key = 0;
@@ -804,7 +896,8 @@ bool StorageMergeTree::rewriteUpsertParts(const DataPartsVector & sources, const
     for (const auto & source : sources)
         source_names.push_back(source->name);
     bool deleted_any = false;
-    bool did_work = false;
+    const size_t physical_rows_limit = remember_budget_cuts ? Upsert::MAX_PART_ROWS : Upsert::MAX_UNIT_ROWS;
+    const size_t physical_lineage_limit = remember_budget_cuts ? Upsert::MAX_PART_LINEAGE_BYTES : Upsert::MAX_RECORD_BYTES;
     size_t lineage_bytes = Upsert::PART_ROWS_ENVELOPE_BYTES;
     size_t unit_rows = 0;
     std::vector<std::vector<UInt32>> source_offsets(sources.size());
@@ -812,6 +905,8 @@ bool StorageMergeTree::rewriteUpsertParts(const DataPartsVector & sources, const
     {
         if (shutdown_called || flush_called)
             throw Exception(ErrorCodes::ABORTED, "UpsertMergeTree rewrite cancelled during shutdown");
+        if (yield_to_foreground())
+            return false;
         output.setColumns(std::move(output_columns));
 
         MergeTreeTemporaryPartPtr temporary;
@@ -855,7 +950,7 @@ bool StorageMergeTree::rewriteUpsertParts(const DataPartsVector & sources, const
         Upsert::PartRows batch_rows;
         Upsert::PartRows batch_expired;
         std::vector<std::vector<UInt32>> batch_offsets(sources.size());
-        const Upsert::StateStore::MergeInput batch_input{snapshot, lineage, batch_offsets};
+        const Upsert::StateStore::MergeInput batch_input{snapshot, lineage, batch_offsets, &source_authorizations};
         size_t batch_lineage_bytes = Upsert::PART_ROWS_ENVELOPE_BYTES;
         bool published_payload = false;
         auto commit_batch = [&](bool complete_output, bool retire)
@@ -893,7 +988,7 @@ bool StorageMergeTree::rewriteUpsertParts(const DataPartsVector & sources, const
                 else
                     part.part = Upsert::newObjectID();
                 decltype(upsert_saturated_parts)::node_type saturated_hint;
-                if (remember_budget_cuts && !retire_sources && temporary && !published_payload)
+                if (remember_budget_cuts && !retire_sources && temporary && complete_output)
                 {
                     /// Allocate scheduling metadata before persistence, then publish with the new part.
                     upsert_saturated_parts.reserve(upsert_saturated_parts.size() + 1);
@@ -922,7 +1017,7 @@ bool StorageMergeTree::rewriteUpsertParts(const DataPartsVector & sources, const
                     upsert_store->publish(prepared);
                     retired_snapshot = publishUpsertReadSnapshot(std::move(read_snapshot));
                     published_payload |= prepared.produces_part;
-                    if (prepared.produces_part && !saturated_hint.empty())
+                    if (!saturated_hint.empty())
                         upsert_saturated_parts.insert(std::move(saturated_hint));
                     for (const auto & source : retired_sources)
                         upsert_saturated_parts.erase(source->name);
@@ -971,6 +1066,19 @@ bool StorageMergeTree::rewriteUpsertParts(const DataPartsVector & sources, const
         }
         if (!commit_batch(true, false))
             return false;
+        if (retire_sources)
+        {
+            const auto retirement_snapshot = getUpsertReadSnapshotForQuery()->visibility;
+            for (const auto & source : source_authorizations)
+            {
+                const auto mask = retirement_snapshot->getMask(Upsert::objectName(source.part));
+                if (!mask || mask->cardinality() != source.rows)
+                    throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree final relocation left a visible source row");
+            }
+            /// Source masks cannot shrink while the operation mutex excludes rewrites into these parts.
+            /// The full winner assertion scan holds no parts lock; inserts continue during validation.
+            upsert_store->validateRetirement(partition, source_names, batch_input);
+        }
         if (retire_sources && !commit_batch(false, true))
             return false;
         if (published_payload)
@@ -988,6 +1096,8 @@ bool StorageMergeTree::rewriteUpsertParts(const DataPartsVector & sources, const
     };
     for (size_t source_index = 0; source_index < sources.size(); ++source_index)
     {
+        if (yield_to_foreground())
+            return did_work;
         const auto & source = sources[source_index];
         const auto mask = snapshot->getMask(source->getDeleteBitmapCacheIdentity());
         DeleteBitmap deleted;
@@ -1029,6 +1139,8 @@ bool StorageMergeTree::rewriteUpsertParts(const DataPartsVector & sources, const
         size_t offset = 0;
         while (executor.pull(block))
         {
+            if (yield_to_foreground())
+                return did_work;
             if (remember_budget_cuts)
                 ProfileEvents::increment(ProfileEvents::UpsertMaintenanceReadBytes, block.bytes());
             if (shutdown_called || flush_called)
@@ -1077,12 +1189,12 @@ bool StorageMergeTree::rewriteUpsertParts(const DataPartsVector & sources, const
             while (begin < visible_offsets.size())
             {
                 size_t lower = 0;
-                size_t upper = std::min({max_batch_rows, visible_offsets.size() - begin, Upsert::MAX_PART_ROWS - unit_rows});
+                size_t upper = std::min({max_batch_rows, visible_offsets.size() - begin, physical_rows_limit - unit_rows});
                 while (lower < upper)
                 {
                     const auto count = lower + (upper - lower + 1) / 2;
                     const auto candidate_lineage_bytes = lineage_prefix[begin + count] - lineage_prefix[begin];
-                    if (candidate_lineage_bytes <= Upsert::MAX_PART_LINEAGE_BYTES - lineage_bytes)
+                    if (candidate_lineage_bytes <= physical_lineage_limit - lineage_bytes)
                         lower = count;
                     else
                         upper = count - 1;
@@ -1236,7 +1348,9 @@ void StorageMergeTree::truncateUpsert(ContextPtr query_context)
         throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree TRUNCATE requires the disk_state_v2 protocol");
     if (query_context->getCurrentTransaction())
         throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree does not support explicit transactions");
+    Upsert::ForegroundOperationWait foreground_wait(upsert_foreground_waiters);
     std::lock_guard operation_lock(upsert_operation_mutex);
+    foreground_wait.acquired();
     /// Keep new inserts excluded until the old state's compaction debt has been drained.
     auto schema_lock = tryLockTimed(upsert_schema_lock, RWLockImpl::Write,
         query_context->getCurrentQueryId(), query_context->getSettingsRef()[Setting::lock_acquire_timeout]);
@@ -1300,7 +1414,9 @@ void StorageMergeTree::mutateUpsert(const MutationCommands & commands, ContextPt
         throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree mutations require the disk_state_v2 protocol");
     if (query_context->getCurrentTransaction())
         throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree does not support explicit transactions");
+    Upsert::ForegroundOperationWait foreground_wait(upsert_foreground_waiters);
     std::lock_guard operation_lock(upsert_operation_mutex);
+    foreground_wait.acquired();
     const auto metadata = getInMemoryMetadataPtr(query_context, true);
     for (const auto & command : commands)
     {

@@ -56,8 +56,12 @@ namespace ErrorCodes
   * and should not be changed by the user without a reason.
   */
 #define MERGE_TREE_SETTINGS(DECLARE, DECLARE_WITH_ALIAS) \
-    DECLARE(UInt64, upsert_maintenance_target_bytes, 256ULL << 20, R"(
+    DECLARE(UInt64, upsert_maintenance_target_bytes, 4ULL << 30, R"(
 Target uncompressed physical column bytes per background `UpsertMergeTree` rewrite part.
+Default: 4 GiB.
+The effective target is halved, down to 32 MiB, until ten targets fit the lower positive background
+soft memory limit or server hard memory limit. The effective target is logged; actual source
+row and lineage density can further limit selection. Explicit table and server settings override the default.
 Allowed range: 32 MiB to 8 GiB. Physical row and lineage limits can split output earlier.
 Winner relocation uses bounded state batches independently of the physical part size.
 Larger targets increase rewrite memory and temporary disk usage. Does not change insert units.

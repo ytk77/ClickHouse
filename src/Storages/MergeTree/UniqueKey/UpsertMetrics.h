@@ -24,6 +24,8 @@ extern const Event UpsertCatalogNodesAllocated;
 extern const Event UpsertCatalogVersionsMicroseconds;
 extern const Event UpsertCatalogRangesMicroseconds;
 extern const Event UpsertMaintenanceAdmissionDenied;
+extern const Event UpsertMaintenanceUnadmittableParts;
+extern const Event UpsertMaintenanceYields;
 extern const Event UpsertMaintenanceAdmissionPrecheckDeferrals;
 extern const Event UpsertMaintenanceOversizedAdmissions;
 extern const Event UpsertMaintenanceSizeRatioSkips;

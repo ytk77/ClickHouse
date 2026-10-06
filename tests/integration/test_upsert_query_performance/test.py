@@ -76,14 +76,21 @@ def test_background_rewrite_evaluates_defaults_and_conditional_ttl():
 
 
 def test_target_settings_persist_and_reject_invalid_values():
+    assert node.query(
+        "SELECT value FROM system.merge_tree_settings WHERE name='upsert_maintenance_target_bytes'"
+    ).strip() == "4294967296"
     assert (
         node.query(
             "SELECT count() FROM system.settings_changes ARRAY JOIN changes AS c "
             "WHERE type='MergeTree' AND c.name='upsert_maintenance_target_bytes' "
-            "AND c.new_value='268435456'"
+            "AND c.new_value='4294967296'"
         ).strip()
         == "1"
     )
+    assert node.query(
+        "SELECT c.previous_value,c.new_value FROM system.settings_changes ARRAY JOIN changes AS c "
+        "WHERE type='MergeTree' AND version='26.8' AND c.name='upsert_maintenance_target_bytes'"
+    ).strip() == "33554432\t268435456"
     create("query_settings")
     node.query(
         "ALTER TABLE query_settings MODIFY SETTING upsert_maintenance_target_bytes=134217728, prewarm_mark_cache=1"
@@ -108,6 +115,40 @@ def test_target_settings_persist_and_reject_invalid_values():
             ENGINE=UpsertMergeTree ORDER BY id UNIQUE KEY id SETTINGS upsert_maintenance_target_bytes={value}"""
         )
         assert "upsert_maintenance_target_bytes" in error
+
+
+def test_waiting_alter_yields_rewrite_then_ttl_resumes():
+    name = "query_yield_resume"
+    node.query(f"DROP TABLE IF EXISTS {name} SYNC")
+    node.query(
+        f"CREATE TABLE {name} (id UInt64,v UInt64,ts DateTime) "
+        "ENGINE=UpsertMergeTree(v) ORDER BY id UNIQUE KEY id TTL ts"
+    )
+    try:
+        node.query(f"SYSTEM STOP MERGES {name}")
+        node.query(f"INSERT INTO {name} SELECT number,1,toDateTime('2020-01-01') FROM numbers(1000)")
+        before = int(node.query("SELECT sum(value) FROM system.events WHERE event='UpsertMaintenanceYields'"))
+        node.query("SYSTEM ENABLE FAILPOINT upsert_pause_before_rewrite_read")
+        node.query(f"SYSTEM START MERGES {name}")
+        node.query("SYSTEM WAIT FAILPOINT upsert_pause_before_rewrite_read PAUSE")
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(node.query, f"ALTER TABLE {name} ADD COLUMN added UInt64 DEFAULT 7")
+            wait_for(
+                "SELECT value FROM system.metrics WHERE metric='UpsertForegroundOperationWaiters'",
+                lambda x: int(x) >= 1,
+            )
+            assert not future.done()
+            node.query("SYSTEM DISABLE FAILPOINT upsert_pause_before_rewrite_read")
+            future.result(timeout=30)
+        wait_for(f"SELECT count() FROM {name}", lambda x: x == "0", timeout=30)
+        assert int(node.query("SELECT sum(value) FROM system.events WHERE event='UpsertMaintenanceYields'")) > before
+        assert node.query(
+            f"SELECT type,default_expression FROM system.columns "
+            f"WHERE database=currentDatabase() AND table='{name}' AND name='added'"
+        ).strip() == "UInt64\t7"
+    finally:
+        node.query("SYSTEM DISABLE FAILPOINT upsert_pause_before_rewrite_read")
+        node.query(f"DROP TABLE IF EXISTS {name} SYNC")
 
 
 def test_prewarm_insert_import_and_failure_keeps_commit():

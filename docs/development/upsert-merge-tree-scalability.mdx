@@ -72,7 +72,7 @@ Existing disk-state tables need one full startup scan to establish missing inven
 
 `UpsertMergeTree` stores ordinary column-oriented `MergeTree` parts. A small whole-row byte target can nevertheless produce many parts on a wide table, even when a query reads only two columns. Every selected part adds file, mark-loading and scheduling work. Compare identical queries and data on the same host with matched cache states before attributing a latency difference to the engine.
 
-`upsert_maintenance_target_bytes` controls background source selection and the output byte target. The default is 268,435,456 bytes (256 MiB); the supported range is 32 MiB through 8 GiB. Explicit table settings and server `<merge_tree>` defaults override this compiled default. Physical parts are limited to 268,435,456 rows and 2 GiB of lineage. Winner relocation commits in independent bounded batches; the 128-MiB state-batch limit no longer limits physical part size. This setting does not enlarge insertion units or foreground mutation output. Maintenance uses version-2 payload authorizations and `UMPROW02` for large lineage sidecars; small sidecars retain `UMPROW01`. Native column serialization is unchanged. Atomic partition imports keep their 128-MiB state limit; a sufficiently large detached part can exceed it and be rejected without changing the detached payload. Complete table backups must include matching engine state. Older binaries cannot read these new authorizations, so reverting requires restoring a pre-upgrade backup rather than reopening newly compacted state.
+`upsert_maintenance_target_bytes` controls background source selection and the output byte target. The default is 4,294,967,296 bytes (4 GiB); the supported range is 32 MiB through 8 GiB. Explicit table settings and server `<merge_tree>` defaults override this compiled default. Physical parts are limited to 268,435,456 rows and 2 GiB of lineage. Winner relocation commits in independent bounded batches; the 128-MiB state-batch limit no longer limits physical part size. This setting does not enlarge insertion units or foreground mutation output. Maintenance uses version-2 payload authorizations and `UMPROW02` for large lineage sidecars; small sidecars retain `UMPROW01`. `Native` column serialization is unchanged. Atomic partition imports keep their 128-MiB state limit; a sufficiently large detached part can exceed it and be rejected without changing the detached payload. Complete table backups must include matching engine state. Older binaries cannot read these new authorizations, so reverting requires restoring a pre-upgrade backup rather than reopening newly compacted state.
 
 ```sql
 ALTER TABLE events MODIFY SETTING
@@ -87,13 +87,13 @@ Changing the target wakes maintenance and revisits existing parts. Convergence r
 
 Rewrite memory is not limited to the target: input columns, filtered copies, output and rebuilding an overflowing prefix coexist. Peak memory can be several times the target (roughly 2–3 times for these buffers, plus writer and state overhead). Background work does not inherit the client's query memory limit. Concurrent maintenance across tables requires a server memory budget. Longer rewrites also retain source parts longer and temporarily increase disk use.
 
-An in-memory hint records background physical output cut by a byte, row or lineage budget. At the same or a smaller target, healthy compaction skips that part; expiration, stale TTL metadata and at least 25 percent masked rows still trigger rewriting. This prevents endless rewrites caused by differences between serialized and in-memory column sizes. Raising the target or changing the schema allows reconsideration. Retired-part hints are removed. A successfully published intermediate output and its hint remain valid if a later batch fails or stops for a changed TTL policy; the source stays active with the already moved rows masked. Hints disappear on reopen, so restart can cause additional compaction before convergence. A hinted part with less than 25 percent masked rows can retain that unused space until another rewrite condition applies. `UpsertMaintenanceSaturatedSkips` counts these scheduling skips.
+An in-memory hint records background physical output cut by a byte, row or lineage budget. At the same or a smaller target, healthy compaction skips that part; expiration, stale TTL metadata and at least 25 percent masked rows still trigger rewriting. This prevents endless rewrites caused by differences between serialized and in-memory column sizes. Raising the target or changing the schema allows reconsideration. Retired-part hints are removed. A hint is published only when relocation of its physical output is complete; partially relocated outputs have no hint. A completed intermediate output and its hint remain valid if a later output fails or stops for a changed TTL policy; the source stays active with the already moved rows masked. Hints disappear on reopen, so restart can cause additional compaction before convergence. A hinted part with less than 25 percent masked rows can retain that unused space until another rewrite condition applies. `UpsertMaintenanceSaturatedSkips` counts these scheduling skips.
 
 Insertion, background rewrite and partition import prewarm caches after successful publication and outside the parts lock, using the existing temporary writer's retained marks. Wide parts honor the configured column filter; Compact parts keep a single marks file for all columns, so the column filter does not apply. Prewarming remains disabled by default and respects the minimum-size setting. A cache-fill failure is logged and counted without changing an already durable commit result. `UpsertPartCachePrewarms` counts eligible successful prewarm calls, not marks inserted: a part whose writer started before prewarming was enabled may have no retained marks. `UpsertPartCachePrewarmFailures` counts exceptions. Prewarming addresses mark loading; it does not warm all column data pages.
 
 ### Background rewrite admission and write amplification {#background-rewrite-admission}
 
-The compiled target remains 256 MiB. Healthy compaction requires comparable source sizes:
+The compiled target is 4 GiB. Healthy compaction requires comparable source sizes:
 when extending a run, neither the accumulated prefix nor the next candidate may exceed four times
 the other. An incompatible healthy singleton is deferred so newer small parts can merge with each
 other first. A ready run is processed before reconsidering the next candidate. Expired rows, stale
@@ -135,19 +135,44 @@ cover foreground mutations, partition imports or retirement cleanup.
 
 `MEMORY_LIMIT_EXCEEDED`, `CANNOT_ALLOCATE_MEMORY`, and allocation exceptions trigger a per-table monotonic-clock retry deadline of 1, 2, 4, 8, 16, 32,
 then 60 seconds. New publications cannot bypass that deadline. A successful rewrite resets the delay.
-The configured target is not silently reduced. A reservation that never fits the background or server
-headroom remains deferred; operators must lower the table target or provide more headroom. Resource pressure can delay `TTL`
-cleanup. The size-ratio rule itself never suppresses an expired source.
+The setting remains unchanged. Before selection, maintenance derives one effective target from the
+lower positive background soft memory limit and server hard memory limit. It halves the configured
+target until ten targets fit that ceiling, with a 32-MiB floor, and logs the resulting byte target.
+The same effective target controls healthy-part skips, source accumulation, output splitting and
+saturation hints. Actual source row and lineage density is checked separately and can keep parts
+smaller. For example, with a 16-GiB ceiling the configured 4-GiB target becomes 1 GiB; with a
+32-GiB ceiling it becomes 2 GiB. These are configured-limit calculations, independent of temporary
+memory use, so output parts are not repeatedly split and reselected as pressure fluctuates.
+
+Temporary headroom denials preserve the selection cursor and retry. A source whose fixed lineage
+and input estimate cannot fit the configured ceiling is reported and skipped, allowing other parts
+and partitions to progress. Its expiration and dead-row cleanup remain pending until limits grow;
+this implementation still loads whole-source lineage. Resource pressure can delay `TTL` cleanup.
+The size-ratio rule itself never suppresses an expired source.
+
+Foreground operations signal while waiting for the operation mutex. Background maintenance yields
+at source-read, block and pre-write boundaries; if no output committed, it restores its cursor and
+retries after one second. It does not preempt a running native writer or interrupt relocation of an
+already written output. Continuous foreground traffic can postpone maintenance; the yield counter
+includes precheck deferrals. Immutable lineage loading and the final winner assertion scan run
+outside the parts lock, while source retirement checks full masks and authenticated identities under
+the lock. The assertion scan does not populate the winner block cache.
 
 The sequential source reader already uses `max_merges_bandwidth_for_server` for local and remote
 column-data reads. This is not a complete rewrite-I/O limit: output writing, lineage reads, payload
 hashing and synchronization are not all charged to that throttler. No automatic upgrade ramp is
 implemented. Before upgrading existing tables without explicit targets, administrators can retain
-the previous target with `<merge_tree><upsert_maintenance_target_bytes>33554432</upsert_maintenance_target_bytes></merge_tree>`
-and raise individual table targets gradually. Without an override, reopening adopts 256 MiB and can
+the previous 256-MiB target with `<merge_tree><upsert_maintenance_target_bytes>268435456</upsert_maintenance_target_bytes></merge_tree>`
+and raise individual table targets gradually. Without an override, reopening adopts 4 GiB and can
 initiate substantial compaction; the admission limits bound simultaneous work, not total rewrite bytes.
+Both custom revisions report base version `26.8.1.1`; use `compatibility='26.8'` or an explicit target
+to retain the deployed fork's 256-MiB behavior. `compatibility='26.8.1.1'` uses the new 4-GiB default.
 
 Observability:
+
+- `UpsertMaintenanceUnadmittableParts` counts sources skipped because their fixed estimate exceeds the configured ceiling.
+- `UpsertMaintenanceYields` counts pending-foreground deferrals and pre-write yields.
+- `UpsertForegroundOperationWaiters` in `system.metrics` counts foreground operations waiting for the operation lock across all tables; it drops when each operation acquires the lock.
 
 - `system.metrics`: `UpsertMaintenanceRewrites`, `UpsertMaintenanceReservedBytes`, and
   `UpsertMaintenanceMemoryTracking` expose admitted attempts, reserved estimates and attributed allocations.
@@ -455,7 +480,7 @@ Coverage includes valid-CRC lineage substitutions in new and previously verified
 
 Physical output now spans multiple durable relocation batches. Release compilation, 158 scoped C++ tests, 18 SQL/shell regressions and 32 distinct integration cases passed. A retirement regression consolidates 16 sources carrying 144,000,000 bytes of historical kills, exceeds the old state batch budget, verifies compact retirement records and reopens the durable store. Integration functions ran through an isolated native-server adapter, covering both `Wide` and `Compact` 1.6-million-row parts, updates, deletion, forced process restart, the first durable relocation before native rename, settings persistence, conditional `TTL`, concurrent writes, schema changes and atomic import budget rejection with the detached payload preserved. This is not Docker, ASan/TSan or sustained production-load coverage.
 
-The same-host benchmark uses eight million unique rows with the same ordered key, partitioning and column values in both engines. The query groups `toDate(settled)` and sums three `Float64` columns. Each engine uses eight query threads. Warm medians use twelve alternating samples with query result caching disabled. File-eviction medians use three alternating samples after `fdatasync` and per-file `POSIX_FADV_DONTNEED`, with `pread` and uncompressed caching disabled; no system-wide caches were dropped.
+The same-host benchmark ran on a host with approximately 754.5 GiB of RAM and uses eight million unique rows with the same ordered key, partitioning and column values in both engines. The query groups `toDate(settled)` and sums three `Float64` columns. Each engine uses eight query threads. Warm medians use twelve alternating samples with query result caching disabled. File-eviction medians use three alternating samples after `fdatasync` and per-file `POSIX_FADV_DONTNEED`, with `pread` and uncompressed caching disabled; no system-wide caches were dropped.
 
 | Build and engine | Active parts | Largest part rows | Warm median | File-eviction median |
 | --- | ---: | ---: | ---: | ---: |
@@ -466,4 +491,55 @@ The same-host benchmark uses eight million unique rows with the same ordered key
 
 Each scan reads 224,000,000 logical bytes. After file eviction, baseline upsert scans report 158,167,040 OS-read bytes and the other scans report 158,035,968 bytes. Advisory eviction does not establish cold controller or drive caches. The candidate's native compressed column size matches its replacing reference exactly at 254,617,944 bytes. Query results retain the expected row count and ID sum. Warm aggregation was already close to the replacing reference in the baseline; the demonstrated improvement is larger physical parts and a lower file-eviction median, not a 46-fold speedup.
 
-Initial candidate consolidation took 307.8 seconds and peaked at 10,497,013,550 tracked maintenance bytes (approximately 9.78 GiB). The final admission estimate was doubled after this measurement to reserve room for native sorting and index construction; the measured query path is unchanged. This experiment does not measure continuous ingestion or establish latency for CRM3's approximately 2.35 billion physical rows. Its storage, available memory and cache residency still affect scan time. Existing-table consolidation requires substantial rewrite I/O, temporary disk space and memory headroom; a larger target should be raised gradually and monitored.
+Initial candidate consolidation took 307.8 seconds and peaked at 10,497,013,550 tracked maintenance bytes (approximately 9.78 GiB). The admission estimate was doubled after this measurement to reserve room for native sorting and index construction; the measured query path is unchanged. These aggregation measurements precede the default-target, memory-planning and lock changes below. This experiment does not measure continuous ingestion or establish latency for CRM3's approximately 2.35 billion physical rows. Its storage, available memory and cache residency still affect scan time. Existing-table consolidation requires substantial rewrite I/O, temporary disk space and memory headroom; a larger target should be raised gradually and monitored.
+
+## Four-GiB default review validation {#four-gib-default-review-validation}
+
+The compiled default is now 4 GiB, with a uniform effective target derived from configured memory
+limits. Source lineage loading and the final winner assertion run outside the parts lock. Foreground
+waiters can yield background work before payload creation, with the cursor restored if no output
+committed. Fully written output relocation finishes before yielding.
+
+Release compilation, 162 scoped C++ tests and 19 SQL/shell regressions passed, along with 35 distinct integration cases through
+the isolated native-server adapter. The large single-row `DELETE` runs under a 1-GiB query limit;
+its foreground outputs reconsolidate into at most two parts, including one above the foreground
+row cap, while counts and sums survive forced restart. Existing healthy size tiers can retain a
+small tail. A separate interrupted `DELETE` case checks completed durable units, absence of duplicate
+IDs after recovery, retry and final sums. The foreground-wait test polls an observable waiter before
+releasing its failpoint and checks that maintenance yields and expiration subsequently resumes.
+
+At a 1-GiB server and background memory ceiling, the compiled setting remains 4 GiB. Live checks
+confirmed small-part consolidation, expiration of viable sources, and progress in other partitions
+while a source with an unadmittable fixed estimate was skipped. Four idle seconds produced no extra
+rewrites of the same output. Raising the limits allowed the deferred source to expire. This is
+resource-policy coverage on synthetic data, not a guarantee of fixed expiration latency.
+
+Independent read-only review accepted the maintenance correctness and availability changes, then
+accepted the waiter metric, preserved settings history, complete-version history ordering and the
+mutation size-tier assertions. It does not replace the full Docker suite, ASan/TSan or production
+load validation.
+
+The settings-history regression now compares complete numeric version components and covers all
+introduced table resource settings. The deployed `26.8` target transition is preserved separately
+from the `26.8.1.1` change to 4 GiB.
+
+A sequential old/new local comparison forced a policy rewrite of the same eight-million-row part
+while inserting new unique keys every 200 ms. Both builds used a configured 4-GiB target and
+64-GiB background/server limits on the host described above. The future expiration expression was
+checked before timing. Counts and ID sums remained correct after each run.
+
+| Measurement | `33deef72` | Reviewed revision |
+| --- | ---: | ---: |
+| Baseline samples | 16 | 16 |
+| Baseline client p99 | 246.8 ms | 153.3 ms |
+| Samples during rewrite | 113 | 190 |
+| Client p99 during rewrite | 2,590.5 ms | 2,321.6 ms |
+| Maximum client latency during rewrite | 21,657.9 ms | 2,468.9 ms |
+| Rewrite duration | 115.70 s | 115.46 s |
+
+These are single local runs measuring client wall time, including client startup and persistence.
+Percentiles use the nearest rank and the runs have different sample counts. The maximum observed
+stall decreased substantially; p99 improved modestly and still exceeded two seconds. This does not
+establish production p99, sustained ingestion throughput or latency for a 4-GiB physical payload.
+The part contained 456,000,000 uncompressed column bytes. Validation preceded the final binary's
+Git metadata stamp; the package contains the same reviewed maintenance implementation.

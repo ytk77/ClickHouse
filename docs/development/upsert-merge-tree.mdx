@@ -299,6 +299,16 @@ subject to the query memory limit. Each unit durably relocates winners and masks
 positions together. Sources remain readable until the final unit retires them; interruption can
 leave completed units committed within a source part. The disk-state format is unchanged.
 
+Foreground rewrite output still targets 32 MiB even when background parts are larger, with caps of
+1,048,576 rows and 64 MiB of lineage per output. The source
+lineage must be loaded for the whole input part, so this output target does not cap query memory.
+The query's `max_memory_usage` applies. An exception after a durable unit commits can leave that
+unit applied within the source part; retrying a `DELETE` evaluates the remaining visible rows.
+Rewriting a large background part into foreground units can temporarily increase the part count.
+Background maintenance subsequently consolidates those units, with additional rewrite I/O.
+Healthy size-tier selection can retain a small tail as a separate part; it does not guarantee one
+output merely because the total bytes fit the target.
+
 The first column or index alteration upgrades an older disk-state manifest to
 `schema_policy=metadata_v1`. SQL metadata then owns mutable column and index definitions,
 while the manifest continues to bind the disk, keys, version type and table incarnation.
@@ -308,9 +318,12 @@ operations.
 ## Background part size and prewarming {#upsert-background-part-size-prewarming}
 
 For wide tables, larger background parts can reduce the number of files and marks opened by
-aggregation queries. `upsert_maintenance_target_bytes` defaults to 256 MiB and accepts 32–256 MiB.
+aggregation queries. `upsert_maintenance_target_bytes` defaults to 4 GiB and accepts 32 MiB through 8 GiB.
+Memory limits can reduce the effective target; it is logged and used consistently throughout selection.
+Reserve disk space for both selected sources and prepared outputs per concurrent rewrite.
 It applies to background maintenance; insertion units and foreground mutation output retain their
-existing limits. Row, lineage and state budgets can split a background part before this byte target.
+existing limits. Physical row and lineage budgets can split a background part before this byte target.
+Winner relocation commits in bounded state batches independently of the physical part size.
 
 ```sql
 ALTER TABLE current_state MODIFY SETTING

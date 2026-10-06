@@ -73,7 +73,7 @@ $CLICKHOUSE_LOCAL --query "
             FROM
             (
                 SELECT c.1 AS name, c.3 AS new_value,
-                    splitByChar('.', version)[1]::UInt64 * 1000 + splitByChar('.', version)[2]::UInt64 AS vnum,
+                    arrayMap(component -> toUInt64(component), splitByChar('.', version)) AS vnum,
                     idx
                 FROM system.settings_changes
                 ARRAY JOIN changes AS c, arrayEnumerate(changes) AS idx
@@ -87,7 +87,7 @@ $CLICKHOUSE_LOCAL --query "
             FROM
             (
                 SELECT c.1 AS name, c.3 AS new_value,
-                    splitByChar('.', version)[1]::UInt64 * 1000 + splitByChar('.', version)[2]::UInt64 AS vnum,
+                    arrayMap(component -> toUInt64(component), splitByChar('.', version)) AS vnum,
                     idx
                 FROM system.settings_changes
                 ARRAY JOIN changes AS c, arrayEnumerate(changes) AS idx

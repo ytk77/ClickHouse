@@ -34,7 +34,8 @@ public:
         std::vector<PartCommit> additions, const std::vector<ValidatedPartRows> & rows,
         const std::vector<String> & removed, const std::vector<String> & reset_partitions, const std::vector<String> & detached,
         const std::vector<String> & cleared_partitions);
-    PartRows loadPartRows(const String & name) const;
+    PartRows loadPartRows(const String & name, PartCommit * authorization = nullptr) const;
+    void validateRetirement(const String & partition, const std::vector<String> & sources, const StateStore::MergeInput & input) const;
     void pruneRetired();
     void append(const StateStore::Prepared & prepared);
     void publish(StateStore::Prepared & prepared) noexcept;

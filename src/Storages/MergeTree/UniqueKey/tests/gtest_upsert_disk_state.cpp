@@ -319,6 +319,41 @@ TEST_F(UpsertDiskStateTest, TruncateRemovesInterruptedOutputProgress)
     EXPECT_TRUE(iterator->status().ok());
 }
 
+TEST_F(UpsertDiskStateTest, AuthenticatedRetirementRequiresFullMasksAndUnchangedPayloads)
+{
+    StateStore store(directory, incarnation, false, true);
+    auto source = prepare(store, {{"a", 1}, {"b", 1}});
+    commit(store, source);
+    std::vector<PartCommit> authorizations(1);
+    std::vector<PartRows> lineage{store.loadPartRows(source.record.final_name, &authorizations.front())};
+    std::vector<std::vector<UInt32>> offsets{{0, 1}};
+    const StateStore::MergeInput input{store.snapshot(), lineage, offsets, &authorizations};
+    EXPECT_THROW(merge(store, {}, {source.record.final_name}, {}, true, &input), Exception);
+    auto moved = merge(store, lineage.front(), {source.record.final_name}, {}, false, &input);
+    commit(store, moved);
+    EXPECT_NO_THROW(store.validateRetirement("p", {source.record.final_name}, input));
+    const auto original_hash = authorizations.front().files_hash;
+    authorizations.front().files_hash = newObjectID();
+    EXPECT_THROW(merge(store, {}, {source.record.final_name}, {}, true, &input), Exception);
+    authorizations.front().files_hash = original_hash;
+    auto retired = merge(store, {}, {source.record.final_name}, {}, true, &input);
+    commit(store, retired);
+    EXPECT_EQ(store.authorizedPartCount(), 1);
+    EXPECT_EQ(store.loadPartRows(moved.record.final_name).size(), 2);
+}
+
+TEST_F(UpsertDiskStateTest, RetirementValidationRejectsRemainingSourceWinners)
+{
+    StateStore store(directory, incarnation, false, true);
+    auto source = prepare(store, {{"a", 1}});
+    commit(store, source);
+    std::vector<PartCommit> authorizations(1);
+    std::vector<PartRows> lineage{store.loadPartRows(source.record.final_name, &authorizations.front())};
+    std::vector<std::vector<UInt32>> offsets(1);
+    const StateStore::MergeInput input{store.snapshot(), lineage, offsets, &authorizations};
+    EXPECT_THROW(store.validateRetirement("p", {source.record.final_name}, input), Exception);
+}
+
 TEST_F(UpsertDiskStateTest, RetirementOmitsHistoricalKillsBeyondTheStateBatchBudget)
 {
     constexpr UInt64 rows = 450000;
