@@ -1179,7 +1179,7 @@ StateStore::Prepared DiskState::prepareMerge(
         auto authorization = impl->database->get("A" + name);
         if (!authorization)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree merge source is no longer active");
-        const auto source = decodePartCommit(*authorization);
+        auto source = decodePartCommit(*authorization);
         const auto info = MergeTreePartInfo::fromPartName(name, MERGE_TREE_DATA_MIN_FORMAT_VERSION_WITH_CUSTOM_PARTITIONING);
         if (info.getPartitionId() != partition)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree merge crosses SQL partitions");
@@ -1249,7 +1249,12 @@ StateStore::Prepared DiskState::prepareMerge(
         }, retire_sources ? nullptr : &input->offsets[source_index]);
         if (retire_sources)
         {
-            batch.Put("R" + name, *authorization);
+            /// Retirement authenticates the payload; historical winner changes and tokens stay in their own state.
+            source.dead.clear();
+            source.kills.clear();
+            source.token = {};
+            source.token.accepted = source.rows;
+            batch.Put("R" + name, encodePartCommit(source));
             batch.Delete("A" + name);
             batch.Delete("V" + objectName(source.part));
             result.disk->deleteMask(objectName(source.part));

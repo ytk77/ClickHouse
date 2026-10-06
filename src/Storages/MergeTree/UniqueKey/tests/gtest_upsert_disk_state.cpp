@@ -319,6 +319,59 @@ TEST_F(UpsertDiskStateTest, TruncateRemovesInterruptedOutputProgress)
     EXPECT_TRUE(iterator->status().ok());
 }
 
+TEST_F(UpsertDiskStateTest, RetirementOmitsHistoricalKillsBeyondTheStateBatchBudget)
+{
+    constexpr UInt64 rows = 450000;
+    std::vector<std::pair<String, UInt64>> values;
+    values.reserve(rows);
+    for (UInt64 row = 0; row < rows; ++row)
+        values.emplace_back(std::to_string(row), 1);
+    std::vector<String> sources;
+    String output_name;
+    {
+        StateStore store(directory, incarnation, false, true);
+        auto seed = prepare(store, values);
+        const auto seed_name = seed.record.final_name;
+        commit(store, seed);
+        size_t historical_kill_bytes = 0;
+        for (UInt64 version = 2; version <= 17; ++version)
+        {
+            for (auto & value : values)
+                value.second = version;
+            auto next = prepare(store, values);
+            ASSERT_EQ(next.record.kills.size(), rows);
+            historical_kill_bytes += next.record.kills.size() * 20;
+            sources.push_back(next.record.final_name);
+            commit(store, next);
+        }
+        ASSERT_GT(historical_kill_bytes, MAX_PENDING_STATE_BYTES);
+        auto output = merge(store, store.loadPartRows(sources.back()), sources);
+        output_name = output.record.final_name;
+        commit(store, output);
+        EXPECT_EQ(store.authorizedPartCount(), 2);
+        EXPECT_TRUE(store.snapshot()->getMask(objectName(output.record.part))->empty());
+        auto retirement = merge(store, {}, {seed_name});
+        commit(store, retirement);
+    }
+    rocksdb::DB * raw = nullptr;
+    ASSERT_TRUE(rocksdb::DB::Open(rocksdb::Options{}, (directory / "upsert_state_v2").string(), &raw).ok());
+    std::unique_ptr<rocksdb::DB> database(raw);
+    for (const auto & source : sources)
+    {
+        String payload;
+        ASSERT_TRUE(database->Get(rocksdb::ReadOptions{}, "R" + source, &payload).ok());
+        const auto record = decodePartCommit(payload);
+        EXPECT_TRUE(record.kills.empty());
+        EXPECT_TRUE(record.dead.empty());
+        EXPECT_EQ(record.token.accepted, rows);
+        EXPECT_EQ(record.final_name, source);
+    }
+    database.reset();
+    StateStore reopened(directory, incarnation, true, true);
+    EXPECT_EQ(reopened.authorizedPartCount(), 1);
+    EXPECT_EQ(reopened.loadPartRows(output_name).size(), rows);
+}
+
 TEST_F(UpsertDiskStateTest, IncompleteFinalBatchRetainsEarlierDurableCommit)
 {
     {
