@@ -213,7 +213,7 @@ Pipe StorageMergeTree::alterPartition(
                     std::iota(ordinals->getData().begin(), ordinals->getData().end(), UInt64{0});
                     slice.insert({std::move(ordinals), std::make_shared<DataTypeUInt64>(), Upsert::ORDINAL_COLUMN});
                     const auto lineage_bytes = Upsert::foldBlock(slice, *target_metadata, target.merging_params.upsert_version_column,
-                        key_limit);
+                        key_limit, query_context->getProcessListElement().get());
                     const auto state_bytes = Upsert::estimateInsertStateBytes(lineage_bytes, slice.rows(), part->info.getPartitionId().size(), 0);
                     if (lineage_bytes > Upsert::MAX_RECORD_BYTES || state_bytes > Upsert::MAX_PENDING_STATE_BYTES / 2)
                     {

@@ -9,6 +9,7 @@
 namespace DB
 {
 class IDataPartStorage;
+class QueryStatus;
 struct StorageInMemoryMetadata;
 struct MergeTreeDataPartChecksums;
 struct MergeTreeDataPartChecksum;
@@ -65,7 +66,9 @@ Block cutInputBlock(const Block & block, size_t offset, size_t max_rows = MAX_UN
 
 /// Fold before the native sort, retaining original input ordinals for equal-version ties.
 /// Return the encoded size of `upsert_rows.bin`, including its envelope.
-size_t foldBlock(Block & block, const StorageInMemoryMetadata & metadata, const String & version_column, size_t max_key_bytes);
+size_t foldBlock(
+    Block & block, const StorageInMemoryMetadata & metadata, const String & version_column,
+    size_t max_key_bytes, QueryStatus * process = nullptr);
 /// Bound winner replacements, authorization and the new mask; existing source masks remain state-dependent.
 size_t estimateInsertStateBytes(size_t lineage_bytes, size_t rows, size_t partition_bytes, size_t token_bytes);
 ObjectID hashInputBlock(const Block & block);

@@ -1,4 +1,5 @@
 #include <Storages/MergeTree/UniqueKey/UpsertPartData.h>
+#include <Storages/MergeTree/UniqueKey/UpsertInputFold.h>
 #include <Storages/MergeTree/UniqueKey/UpsertMetrics.h>
 #include <Storages/MergeTree/UniqueKey/UpsertBinary.h>
 #include <Storages/MergeTree/UniqueKey/UpsertDurableFile.h>
@@ -11,6 +12,7 @@
 #include <Columns/ColumnTuple.h>
 #include <Columns/ColumnSparse.h>
 #include <Interpreters/Context.h>
+#include <Interpreters/ProcessList.h>
 #include <Core/UUID.h>
 #include <Common/ErrnoException.h>
 #include <Common/SipHash.h>
@@ -251,26 +253,26 @@ Block cutInputBlock(const Block & block, size_t offset, size_t max_rows, size_t 
     }
 }
 
-size_t foldBlock(Block & block, const StorageInMemoryMetadata & metadata, const String & version_column, size_t max_key_bytes)
+size_t foldBlock(Block & block, const StorageInMemoryMetadata & metadata, const String & version_column, size_t max_key_bytes, QueryStatus * process)
 {
     ProfileEventTimeIncrement<Microseconds> timer(ProfileEvents::UpsertInputFoldMicroseconds);
     auto keys = encodeKeys(block, metadata, max_key_bytes);
-    std::map<String, size_t> winners;
     std::optional<VersionColumn> versions;
     if (!version_column.empty())
         versions.emplace(block.getByName(version_column));
     const auto & ordinals = *block.getByName(ORDINAL_COLUMN).column;
-    for (size_t row = 0; row < block.rows(); ++row)
-    {
-        auto [it, inserted] = winners.emplace(keys[row], row);
-        if (!inserted)
+    const auto winners = selectInputWinners(std::span<const String>(keys.data(), keys.size()),
+        [&](size_t row, size_t old)
         {
-            const auto old = it->second;
-            if (!versions || versions->get(row) > versions->get(old)
-                || (versions->get(row) == versions->get(old) && ordinals.getUInt(row) > ordinals.getUInt(old)))
-                it->second = row;
-        }
-    }
+            return !versions || versions->get(row) > versions->get(old)
+                || (versions->get(row) == versions->get(old) && ordinals.getUInt(row) > ordinals.getUInt(old));
+        },
+        [&]
+        {
+            if (process)
+                process->checkTimeLimit();
+            CurrentMemoryTracker::check();
+        });
     IColumn::Filter keep(block.rows(), UInt8{0});
     size_t lineage_bytes = PART_ROWS_ENVELOPE_BYTES;
     for (const auto & [key, row] : winners)

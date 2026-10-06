@@ -225,6 +225,26 @@ Median client wall time was 1.033 to 0.898 seconds and 1.154 to 1.085 seconds re
 The 32 MiB update case was approximately unchanged. These are local comparisons, not
 production throughput or tail-latency guarantees; inclusive stage timers must not be added.
 
+## Input duplicate folding {#upsert-input-duplicate-folding}
+
+`foldBlock` selects winners with a hash table whose `string_view` keys borrow the immutable
+encoded-key vector. `StringViewHash64` uses full-length 64-bit CityHash, and equality compares
+all bytes, including embedded zeroes. The initial bucket reservation is capped at 4,096
+rows to avoid a large up-front allocation for duplicate-heavy input. The map and its allocations
+remain local to the fold and are memory-tracked. CityHash is not keyed; the hash table does
+not provide a worst-case linear-time guarantee.
+
+Higher versions win; equal versions retain the higher original ordinal. An exact tie retains
+the current winner, and unversioned input retains the later physical row. The keep-filter
+preserves physical input order independently of hash-table iteration order. Key encoding,
+retry hashes, column schemas and lineage bytes are unchanged; encoded keys are not shared
+with the later part writer.
+
+The winner-selection loop checks query cancellation, time limits and tracked memory at
+row zero and every 65,536 rows. Both inserts and partition imports pass their query process.
+These checks do not preempt key encoding, a native write or an individual hash-table operation.
+The database lookup batch remains 1,024 keys and the foreground state budgets remain unchanged.
+
 ## Incremental materialized views {#upsert-incremental-materialized-views}
 
 An `UpsertMergeTree` table can be the source of an incremental materialized view:

@@ -284,7 +284,7 @@ bool Sink::consumeBlock(Block block, size_t first_row, const String & client_tok
         /// Only token-based retries compare the evaluated input hash. Payload authentication is independent.
         tokens.push_back({client_token, unit, client_token.empty() ? ObjectID{} : hashInputBlock(*partition.block), 0});
         const auto lineage_bytes = foldBlock(*partition.block, *metadata, storage.merging_params.upsert_version_column,
-            settings[Setting::unique_key_max_encoded_size]);
+            settings[Setting::unique_key_max_encoded_size], context->getProcessListElement().get());
         if (lineage_bytes > MAX_RECORD_BYTES)
             return false;
         const auto partition_id = partition.partition.getID(metadata->getPartitionKey().sample_block);
