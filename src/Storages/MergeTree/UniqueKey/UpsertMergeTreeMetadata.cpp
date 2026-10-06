@@ -44,9 +44,9 @@ void validateUpsertMergeTreeMetadata(
     const StorageInMemoryMetadata & metadata, const String & version_column, MergeTreeSettings & settings)
 {
     const UInt64 target_bytes = settings[MergeTreeSetting::upsert_maintenance_target_bytes];
-    if (target_bytes < (32ULL << 20) || target_bytes > (256ULL << 20))
+    if (target_bytes < (32ULL << 20) || target_bytes > (8ULL << 30))
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
-            "Setting upsert_maintenance_target_bytes={} must be between 33554432 and 268435456 bytes", target_bytes);
+            "Setting upsert_maintenance_target_bytes={} must be between 33554432 and 8589934592 bytes", target_bytes);
 
     if (!metadata.hasUniqueKey())
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "UpsertMergeTree requires a nonempty UNIQUE KEY");

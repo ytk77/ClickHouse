@@ -182,7 +182,7 @@ Pipe StorageMergeTree::alterPartition(
             size_t key_limit = settings[Setting::unique_key_max_encoded_size];
             const auto lineage_path = std::filesystem::path(part->getDataPartStorage().getFullPath()) / Upsert::ROWS_FILE;
             if (std::filesystem::exists(lineage_path))
-                for (const auto & row : Upsert::decodePartRows(Upsert::readBoundedFile(lineage_path, Upsert::MAX_RECORD_BYTES)))
+                for (const auto & row : Upsert::decodePartRows(Upsert::readBoundedFile(lineage_path, Upsert::MAX_PART_LINEAGE_BYTES)))
                     key_limit = std::max(key_limit, row.key.size());
             import_context->setSetting("unique_key_max_encoded_size", static_cast<UInt64>(key_limit));
             const auto mask = visibility ? visibility->getMask(part->getDeleteBitmapCacheIdentity()) : readVisibility(part);

@@ -24,6 +24,8 @@ inline constexpr size_t PART_ROWS_ENVELOPE_BYTES = 16;
 inline constexpr size_t MAX_UNIT_ROWS = 1U << 20;
 inline constexpr size_t MAX_UNIT_BYTES = 32U << 20;
 inline constexpr size_t MAX_PENDING_STATE_BYTES = 128U << 20;
+/// Maintenance payloads may span many state batches; foreground admission stays unchanged.
+inline constexpr size_t MAX_PART_LINEAGE_BYTES = 2ULL << 30;
 
 struct PartRow
 {

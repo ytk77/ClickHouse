@@ -20,6 +20,7 @@ namespace DB
 
 namespace ErrorCodes
 {
+    extern const int BAD_ARGUMENTS;
     extern const int CORRUPTED_DATA;
     extern const int UNKNOWN_FORMAT_VERSION;
 }
@@ -236,6 +237,24 @@ void DeleteBitmap::add(UInt64 row)
     if (!is64Bit() && row > std::numeric_limits<UInt32>::max())
         upgradeTo64();
     std::visit([row](auto & p) { addAny(*p, row); }, bitmap);
+}
+
+void DeleteBitmap::addRange(UInt64 begin, UInt64 end)
+{
+    if (begin > end || end > (UInt64{1} << 32))
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid 32-bit delete bitmap range");
+    std::visit([&](auto & p) { p->addRange(begin, end); }, bitmap);
+}
+
+void DeleteBitmap::remove(UInt64 row)
+{
+    if (auto * narrow = std::get_if<R32Ptr>(&bitmap))
+    {
+        if (row <= std::numeric_limits<UInt32>::max())
+            (*narrow)->remove(static_cast<UInt32>(row));
+    }
+    else
+        std::get<R64Ptr>(bitmap)->remove(row);
 }
 
 void DeleteBitmap::addMany(const std::vector<UInt64> & rows)

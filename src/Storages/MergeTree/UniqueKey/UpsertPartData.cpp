@@ -13,6 +13,7 @@
 #include <Core/UUID.h>
 #include <Common/ErrnoException.h>
 #include <Common/SipHash.h>
+#include <Common/CurrentMemoryTracker.h>
 #include <IO/HashingWriteBuffer.h>
 #include <IO/HashingReadBuffer.h>
 #include <IO/ReadBufferFromFile.h>
@@ -107,39 +108,62 @@ String objectName(ObjectID id)
 
 String encodePartRows(const PartRows & rows)
 {
-    if (rows.empty() || rows.size() > MAX_UNIT_ROWS)
+    if (rows.empty() || rows.size() > MAX_PART_ROWS)
         throw Exception(ErrorCodes::LIMIT_EXCEEDED, "Invalid UpsertMergeTree part row count");
+    size_t encoded_size = PART_ROWS_ENVELOPE_BYTES;
+    for (const auto & row : rows)
+    {
+        if (row.value.row_offset % 65536 == 0)
+            CurrentMemoryTracker::check();
+        if (row.key.size() > MAX_UNIT_BYTES)
+            throw Exception(ErrorCodes::LIMIT_EXCEEDED, "UpsertMergeTree part key exceeds its byte limit");
+        const auto size = row.key.size() + 8 + encodeIndexValue(row.value).size();
+        if (size > MAX_PART_LINEAGE_BYTES - encoded_size)
+            throw Exception(ErrorCodes::LIMIT_EXCEEDED, "UpsertMergeTree part lineage exceeds its byte limit");
+        encoded_size += size;
+    }
+    const bool large = rows.size() > MAX_UNIT_ROWS || encoded_size > MAX_RECORD_BYTES;
     BinaryWriter out;
-    out.bytes = "UMPROW01";
+    out.bytes.reserve(encoded_size);
+    CurrentMemoryTracker::check();
+    out.bytes = large ? "UMPROW02" : "UMPROW01";
     out.number(rows.size(), 4);
     for (size_t i = 0; i < rows.size(); ++i)
     {
+        if (i % 65536 == 0)
+            CurrentMemoryTracker::check();
         if (rows[i].value.row_offset != i)
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "UpsertMergeTree row metadata is not in physical order");
-        out.string(rows[i].key);
-        out.string(encodeIndexValue(rows[i].value));
+        out.number(rows[i].key.size(), 4);
+        out.bytes += rows[i].key;
+        const auto value = encodeIndexValue(rows[i].value);
+        out.number(value.size(), 4);
+        out.bytes += value;
     }
-    if (out.bytes.size() > MAX_RECORD_BYTES - 4)
-        throw Exception(ErrorCodes::LIMIT_EXCEEDED, "UpsertMergeTree row metadata exceeds its byte limit");
     out.number(crc(out.bytes), 4);
     return std::move(out.bytes);
 }
 
 PartRows decodePartRows(std::string_view bytes)
 {
-    if (bytes.size() < PART_ROWS_ENVELOPE_BYTES || bytes.size() > MAX_RECORD_BYTES || !bytes.starts_with("UMPROW01"))
+    const bool large = bytes.starts_with("UMPROW02");
+    if (bytes.size() < PART_ROWS_ENVELOPE_BYTES || bytes.size() > (large ? MAX_PART_LINEAGE_BYTES : MAX_RECORD_BYTES)
+        || (!large && !bytes.starts_with("UMPROW01")))
         throw Exception(ErrorCodes::CORRUPTED_DATA, "Invalid UpsertMergeTree row metadata header");
     BinaryReader checksum{bytes.substr(bytes.size() - 4)};
     if (checksum.number(4) != crc(bytes.substr(0, bytes.size() - 4)))
         throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree row metadata checksum mismatch");
     BinaryReader in{bytes.substr(8, bytes.size() - 12)};
-    const auto count = in.count(MAX_UNIT_ROWS, 50);
+    const auto count = in.count(large ? MAX_PART_ROWS : MAX_UNIT_ROWS, 50);
     if (!count)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "Empty UpsertMergeTree part metadata");
     PartRows rows;
     rows.reserve(count);
+    CurrentMemoryTracker::check();
     for (size_t i = 0; i < count; ++i)
     {
+        if (i % 65536 == 0)
+            CurrentMemoryTracker::check();
         auto key = in.string(MAX_UNIT_BYTES);
         auto value = decodeIndexValue(in.string(50));
         if (value.row_offset != i)
@@ -299,6 +323,7 @@ void writePartIndex(
     size_t max_key_bytes, ContextPtr context, MergeTreeDataPartChecksums & checksums)
 {
     const auto keys = encodeKeys(block, metadata, max_key_bytes);
+    CurrentMemoryTracker::check();
     const auto & ordinals = *block.getByName(ORDINAL_COLUMN).column;
     std::optional<VersionColumn> versions;
     if (!version_column.empty())
@@ -307,6 +332,8 @@ void writePartIndex(
     rows.reserve(block.rows());
     for (size_t offset = 0; offset < block.rows(); ++offset)
     {
+        if (offset % 65536 == 0)
+            CurrentMemoryTracker::check();
         const auto source = permutation ? (*permutation)[offset] : offset;
         RowMetadata row{.operation_id = operation_id, .block_ordinal = ordinals.getUInt(source), .self_binding = true};
         if (versions)

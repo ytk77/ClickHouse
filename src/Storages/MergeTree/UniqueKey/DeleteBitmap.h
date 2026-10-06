@@ -83,6 +83,10 @@ public:
 
     /// Set `row`.
     void add(UInt64 row);
+    /// Set a bounded half-open range of 32-bit part offsets without materializing it.
+    void addRange(UInt64 begin, UInt64 end);
+    /// Clear one offset while retaining the other deleted rows.
+    void remove(UInt64 row);
     /// Set every entry of `rows`. Empty input is a no-op.
     void addMany(const std::vector<UInt64> & rows);
     /// In-place union: `*this |= other`.

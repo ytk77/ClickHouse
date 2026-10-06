@@ -91,18 +91,18 @@ def test_target_settings_persist_and_reject_invalid_values():
     node.query("INSERT INTO query_settings VALUES (1,1,'a','u','p')")
     before = node.query("SHOW CREATE TABLE query_settings")
     assert "upsert_maintenance_target_bytes = 134217728" in before
-    for value in (0, 33554431, 268435457):
+    for value in (0, 33554431, 8589934593):
         error = node.query_and_get_error(
             f"ALTER TABLE query_settings MODIFY SETTING upsert_maintenance_target_bytes={value}"
         )
         assert "upsert_maintenance_target_bytes" in error
-        assert "33554432" in error and "268435456" in error
+        assert "33554432" in error and "8589934592" in error
         assert node.query("SHOW CREATE TABLE query_settings") == before
     node.restart_clickhouse()
     assert node.query("SHOW CREATE TABLE query_settings") == before
     assert node.query("SELECT count() FROM query_settings").strip() == "1"
     node.query("DROP TABLE query_settings SYNC")
-    for value in (0, 268435457):
+    for value in (0, 8589934593):
         error = node.query_and_get_error(
             f"""CREATE TABLE query_bad_target (id UInt64)
             ENGINE=UpsertMergeTree ORDER BY id UNIQUE KEY id SETTINGS upsert_maintenance_target_bytes={value}"""

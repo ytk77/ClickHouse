@@ -153,16 +153,16 @@ def test_maintenance_bounds_state_and_reclaims_dead_sources():
             )
         node.query(f"INSERT INTO {table} VALUES (1048576,1,'a',2)", settings=settings)
         node.query(f"INSERT INTO {table} VALUES (1048577,1,'a',2)", settings=settings)
-        # Small sources still consolidate after large healthy parts are treated as complete.
-        wait_parts(3)
+        # Large sources consolidate independently of the bounded winner-state batches.
+        wait_parts(2)
         assert node.query(f"SELECT count(),uniqExact((a,b)),min(value) FROM {table}") == "1048578\t1048578\t2\n"
         node.query(
             f"INSERT INTO {table} SELECT number,1,'a',3 FROM numbers(524288)",
             settings=insert_settings,
             timeout=120,
         )
-        # The conservative budget must still permit reclamation of fully dead large sources.
-        wait_parts(3)
+        # Bounded winner-state batches still permit reclamation of fully dead large sources.
+        wait_parts(2)
         assert node.query(f"SELECT count(),countIf(value=3) FROM {table}") == "1048578\t524288\n"
         assert not node.contains_in_log("UpsertMergeTree maintenance failed.*pending state batch")
     finally:

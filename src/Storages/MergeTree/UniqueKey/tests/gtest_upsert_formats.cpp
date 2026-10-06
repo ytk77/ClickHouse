@@ -3,6 +3,7 @@
 #include <Storages/MergeTree/UniqueKey/UpsertPartData.h>
 #include <Storages/MergeTree/UniqueKey/UpsertTableManifest.h>
 #include <Storages/MergeTree/UniqueKey/UpsertDurableFile.h>
+#include <Storages/MergeTree/UniqueKey/UpsertStateStore.h>
 #include <Storages/StorageInMemoryMetadata.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <Parsers/ASTIdentifier.h>
@@ -11,6 +12,7 @@
 #include <gtest/gtest.h>
 #include <limits>
 #include <filesystem>
+#include <string>
 
 namespace DB::ErrorCodes
 {
@@ -245,6 +247,52 @@ TEST(UpsertPartRows, PrevalidationRejectsInvalidImmutableInput)
     bad = rows;
     bad[1].value.row.write_csn = 1;
     EXPECT_THROW((ValidatedPartRows(bad, id)), Exception);
+}
+
+TEST(UpsertPartRows, LargeMaintenanceLineageExceedsForegroundRowAndByteBudgets)
+{
+    PartRows rows;
+    rows.reserve(MAX_UNIT_ROWS + 1);
+    for (UInt32 offset = 0; offset <= MAX_UNIT_ROWS; ++offset)
+        rows.push_back({std::to_string(offset), {offset, {.operation_id = {1, 2}, .block_ordinal = offset, .write_csn = 1}}});
+    auto bytes = encodePartRows(rows);
+    EXPECT_EQ(bytes.substr(0, 8), "UMPROW02");
+    auto decoded = decodePartRows(bytes);
+    ASSERT_EQ(decoded.size(), rows.size());
+    EXPECT_EQ(decoded.front(), rows.front());
+    EXPECT_EQ(decoded.back(), rows.back());
+    bytes.back() ^= 1;
+    EXPECT_THROW(decodePartRows(bytes), Exception);
+    rows.clear();
+    decoded.clear();
+    for (UInt32 offset = 0; offset < 3; ++offset)
+        rows.push_back({String(23U << 20, static_cast<char>('a' + offset)),
+            {offset, {.operation_id = {1, 2}, .block_ordinal = offset, .write_csn = 1}}});
+    bytes = encodePartRows(rows);
+    ASSERT_GT(bytes.size(), MAX_RECORD_BYTES);
+    EXPECT_EQ(bytes.substr(0, 8), "UMPROW02");
+    EXPECT_EQ(decodePartRows(bytes), rows);
+}
+
+TEST(UpsertPartRows, SmallLineageAndLargeAuthorizationHaveDistinctVersions)
+{
+    PartRows rows{{"key", {0, {.operation_id = {1, 2}, .write_csn = 1}}}};
+    EXPECT_EQ(encodePartRows(rows).substr(0, 8), "UMPROW01");
+    rows[0].key.assign(MAX_UNIT_BYTES + 1, 'a');
+    EXPECT_THROW(encodePartRows(rows), Exception);
+    PartCommit part;
+    part.part = {1, 2};
+    part.temporary_name = "tmp_upsert_test";
+    part.final_name = "p_1_1_0";
+    part.files_hash = {3, 4};
+    part.rows = MAX_UNIT_ROWS + 1;
+    part.token.accepted = part.rows;
+    EXPECT_THROW(decodePartCommit(encodePartCommit(part)), Exception);
+    part.chunked = true;
+    EXPECT_TRUE(decodePartCommit(encodePartCommit(part)).chunked);
+    part.rows = MAX_PART_ROWS + 1;
+    part.token.accepted = part.rows;
+    EXPECT_THROW(decodePartCommit(encodePartCommit(part)), Exception);
 }
 
 class UpsertTTLManifestTest : public ::testing::Test

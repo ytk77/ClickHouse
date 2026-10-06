@@ -72,11 +72,11 @@ Existing disk-state tables need one full startup scan to establish missing inven
 
 `UpsertMergeTree` stores ordinary column-oriented `MergeTree` parts. A small whole-row byte target can nevertheless produce many parts on a wide table, even when a query reads only two columns. Every selected part adds file, mark-loading and scheduling work. Compare identical queries and data on the same host with matched cache states before attributing a latency difference to the engine.
 
-`upsert_maintenance_target_bytes` controls background source selection and the output byte target. The default is 268,435,456 bytes (256 MiB); the supported range is 32 through 256 MiB. Explicit table settings and server `<merge_tree>` defaults override this compiled default. Row, lineage and durable-state budgets remain enforced and can split output earlier. This setting does not enlarge insertion units or foreground mutation output, and does not change the durable format.
+`upsert_maintenance_target_bytes` controls background source selection and the output byte target. The default is 268,435,456 bytes (256 MiB); the supported range is 32 MiB through 8 GiB. Explicit table settings and server `<merge_tree>` defaults override this compiled default. Physical parts are limited to 268,435,456 rows and 2 GiB of lineage. Winner relocation commits in independent bounded batches; the 128-MiB state-batch limit no longer limits physical part size. This setting does not enlarge insertion units or foreground mutation output. Maintenance uses version-2 payload authorizations and `UMPROW02` for large lineage sidecars; small sidecars retain `UMPROW01`. Native column serialization is unchanged. Atomic partition imports keep their 128-MiB state limit; a sufficiently large detached part can exceed it and be rejected without changing the detached payload. Complete table backups must include matching engine state. Older binaries cannot read these new authorizations, so reverting requires restoring a pre-upgrade backup rather than reopening newly compacted state.
 
 ```sql
 ALTER TABLE events MODIFY SETTING
-    upsert_maintenance_target_bytes = 134217728,
+    upsert_maintenance_target_bytes = 1073741824,
     prewarm_mark_cache = 1,
     columns_to_prewarm_mark_cache = 'AFFILIATE,USER_ID';
 ```
@@ -87,7 +87,7 @@ Changing the target wakes maintenance and revisits existing parts. Convergence r
 
 Rewrite memory is not limited to the target: input columns, filtered copies, output and rebuilding an overflowing prefix coexist. Peak memory can be several times the target (roughly 2–3 times for these buffers, plus writer and state overhead). Background work does not inherit the client's query memory limit. Concurrent maintenance across tables requires a server memory budget. Longer rewrites also retain source parts longer and temporarily increase disk use.
 
-An in-memory hint records background output cut by a byte, row, lineage or state budget. At the same or a smaller target, healthy compaction skips that part; expiration, stale TTL metadata and at least 25 percent masked rows still trigger rewriting. This prevents endless rewrites caused by differences between serialized and in-memory column sizes. Raising the target or changing the schema allows reconsideration. Retired-part hints are removed. A successfully published intermediate output and its hint remain valid if a later batch fails or stops for a changed TTL policy; the source stays active with the already moved rows masked. Hints disappear on reopen, so restart can cause additional compaction before convergence. A hinted part with less than 25 percent masked rows can retain that unused space until another rewrite condition applies. `UpsertMaintenanceSaturatedSkips` counts these scheduling skips.
+An in-memory hint records background physical output cut by a byte, row or lineage budget. At the same or a smaller target, healthy compaction skips that part; expiration, stale TTL metadata and at least 25 percent masked rows still trigger rewriting. This prevents endless rewrites caused by differences between serialized and in-memory column sizes. Raising the target or changing the schema allows reconsideration. Retired-part hints are removed. A successfully published intermediate output and its hint remain valid if a later batch fails or stops for a changed TTL policy; the source stays active with the already moved rows masked. Hints disappear on reopen, so restart can cause additional compaction before convergence. A hinted part with less than 25 percent masked rows can retain that unused space until another rewrite condition applies. `UpsertMaintenanceSaturatedSkips` counts these scheduling skips.
 
 Insertion, background rewrite and partition import prewarm caches after successful publication and outside the parts lock, using the existing temporary writer's retained marks. Wide parts honor the configured column filter; Compact parts keep a single marks file for all columns, so the column filter does not apply. Prewarming remains disabled by default and respects the minimum-size setting. A cache-fill failure is logged and counted without changing an already durable commit result. `UpsertPartCachePrewarms` counts eligible successful prewarm calls, not marks inserted: a part whose writer started before prewarming was enabled may have no retained marks. `UpsertPartCachePrewarmFailures` counts exceptions. Prewarming addresses mark loading; it does not warm all column data pages.
 
@@ -111,9 +111,9 @@ Two server settings, read at startup, bound background rewrite admission:
 | `upsert_maintenance_memory_budget` | 2 GiB | Soft budget for estimated memory reservations of admitted attempts |
 
 Both must be positive. Reservations estimate three times the smaller of the target and selected
-sources' total uncompressed on-disk bytes, plus the largest source, decoded lineage and row metadata,
-and estimated state work capped at half the state-batch limit. Small rewrites therefore do not reserve
-an entire target-sized buffer. A single attempt exceeding the reservation budget may run alone when
+sources' total uncompressed on-disk bytes, plus the largest source, source and output lineage, row metadata, relocation maps,
+and estimated state work capped at half the state-batch limit. The reservation doubles this sum to allow for additional native sorting and `SSTIndexWriter` copies.
+Small rewrites therefore do not reserve an entire target-sized buffer. A single attempt exceeding the reservation budget may run alone when
 background and server headroom permit it; `UpsertMaintenanceOversizedAdmissions` records this policy.
 Admission also checks the background merge soft limit and server memory hard limit, using their
 current tracked usage plus reservations. This intentionally counts some active allocations twice.
@@ -450,3 +450,20 @@ These are local checks, not the full Docker integration suite or an ASan/TSan ru
 The query verification change passed a Release build, 103 scoped `Upsert` C++ tests, 59 integration cases on an isolated local server, and all 18 existing `UpsertMergeTree` SQL/shell tests. The three new integration cases were rerun after strengthening their assertions. Both analyzers completed ordinary reads, forced projection reads, `mergeTreeProjection` introspection and an insert while a full-payload verifier held a recovered part's mutex. Those queries did not increment `UpsertPayloadVerificationParts`. The old binary's ordinary count query verified both recovered parts with the background sweep paused.
 
 Coverage includes valid-CRC lineage substitutions in new and previously verified parts, authenticated legacy-inventory establishment, native compressed-block corruption, background fencing and rejection of a corrupt partition export before output authorization. Integration cases used the local native-server adapter; the Docker integration runner and ASan/TSan were not run for this change. These checks establish behavior and integrity boundaries, not a production latency or throughput measurement.
+
+## Large-part relocation validation on 2026-10-06 {#large-part-relocation-validation-20261006}
+
+Physical output now spans multiple durable relocation batches. Release compilation, 157 scoped C++ tests, 18 SQL/shell regressions and 32 distinct integration cases passed. Integration functions ran through an isolated native-server adapter, covering both `Wide` and `Compact` 1.6-million-row parts, updates, deletion, forced process restart, the first durable relocation before native rename, settings persistence, conditional `TTL`, concurrent writes, schema changes and atomic import budget rejection with the detached payload preserved. This is not Docker, ASan/TSan or sustained production-load coverage.
+
+The same-host benchmark uses eight million unique rows with the same ordered key, partitioning and column values in both engines. The query groups `toDate(settled)` and sums three `Float64` columns. Each engine uses eight query threads. Warm medians use twelve alternating samples with query result caching disabled. File-eviction medians use three alternating samples after `fdatasync` and per-file `POSIX_FADV_DONTNEED`, with `pread` and uncompressed caching disabled; no system-wide caches were dropped.
+
+| Build and engine | Active parts | Largest part rows | Warm median | File-eviction median |
+| --- | ---: | ---: | ---: | ---: |
+| `83376bf8` baseline, `UpsertMergeTree`, 256-MiB target | 15 | 540,547 | 51 ms | 86 ms |
+| Baseline `ReplacingMergeTree` | 1 | 8,000,000 | 49 ms | 51 ms |
+| Large-part `UpsertMergeTree`, 4-GiB target | 1 | 8,000,000 | 50 ms | 69 ms |
+| Candidate `ReplacingMergeTree` | 1 | 8,000,000 | 48.5 ms | 53 ms |
+
+Each scan reads 224,000,000 logical bytes. After file eviction, baseline upsert scans report 158,167,040 OS-read bytes and the other scans report 158,035,968 bytes. Advisory eviction does not establish cold controller or drive caches. The candidate's native compressed column size matches its replacing reference exactly at 254,617,944 bytes. Query results retain the expected row count and ID sum. Warm aggregation was already close to the replacing reference in the baseline; the demonstrated improvement is larger physical parts and a lower file-eviction median, not a 46-fold speedup.
+
+Initial candidate consolidation took 307.8 seconds and peaked at 10,497,013,550 tracked maintenance bytes (approximately 9.78 GiB). The final admission estimate was doubled after this measurement to reserve room for native sorting and index construction; the measured query path is unchanged. This experiment does not measure continuous ingestion or establish latency for CRM3's approximately 2.35 billion physical rows. Its storage, available memory and cache residency still affect scan time. Existing-table consolidation requires substantial rewrite I/O, temporary disk space and memory headroom; a larger target should be raised gradually and monitored.

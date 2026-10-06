@@ -545,6 +545,16 @@ struct DiskState::Impl
             const auto mask = DeleteBitmap::deserialize(mask_input);
             if (mask->rangeCardinality(0, record.rows) != mask->cardinality())
                 throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree recovered mask exceeds its part");
+            if (const auto progress = database->get("B" + objectName(record.part)))
+            {
+                ReadBufferFromString progress_input(*progress);
+                auto processed = DeleteBitmap::deserialize(progress_input);
+                if (!record.chunked || processed->rangeCardinality(0, record.rows) != processed->cardinality())
+                    throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree recovered relocation progress exceeds its part");
+                processed->merge(*mask);
+                if (processed->cardinality() != record.rows)
+                    throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree recovered an unprocessed visible output row");
+            }
             if (!final_exists)
             {
                 fs::rename(temporary, final);
@@ -798,7 +808,7 @@ PartRows DiskState::loadPartRows(const String & name) const
         if (!inventory || hashLogRecord(*inventory) != record.files_hash)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree maintenance source lacks its authenticated inventory");
         /// Authenticate the bytes being decoded even for new or previously verified parts, without the sweep mutex.
-        auto rows = decodePartRows(readInventoryFile(std::filesystem::path(impl->table_path) / name, ROWS_FILE, *inventory, MAX_RECORD_BYTES));
+        auto rows = decodePartRows(readInventoryFile(std::filesystem::path(impl->table_path) / name, ROWS_FILE, *inventory, MAX_PART_LINEAGE_BYTES));
         if (rows.size() != record.rows)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree maintenance source row count mismatch");
         const auto csn = impl->database->integer("O" + objectName(record.part));
@@ -1092,14 +1102,17 @@ StateStore::Prepared DiskState::prepare(const String & partition, PartCommit par
 
 StateStore::Prepared DiskState::prepareMerge(
     const String & partition, PartCommit part, const PartRows & rows, const std::vector<String> & sources,
-    const PartRows & expired, bool retire_sources, const StateStore::MergeInput * input)
+    const PartRows & expired, bool retire_sources, const StateStore::MergeInput * input, std::optional<bool> complete_output)
 {
     ProfileEventTimeIncrement<Microseconds> timer(ProfileEvents::UpsertStatePrepareMicroseconds);
+    const bool chunked = complete_output.has_value();
+    const auto existing_output = chunked ? impl->database->get("A" + part.final_name) : std::nullopt;
     if ((!retire_sources && !input)
         || (input && (!input->snapshot || input->lineage.size() != sources.size() || input->offsets.size() != sources.size()))
-        || sources.empty() || sources.size() > 32 || part.rows != rows.size() || rows.size() > MAX_UNIT_ROWS
+        || sources.empty() || sources.size() > 32 || (!chunked && part.rows != rows.size()) || rows.size() > MAX_UNIT_ROWS
         || expired.size() > MAX_UNIT_ROWS - rows.size()
-        || part.part == ObjectID{} || impl->database->get("O" + objectName(part.part)))
+        || (chunked && (retire_sources || !input || !part.rows || part.rows > MAX_PART_ROWS))
+        || part.part == ObjectID{} || (!existing_output && impl->database->get("O" + objectName(part.part))))
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid UpsertMergeTree maintenance unit");
     StateStore::Prepared result;
     result.partition = partition;
@@ -1113,14 +1126,42 @@ StateStore::Prepared DiskState::prepareMerge(
         throw Exception(ErrorCodes::LIMIT_EXCEEDED, "UpsertMergeTree commit sequence exhausted");
     result.csn = result.disk->previous_csn + 1;
     auto & batch = result.disk->batch;
+    auto dead = std::make_shared<DeleteBitmap>();
+    DeleteBitmap processed;
+    if (chunked)
+    {
+        part.chunked = true;
+        if (existing_output)
+        {
+            const auto previous = decodePartCommit(*existing_output);
+            if (!previous.chunked || previous.part != part.part || previous.rows != part.rows
+                || previous.files_hash != part.files_hash || previous.temporary_name != part.temporary_name)
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree relocation changed its output authorization");
+            const auto previous_mask = impl->current->getMask(objectName(part.part));
+            const auto progress = impl->database->get("B" + objectName(part.part));
+            if (!previous_mask || !progress)
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree relocation lacks its output progress or mask");
+            dead->merge(*previous_mask);
+            ReadBufferFromString progress_input(*progress);
+            processed.merge(*DeleteBitmap::deserialize(progress_input));
+        }
+        else
+            dead->addRange(0, part.rows);
+    }
     std::map<String, const PartRow *> output;
     for (size_t offset = 0; offset < rows.size(); ++offset)
     {
         const auto & row = rows[offset];
-        if (row.value.row.self_binding || row.value.row_offset != offset || !output.emplace(row.key, &row).second)
+        if (row.value.row.self_binding || row.value.row_offset >= part.rows
+            || (!chunked && row.value.row_offset != offset) || !output.emplace(row.key, &row).second)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "Invalid UpsertMergeTree merge output lineage or duplicate key");
+        if (chunked)
+        {
+            if (processed.contains(row.value.row_offset) || !dead->contains(row.value.row_offset))
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree relocation repeated an output offset");
+            processed.add(row.value.row_offset);
+        }
     }
-    auto dead = std::make_shared<DeleteBitmap>();
     std::map<String, const PartRow *> expirations;
     for (const auto & row : expired)
     {
@@ -1194,6 +1235,8 @@ StateStore::Prepared DiskState::prepareMerge(
                     updated.id(part.part);
                     updated.string(encodeIndexValue(it->second->value));
                     batch.Put(key, updated.bytes);
+                    if (chunked)
+                        dead->remove(it->second->value.row_offset);
                 }
                 rewritten_mask.add(row.value.row_offset);
                 checkBatchBudget(batch);
@@ -1211,6 +1254,7 @@ StateStore::Prepared DiskState::prepareMerge(
             batch.Delete("V" + objectName(source.part));
             result.disk->deleteMask(objectName(source.part));
             batch.Delete("O" + objectName(source.part));
+            batch.Delete("B" + objectName(source.part));
         }
         else
         {
@@ -1223,6 +1267,43 @@ StateStore::Prepared DiskState::prepareMerge(
     if (mapped_expirations.size() != expirations.size())
         throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree merge invented an expiration identity");
     part.dead.clear();
+    if (chunked)
+    {
+        part.kills.clear();
+        part.token = {};
+        /// The authorization describes the immutable payload; its current live rows are in the mask.
+        part.token.accepted = part.rows;
+        result.produces_part = !existing_output;
+        if (result.produces_part)
+        {
+            const auto info = MergeTreePartInfo::fromPartName(part.final_name, MERGE_TREE_DATA_MIN_FORMAT_VERSION_WITH_CUSTOM_PARTITIONING);
+            if (info.getPartitionId() != partition)
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree relocation output partition mismatch");
+            result.payload = encodePartCommit(part);
+            decodePartCommit(result.payload);
+            batch.Put("A" + part.final_name, result.payload);
+            putInventory(batch, part);
+            batch.Put("O" + objectName(part.part), number(result.csn));
+        }
+        result.disk->putMask(objectName(part.part), *dead);
+        if (*complete_output)
+        {
+            if (processed.cardinality() != part.rows)
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree relocation omitted output offsets");
+            batch.Delete("B" + objectName(part.part));
+        }
+        else
+            batch.Put("B" + objectName(part.part), encodeMask(processed));
+        if (result.produces_part && impl->part_count == std::numeric_limits<UInt64>::max())
+            throw Exception(ErrorCodes::LIMIT_EXCEEDED, "UpsertMergeTree part counter exhausted");
+        batch.Put("part_count", number(impl->part_count + result.produces_part));
+        batch.Put(csn_key, number(result.csn));
+        result.record = std::move(part);
+        checkBatchBudget(batch);
+        result.disk->masks = std::make_shared<DiskMaskSnapshot>(impl->database);
+        result.snapshot = impl->newSnapshot(result.disk->masks);
+        return result;
+    }
     for (const auto offset : dead->toVector())
     {
         if (offset >= rows.size())
@@ -1295,7 +1376,7 @@ StateStore::Prepared DiskState::prepareTruncate()
     /// Clear active authorizations, sequence counters, token expiry, masks, operation bindings, tokens and winners.
     /// Range tombstones preserve the old masks for readers holding a pre-truncate `RocksDB` snapshot.
     result.disk->clearMasks();
-    for (const char space : {'A', 'C', 'E', 'O', 'T', 'V', 'W'})
+    for (const char space : {'A', 'B', 'C', 'E', 'O', 'T', 'V', 'W'})
         check(batch.DeleteRange(String(1, space), String(1, space + 1)));
     batch.Put("part_count", number(0));
     batch.Put("retry_bytes", number(0));
@@ -1386,6 +1467,7 @@ StateStore::Prepared DiskState::preparePartition(
         batch.Delete("V" + objectName(source.part));
         result.disk->deleteMask(objectName(source.part));
         batch.Delete("O" + objectName(source.part));
+        batch.Delete("B" + objectName(source.part));
         result.retired_parts.push_back(name);
         checkBatchBudget(batch);
     }
@@ -1679,7 +1761,7 @@ StateStore::Prepared DiskState::prepare(const String &, PartCommit, const Valida
 {
     std::unreachable();
 }
-StateStore::Prepared DiskState::prepareMerge(const String &, PartCommit, const PartRows &, const std::vector<String> &, const PartRows &, bool, const StateStore::MergeInput *)
+StateStore::Prepared DiskState::prepareMerge(const String &, PartCommit, const PartRows &, const std::vector<String> &, const PartRows &, bool, const StateStore::MergeInput *, std::optional<bool>)
 {
     std::unreachable();
 }

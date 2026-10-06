@@ -15,14 +15,14 @@ $CLICKHOUSE_CLIENT --allow_experimental_unique_key=1 -q "CREATE TABLE $table
     (id UInt64, ver UInt64) ENGINE=UpsertMergeTree(ver) ORDER BY id UNIQUE KEY id
     SETTINGS min_bytes_for_wide_part=0"
 
-# Both inputs fit; their combined encoded lineage exceeds 64 MiB despite only 16 MiB of column data.
+# The combined lineage exceeds the old 64-MiB limit despite only 16 MiB of column data.
 for start in 0 524288; do
     $CLICKHOUSE_CLIENT --async_insert=0 -q "INSERT INTO $table SELECT number, toUInt64(1)
         FROM numbers($start, 524288) SETTINGS max_threads=1, max_insert_threads=1,
         max_block_size=524288, min_insert_block_size_rows=524288, min_insert_block_size_bytes=0"
 done
 
-# Later small parts must still consolidate instead of waiting behind an impossible candidate.
+# The larger inputs can consolidate, while a disproportionate small tail forms its own part.
 for id in {1048576..1048583}; do
     $CLICKHOUSE_CLIENT --async_insert=0 -q "INSERT INTO $table VALUES ($id,1)"
 done
@@ -31,7 +31,7 @@ deadline=$((SECONDS + 60))
 while :; do
     parts=$($CLICKHOUSE_CLIENT -q "SELECT count() FROM system.parts
         WHERE database='$CLICKHOUSE_DATABASE' AND table='upsert_maintenance_lineage_budget' AND active")
-    if [[ "$parts" == 3 ]]; then
+    if [[ "$parts" == 2 ]]; then
         break
     fi
     if (( SECONDS >= deadline )); then

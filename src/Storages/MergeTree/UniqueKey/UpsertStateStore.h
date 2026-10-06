@@ -41,6 +41,8 @@ struct PartCommit
     std::vector<UInt32> dead;
     std::vector<Kill> kills;
     Token token;
+    /// Version-two authorization: visibility is persisted independently for bounded relocations.
+    bool chunked = false;
 };
 String encodePartCommit(const PartCommit & record);
 PartCommit decodePartCommit(std::string_view bytes);
@@ -106,7 +108,8 @@ public:
     };
     Prepared prepareMerge(
         const String & partition, PartCommit part, const PartRows & rows, const std::vector<String> & sources,
-        const PartRows & expired = {}, bool retire_sources = true, const MergeInput * input = nullptr);
+        const PartRows & expired = {}, bool retire_sources = true, const MergeInput * input = nullptr,
+        std::optional<bool> complete_output = std::nullopt);
     Prepared prepareTruncate();
     /// Requires writer exclusion, but must run outside the parts lock after publication.
     void finishTruncate();

@@ -10,6 +10,7 @@
 #include <barrier>
 #include <Storages/MergeTree/UniqueKey/UpsertMetrics.h>
 #include <Common/ProfileEvents.h>
+#include <IO/WriteBufferFromString.h>
 
 namespace DB::ErrorCodes
 {
@@ -120,7 +121,203 @@ protected:
         database.reset();
         return {wal, boundary};
     }
+
+    PartCommit chunkedOutput(PartRows & rows)
+    {
+        PartCommit part;
+        part.part = newObjectID();
+        part.rows = rows.size();
+        part.temporary_name = "tmp_upsert_" + objectName(part.part);
+        const auto number = next_part++;
+        part.final_name = "p_" + std::to_string(number) + "_" + std::to_string(number) + "_0";
+        for (size_t offset = 0; offset < rows.size(); ++offset)
+            rows[offset].value.row_offset = static_cast<UInt32>(offset);
+        const auto path = directory / part.temporary_name;
+        std::filesystem::create_directory(path);
+        createDurableFile(path / ROWS_FILE, encodePartRows(rows));
+        part.files_hash = hashPartDirectory(path, true, &part.files_inventory);
+        return part;
+    }
 };
+
+TEST_F(UpsertDiskStateTest, ChunkedOutputPreservesSnapshotsAndConcurrentWinners)
+{
+    String source_id;
+    String destination_id;
+    {
+        StateStore store(directory, incarnation, false, true);
+        auto source = prepare(store, {{"a", 1}, {"b", 1}, {"c", 1}, {"d", 1}});
+        commit(store, source);
+        source_id = objectName(source.record.part);
+        const auto initial = store.snapshot();
+        const std::vector<PartRows> lineage{store.loadPartRows(source.record.final_name)};
+        PartRows output{lineage[0][3], lineage[0][2], lineage[0][1], lineage[0][0]};
+        auto authorization = chunkedOutput(output);
+        destination_id = objectName(authorization.part);
+        std::vector<std::vector<UInt32>> offsets{{0, 2}};
+        const StateStore::MergeInput input{initial, lineage, offsets};
+        const std::vector<String> sources{source.record.final_name};
+        auto first = store.prepareMerge("p", authorization, {output[3], output[1]}, sources, {}, false, &input, false);
+        ASSERT_TRUE(first.produces_part);
+        ASSERT_TRUE(first.record.chunked);
+        commit(store, first);
+        const auto pinned = store.snapshot();
+        EXPECT_EQ(initial->getMask(source_id)->cardinality(), 0);
+        EXPECT_EQ(pinned->getMask(source_id)->toVector(), (std::vector<UInt64>{0, 2}));
+        EXPECT_EQ(pinned->getMask(destination_id)->toVector(), (std::vector<UInt64>{0, 2}));
+
+        auto concurrent = prepare(store, {{"a", 2}, {"b", 2}});
+        commit(store, concurrent);
+        offsets = {{1, 3}};
+        auto last = store.prepareMerge("p", authorization, {output[2], output[0]}, sources, {}, false, &input, true);
+        EXPECT_FALSE(last.produces_part);
+        commit(store, last);
+        EXPECT_EQ(store.snapshot()->getMask(destination_id)->toVector(), (std::vector<UInt64>{2, 3}));
+        EXPECT_EQ(store.snapshot()->getMask(source_id)->cardinality(), 4);
+        EXPECT_EQ(pinned->getMask(destination_id)->toVector(), (std::vector<UInt64>{0, 2}));
+        offsets = {{}};
+        auto retirement = merge(store, {}, sources, {}, true, &input);
+        commit(store, retirement);
+        EXPECT_EQ(store.authorizedPartCount(), 2);
+        EXPECT_FALSE(store.snapshot()->getMask(source_id));
+    }
+    StateStore reopened(directory, incarnation, true, true);
+    EXPECT_EQ(reopened.authorizedPartCount(), 2);
+    EXPECT_EQ(reopened.snapshot()->getMask(destination_id)->toVector(), (std::vector<UInt64>{2, 3}));
+    EXPECT_FALSE(reopened.snapshot()->getMask(source_id));
+    EXPECT_FALSE(prepare(reopened, {{"a", 1}, {"b", 1}, {"c", 0}, {"d", 0}}).produces_part);
+}
+
+TEST_F(UpsertDiskStateTest, ChunkedOutputRecoversBeforeRenameAndRejectsRepeatedOrOmittedOffsets)
+{
+    PartCommit authorization;
+    PartRows output;
+    String source_name;
+    String source_id;
+    {
+        StateStore store(directory, incarnation, false, true);
+        auto source = prepare(store, {{"a", 1}, {"b", 1}, {"c", 1}});
+        commit(store, source);
+        source_name = source.record.final_name;
+        source_id = objectName(source.record.part);
+        const std::vector<PartRows> lineage{store.loadPartRows(source_name)};
+        output = lineage[0];
+        authorization = chunkedOutput(output);
+        const std::vector<std::vector<UInt32>> offsets{{1}};
+        const StateStore::MergeInput input{store.snapshot(), lineage, offsets};
+        auto first = store.prepareMerge("p", authorization, {output[1]}, {source_name}, {}, false, &input, false);
+        store.append(first);
+    }
+    StateStore reopened(directory, incarnation, true, true);
+    const auto destination_id = objectName(authorization.part);
+    EXPECT_TRUE(std::filesystem::exists(directory / authorization.final_name));
+    EXPECT_EQ(reopened.snapshot()->getMask(destination_id)->toVector(), (std::vector<UInt64>{0, 2}));
+    EXPECT_EQ(reopened.snapshot()->getMask(source_id)->toVector(), (std::vector<UInt64>{1}));
+    const std::vector<PartRows> lineage{reopened.loadPartRows(source_name)};
+    std::vector<std::vector<UInt32>> offsets{{1}};
+    const StateStore::MergeInput input{reopened.snapshot(), lineage, offsets};
+    EXPECT_THROW(reopened.prepareMerge("p", authorization, {output[1]}, {source_name}, {}, false, &input, false), Exception);
+    offsets = {{0}};
+    EXPECT_THROW(reopened.prepareMerge("p", authorization, {output[0]}, {source_name}, {}, false, &input, true), Exception);
+    auto changed = authorization;
+    changed.files_hash = newObjectID();
+    EXPECT_THROW(reopened.prepareMerge("p", changed, {output[0]}, {source_name}, {}, false, &input, false), Exception);
+    offsets = {{0, 2}};
+    auto last = reopened.prepareMerge("p", authorization, {output[0], output[2]}, {source_name}, {}, false, &input, true);
+    commit(reopened, last);
+    EXPECT_TRUE(reopened.snapshot()->getMask(destination_id)->empty());
+    EXPECT_EQ(reopened.snapshot()->getMask(source_id)->cardinality(), 3);
+    EXPECT_THROW(reopened.prepareMerge("p", authorization, {}, {source_name}, {}, false, &input, false), Exception);
+}
+
+TEST_F(UpsertDiskStateTest, InterruptedChunkedOutputCanBeConsolidatedWithoutResuming)
+{
+    String source_name;
+    String destination_name;
+    {
+        StateStore store(directory, incarnation, false, true);
+        auto source = prepare(store, {{"a", 1}, {"b", 1}, {"c", 1}});
+        commit(store, source);
+        source_name = source.record.final_name;
+        const std::vector<PartRows> lineage{store.loadPartRows(source_name)};
+        auto output = lineage[0];
+        auto authorization = chunkedOutput(output);
+        destination_name = authorization.final_name;
+        const std::vector<std::vector<UInt32>> offsets{{1}};
+        const StateStore::MergeInput input{store.snapshot(), lineage, offsets};
+        auto first = store.prepareMerge("p", authorization, {output[1]}, {source_name}, {}, false, &input, false);
+        commit(store, first);
+    }
+    {
+        StateStore reopened(directory, incarnation, true, true);
+        const std::vector<PartRows> lineage{reopened.loadPartRows(source_name), reopened.loadPartRows(destination_name)};
+        const std::vector<std::vector<UInt32>> offsets(2);
+        const StateStore::MergeInput input{reopened.snapshot(), lineage, offsets};
+        auto joined = merge(reopened, {lineage[0][0], lineage[1][1], lineage[0][2]}, {source_name, destination_name}, {}, true, &input);
+        commit(reopened, joined);
+        EXPECT_EQ(reopened.authorizedPartCount(), 1);
+        EXPECT_TRUE(reopened.snapshot()->getMask(objectName(joined.record.part))->empty());
+        EXPECT_EQ(reopened.loadPartRows(joined.record.final_name).size(), 3);
+    }
+    StateStore reopened(directory, incarnation, true, true);
+    EXPECT_EQ(reopened.authorizedPartCount(), 1);
+}
+
+TEST_F(UpsertDiskStateTest, RecoveryRejectsVisibleOutputWithoutDurableProgress)
+{
+    String destination_id;
+    {
+        StateStore store(directory, incarnation, false, true);
+        auto source = prepare(store, {{"a", 1}, {"b", 1}});
+        commit(store, source);
+        const std::vector<PartRows> lineage{store.loadPartRows(source.record.final_name)};
+        auto output = lineage[0];
+        auto authorization = chunkedOutput(output);
+        destination_id = objectName(authorization.part);
+        const std::vector<std::vector<UInt32>> offsets{{0}};
+        const StateStore::MergeInput input{store.snapshot(), lineage, offsets};
+        auto first = store.prepareMerge("p", authorization, {output[0]}, {source.record.final_name}, {}, false, &input, false);
+        commit(store, first);
+    }
+    rocksdb::DB * raw = nullptr;
+    ASSERT_TRUE(rocksdb::DB::Open(rocksdb::Options{}, (directory / "upsert_state_v2").string(), &raw).ok());
+    std::unique_ptr<rocksdb::DB> database(raw);
+    String progress;
+    {
+        WriteBufferFromString out(progress);
+        DeleteBitmap{}.serialize(out);
+    }
+    ASSERT_TRUE(database->Put(rocksdb::WriteOptions{}, "B" + destination_id, progress).ok());
+    database.reset();
+    EXPECT_THROW((StateStore(directory, incarnation, true, true)), Exception);
+}
+
+TEST_F(UpsertDiskStateTest, TruncateRemovesInterruptedOutputProgress)
+{
+    {
+        StateStore store(directory, incarnation, false, true);
+        auto source = prepare(store, {{"a", 1}, {"b", 1}});
+        commit(store, source);
+        const std::vector<PartRows> lineage{store.loadPartRows(source.record.final_name)};
+        auto output = lineage[0];
+        auto authorization = chunkedOutput(output);
+        const std::vector<std::vector<UInt32>> offsets{{0}};
+        const StateStore::MergeInput input{store.snapshot(), lineage, offsets};
+        auto first = store.prepareMerge("p", authorization, {output[0]}, {source.record.final_name}, {}, false, &input, false);
+        commit(store, first);
+        auto truncated = store.prepareTruncate();
+        store.append(truncated);
+        store.publish(truncated);
+        EXPECT_EQ(store.authorizedPartCount(), 0);
+    }
+    rocksdb::DB * raw = nullptr;
+    ASSERT_TRUE(rocksdb::DB::Open(rocksdb::Options{}, (directory / "upsert_state_v2").string(), &raw).ok());
+    std::unique_ptr<rocksdb::DB> database(raw);
+    std::unique_ptr<rocksdb::Iterator> iterator(database->NewIterator(rocksdb::ReadOptions{}));
+    iterator->Seek("B");
+    EXPECT_FALSE(iterator->Valid() && iterator->key().starts_with("B"));
+    EXPECT_TRUE(iterator->status().ok());
+}
 
 TEST_F(UpsertDiskStateTest, IncompleteFinalBatchRetainsEarlierDurableCommit)
 {

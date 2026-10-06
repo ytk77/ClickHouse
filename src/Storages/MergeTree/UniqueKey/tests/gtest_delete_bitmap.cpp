@@ -72,6 +72,34 @@ TEST(DeleteBitmapTest, WrapperSmoke)
     EXPECT_EQ(v, (std::vector<UInt64>{10, 20, 30, 40, 50}));
 }
 
+TEST(DeleteBitmapTest, RangeInitializationAndRemovalPreserveWidthBoundaries)
+{
+    DeleteBitmap bitmap;
+    bitmap.addRange(5, 1000000);
+    EXPECT_EQ(bitmap.cardinality(), 999995);
+    bitmap.remove(5);
+    bitmap.remove(123456);
+    bitmap.remove(UInt64{1} << 32);
+    EXPECT_EQ(bitmap.cardinality(), 999993);
+    EXPECT_FALSE(bitmap.contains(5));
+    EXPECT_FALSE(bitmap.contains(123456));
+    EXPECT_TRUE(bitmap.contains(999999));
+    bitmap.addRange((UInt64{1} << 32) - 2, UInt64{1} << 32);
+    bitmap.remove((UInt64{1} << 32) - 1);
+    EXPECT_TRUE(bitmap.contains((UInt64{1} << 32) - 2));
+    EXPECT_FALSE(bitmap.contains((UInt64{1} << 32) - 1));
+    bitmap.add((UInt64{1} << 32) + 1);
+    bitmap.addRange(0, 6);
+    bitmap.remove((UInt64{1} << 32) + 1);
+    bitmap.remove(0);
+    auto restored = roundtrip(bitmap);
+    EXPECT_EQ(restored->cardinality(), bitmap.cardinality());
+    EXPECT_EQ(restored->contains(0), false);
+    EXPECT_TRUE(restored->contains(5));
+    EXPECT_THROW(bitmap.addRange(10, 9), Exception);
+    EXPECT_THROW(bitmap.addRange(0, (UInt64{1} << 32) + 1), Exception);
+}
+
 TEST(DeleteBitmapTest, ContainsBulkMatchesScalar)
 {
     /// Correctness lock for the bulk API: must produce the same keep/drop

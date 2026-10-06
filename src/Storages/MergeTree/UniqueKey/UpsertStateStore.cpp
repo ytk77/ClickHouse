@@ -33,7 +33,7 @@ String partitionFile(const String & partition)
 String encodePartCommit(const PartCommit & record)
 {
     BinaryWriter out;
-    out.number(1, 1);
+    out.number(record.chunked ? 2 : 1, 1);
     out.id(record.part);
     out.string(record.temporary_name);
     out.string(record.final_name);
@@ -60,9 +60,11 @@ String encodePartCommit(const PartCommit & record)
 PartCommit decodePartCommit(std::string_view bytes)
 {
     BinaryReader in{bytes};
-    if (in.number(1) != 1)
+    const auto version = in.number(1);
+    if (version != 1 && version != 2)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "Unknown UpsertMergeTree commit payload version");
     PartCommit result;
+    result.chunked = version == 2;
     result.part = in.id();
     result.temporary_name = in.string(240);
     result.final_name = in.string(240);
@@ -93,7 +95,7 @@ PartCommit decodePartCommit(std::string_view bytes)
     in.end();
     if (!result.rows)
     {
-        if (result.part != ObjectID{} || !result.temporary_name.empty() || !result.final_name.empty()
+        if (result.chunked || result.part != ObjectID{} || !result.temporary_name.empty() || !result.final_name.empty()
             || result.files_hash != ObjectID{} || !result.dead.empty() || !result.kills.empty() || result.token.accepted)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "Invalid UpsertMergeTree no-op payload");
     }
@@ -101,9 +103,12 @@ PartCommit decodePartCommit(std::string_view bytes)
     {
         validateName(result.temporary_name, true);
         validateName(result.final_name, false);
-        if (result.part == ObjectID{} || result.files_hash == ObjectID{} || result.rows > MAX_UNIT_ROWS
+        if (result.part == ObjectID{} || result.files_hash == ObjectID{} || result.rows > (result.chunked ? MAX_PART_ROWS : MAX_UNIT_ROWS)
             || result.token.accepted != result.rows - result.dead.size() || !result.token.accepted)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "Invalid UpsertMergeTree part authorization");
+        if (result.chunked && (!result.dead.empty() || !result.kills.empty() || !result.token.client_token.empty()
+            || result.token.unit || result.token.payload_hash != ObjectID{}))
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "Invalid UpsertMergeTree chunked payload authorization");
     }
     return result;
 }
@@ -376,11 +381,11 @@ void StateStore::append(const Prepared & prepared)
 
 StateStore::Prepared StateStore::prepareMerge(
     const String & partition, PartCommit part, const PartRows & rows, const std::vector<String> & sources,
-    const PartRows & expired, bool retire_sources, const MergeInput * input)
+    const PartRows & expired, bool retire_sources, const MergeInput * input, std::optional<bool> complete_output)
 {
     if (!disk)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Legacy UpsertMergeTree does not authorize reclamation");
-    return disk->prepareMerge(partition, std::move(part), rows, sources, expired, retire_sources, input);
+    return disk->prepareMerge(partition, std::move(part), rows, sources, expired, retire_sources, input, complete_output);
 }
 
 StateStore::Prepared StateStore::prepareTruncate()

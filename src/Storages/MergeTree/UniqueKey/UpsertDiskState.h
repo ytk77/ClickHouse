@@ -25,7 +25,8 @@ public:
     StateStore::Prepared prepare(const String & partition, PartCommit part, const ValidatedPartRows & rows);
     StateStore::Prepared prepareMerge(
         const String & partition, PartCommit part, const PartRows & rows, const std::vector<String> & sources,
-        const PartRows & expired, bool retire_sources, const StateStore::MergeInput * input);
+        const PartRows & expired, bool retire_sources, const StateStore::MergeInput * input,
+        std::optional<bool> complete_output = std::nullopt);
     StateStore::Prepared prepareTruncate();
     /// Finish durable truncation while writers are excluded, after releasing retired snapshots.
     void finishTruncate();
