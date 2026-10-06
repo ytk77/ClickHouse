@@ -16,8 +16,6 @@
 #include <Common/SipHash.h>
 #include <Common/CurrentMemoryTracker.h>
 #include <IO/HashingWriteBuffer.h>
-#include <IO/HashingReadBuffer.h>
-#include <IO/ReadBufferFromFile.h>
 #include <IO/WriteBufferFromFileBase.h>
 #include <IO/WriteHelpers.h>
 #include <IO/WriteBufferFromString.h>
@@ -27,7 +25,6 @@
 #include <sys/stat.h>
 #include <filesystem>
 #include <map>
-#include <numeric>
 #include <zlib.h>
 
 namespace DB::ErrorCodes
@@ -377,22 +374,8 @@ void writePartIndex(
         checksums.addFile(TTL_FILE, policy.size(), ttl_hash);
     }
 
-    std::vector<size_t> order(rows.size());
-    std::iota(order.begin(), order.end(), 0);
-    std::sort(order.begin(), order.end(), [&](size_t lhs, size_t rhs)
-    {
-        return rows[lhs].key < rows[rhs].key;
-    });
-    SSTIndexWriter writer(storage, context);
-    for (auto row : order)
-        writer.addUpsertEncoded(rows[row].key, encodeIndexValue(rows[row].value));
-    writer.finalizeToStorage();
-
-    /// `UpsertMergeTree` uses the state database for winner lookups; any future `SST` reader must authenticate its inventory entry.
-    ReadBufferFromFile sst(std::filesystem::path(storage.getFullPath()) / SSTIndexWriter::FILE_NAME);
-    HashingReadBuffer sst_hash(sst);
-    sst_hash.ignoreAll();
-    checksums.addFile(SSTIndexWriter::FILE_NAME, sst_hash.count(), sst_hash.getHash());
+    /// `UpsertMergeTree` winner lookups use the state database, so new parts need no duplicate `SST`.
+    /// Old parts retain their authenticated `SST`; any future reader must authenticate its inventory entry.
 }
 
 namespace

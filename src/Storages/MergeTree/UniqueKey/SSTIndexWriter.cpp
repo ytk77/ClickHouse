@@ -410,26 +410,6 @@ void SSTIndexWriter::addEncoded(const std::string_view & encoded_key, UInt32 row
 #endif
 }
 
-void SSTIndexWriter::addUpsertEncoded(std::string_view encoded_key, std::string_view value)
-{
-#if USE_ROCKSDB
-    if (finalized)
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot append to a finalized UpsertMergeTree index");
-    openOutputStreamOnFirstEntry();
-    if (entries_added && encoded_key <= impl->last_key)
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree index keys must be strictly increasing");
-    auto status = impl->writer->Put(rocksdb::Slice(encoded_key.data(), encoded_key.size()), rocksdb::Slice(value.data(), value.size()));
-    if (!status.ok())
-        throw Exception(ErrorCodes::CANNOT_WRITE_TO_FILE_DESCRIPTOR, "Cannot write UpsertMergeTree index: {}", status.ToString());
-    impl->last_key.assign(encoded_key);
-    ++entries_added;
-#else
-    (void)encoded_key;
-    (void)value;
-    throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree requires RocksDB support");
-#endif
-}
-
 UInt64 SSTIndexWriter::finalizeToStorage()
 {
 #if USE_ROCKSDB

@@ -93,9 +93,6 @@ public:
     /// Put one already-encoded key.
     void addEncoded(const std::string_view & encoded_key, UInt32 row_number);
 
-    /// Store an explicitly versioned `UpsertMergeTree` value, distinct from the legacy offset encoding.
-    void addUpsertEncoded(std::string_view encoded_key, std::string_view value);
-
     UInt64 entriesAdded() const { return entries_added; }
 
     /// Finalize the SST: close the RocksDB writer, then finalize the

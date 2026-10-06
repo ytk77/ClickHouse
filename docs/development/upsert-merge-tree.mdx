@@ -558,8 +558,17 @@ Existing `UInt64` metadata and table manifests remain unchanged. Older binaries 
 using time version columns during schema validation. The `Native` wire format is unchanged.
 Winner comparison orders `(version, write_csn, block_ordinal)`, or `(write_csn, block_ordinal)`
 without an application version. Comparing different version modes or unresolved rows is an error.
-Legacy four-byte SST values are rejected by this decoder. New parts persist these values in the
-SST index and in the checksummed `upsert_rows.bin` lineage sidecar. Other engines retain their legacy format.
+Legacy four-byte `SST` values are rejected by this decoder. New `UpsertMergeTree` parts persist these
+values in the checksummed `upsert_rows.bin` lineage sidecar; winner lookups use the state database.
+New writes omit the redundant `unique_key_index.sst`, its key sort and its native checksum entry.
+Existing parts retain that file and its committed inventory and native checksums: metadata recovery
+checks its presence and size, and the complete payload sweep authenticates its contents.
+A future part-index consumer must authenticate the inventory entry before reading it.
+Ordinary `UNIQUE KEY` engines retain their existing index format.
+
+SQL `CHECK TABLE` and SQL `BACKUP`/`RESTORE` remain unsupported for `UNIQUE KEY` tables in this fork.
+Compatibility validation uses native checksum parsing and file hashing, full payload verification,
+recovery, partition operations and `FREEZE` with detached-part restore instead.
 
 ## Terminal-record envelope version 1 {#terminal-record-envelope-version-1}
 

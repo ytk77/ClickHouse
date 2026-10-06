@@ -60,7 +60,7 @@ Ordinary `SELECT` queries, including projection selection and `mergeTreeProjecti
 
 Maintenance rewrites and partition operations retain full source verification before consuming or exporting recovered payloads, preventing corrupted sources from being reauthorized as new outputs. `DiskState::loadPartRows` also authenticates the exact `upsert_rows.bin` bytes passed to `decodePartRows` against the committed inventory on every use, including newly committed and previously verified parts. It then checks the envelope CRC, row offsets, row count and lineage. Survivor parts used only to restore winners in cleared partitions follow this lineage-only path because their columns are not consumed or rewritten. This bounded read does not acquire the background verification mutex or complete the pending full verification obligation. A missing or mismatched inventory or sidecar raises `CORRUPTED_DATA` and fences the state; transient file-open/read exceptions propagate without setting that fence. New parts remain fully authenticated and synchronized before their durable authorization.
 
-Startup hashes `upsert_ttl.txt`, `ttl.txt` and `checksums.txt`; maintenance uses the policy checksum and TTL information loaded from this authenticated metadata. The engine writes `unique_key_index.sst` but uses the state database for winner lookups. Its contents are covered by the full sweep; a future consumer must validate its committed inventory entry before use.
+Startup hashes `upsert_ttl.txt`, `ttl.txt` and `checksums.txt`; maintenance uses the policy checksum and TTL information loaded from this authenticated metadata. Winner lookups use the state database. New parts omit the redundant `unique_key_index.sst`; existing parts retain it, and the full sweep authenticates its contents. A future consumer must validate its committed inventory entry before use.
 
 A dedicated background task starts after one second, pins and verifies one active part per slice outside the parts lock, and waits 100 ms between slices. After a complete pass it waits 24 hours before starting another full sweep. The task shares the table operation mutex with schema and partition operations. One large part can therefore delay those operations and shutdown; ordinary inserts do not take that mutex. The task has no separate byte-rate limit, and hashing competes with query and write I/O. Continuous ingestion can extend a sweep; the interval is not a deadline for detecting corruption.
 
@@ -120,7 +120,7 @@ Two server settings, read at startup, bound background rewrite admission:
 
 Both must be positive. Reservations estimate three times the smaller of the target and selected
 sources' total uncompressed on-disk bytes, plus the largest source, source and output lineage, row metadata, relocation maps,
-and estimated state work capped at half the state-batch limit. The reservation doubles this sum to allow for additional native sorting and `SSTIndexWriter` copies.
+and estimated state work capped at half the state-batch limit. The reservation doubles this sum to allow for additional native sorting and temporary copies.
 Small rewrites therefore do not reserve an entire target-sized buffer. A single attempt exceeding the reservation budget may run alone when
 background and server headroom permit it; `UpsertMaintenanceOversizedAdmissions` records this policy.
 Admission also checks the background merge soft limit and server memory hard limit, using their
