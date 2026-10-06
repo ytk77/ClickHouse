@@ -528,7 +528,7 @@ while inserting new unique keys every 200 ms. Both builds used a configured 4-Gi
 64-GiB background/server limits on the host described above. The future expiration expression was
 checked before timing. Counts and ID sums remained correct after each run.
 
-| Measurement | `33deef72` | Reviewed revision |
+| Measurement | `33deef72` | Measured working-tree build |
 | --- | ---: | ---: |
 | Baseline samples | 16 | 16 |
 | Baseline client p99 | 246.8 ms | 153.3 ms |
@@ -538,8 +538,11 @@ checked before timing. Counts and ID sums remained correct after each run.
 | Rewrite duration | 115.70 s | 115.46 s |
 
 These are single local runs measuring client wall time, including client startup and persistence.
-Percentiles use the nearest rank and the runs have different sample counts. The maximum observed
-stall decreased substantially; p99 improved modestly and still exceeded two seconds. This does not
+Percentiles use the nearest rank and the runs have different sample counts. In both runs, p99 is
+the second-largest sample; those values were similar and still exceeded two seconds. The maximum
+observed stall fell from 21.7 seconds to 2.5 seconds. This does not
 establish production p99, sustained ingestion throughput or latency for a 4-GiB physical payload.
-The part contained 456,000,000 uncompressed column bytes. Validation preceded the final binary's
-Git metadata stamp; the package contains the same reviewed maintenance implementation.
+The part contained 456,000,000 uncompressed column bytes. The measured new binary was a
+working-tree build before the final Git metadata stamp, with SHA-256
+`f7d0d4670b3795c7162bf01b87c7524fa371c35ca291ef7526abc119c0426c3c`.
+The package's binary digest is recorded separately in its build manifest.
