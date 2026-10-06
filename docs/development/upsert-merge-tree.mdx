@@ -180,6 +180,31 @@ These are single local measurements, not a universal memory or throughput improv
 They motivate validating input sizes and concurrent loads before raising an existing table's
 target. The 512 MiB compiled default remains an upper bound for a unit, not a query memory limit.
 
+## Insert performance counters {#upsert-insert-performance-counters}
+
+The per-query `ProfileEvents` map in `system.query_log` reports cumulative stage times.
+These counters also apply to maintenance and verification where the same helpers are used;
+global `system.events` deltas cannot isolate an insert while those operations run.
+Preparations can run concurrently, so worker totals are not elapsed query wall time.
+
+The counters overlap as follows:
+
+- `UpsertInputFoldMicroseconds` includes key encoding.
+- `UpsertPartIndexMicroseconds` includes key encoding, lineage encoding and any optional index writing.
+- `UpsertLineageReadbackMicroseconds` includes lineage decoding.
+- `UpsertPartPreparationMicroseconds` includes column writing, part indexing, lineage readback and validation,
+  inventory hashing, file and directory synchronization, and the advisory token/admission check.
+  `UpsertPreparationLockWaitMicroseconds` and `UpsertPreparationLockHoldMicroseconds` identify that check's
+  use of the table parts lock.
+- `UpsertStatePrepareMicroseconds` includes winner lookup, winner decisions, victim masks and token records.
+  `UpsertCommitLockHoldMicroseconds` includes state preparation and the synchronous state write.
+
+Do not add these inclusive times together. `UpsertPayloadSyncFiles`,
+`UpsertPayloadSyncParallelGroups` and `UpsertPayloadSyncSequentialGroups` identify file count and
+whether the initialized IO pool was used. `UpsertPayloadSyncMicroseconds` measures the group's wall
+time through completion of all file barriers. `UpsertInventoryHashMicroseconds` includes enumeration
+and file hashing and is recorded only when that work succeeds.
+
 ## Incremental materialized views {#upsert-incremental-materialized-views}
 
 An `UpsertMergeTree` table can be the source of an incremental materialized view:

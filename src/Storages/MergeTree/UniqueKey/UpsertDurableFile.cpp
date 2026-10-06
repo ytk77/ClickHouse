@@ -1,4 +1,5 @@
 #include <Storages/MergeTree/UniqueKey/UpsertDurableFile.h>
+#include <Storages/MergeTree/UniqueKey/UpsertMetrics.h>
 #include <Common/ErrnoException.h>
 #include <Common/Exception.h>
 #include <Common/FailPoint.h>
@@ -85,6 +86,7 @@ private:
 
 void syncDirectory(const String & path)
 {
+    ProfileEventTimeIncrement<Microseconds> timer(ProfileEvents::UpsertDirectorySyncMicroseconds);
     FileDescriptor directory(path, O_RDONLY | O_DIRECTORY);
     directory.sync();
 }
@@ -119,6 +121,8 @@ void syncDirectoryAncestors(const String & path, const String & root)
 
 void syncFiles(const std::vector<String> & paths)
 {
+    ProfileEventTimeIncrement<Microseconds> timer(ProfileEvents::UpsertPayloadSyncMicroseconds);
+    ProfileEvents::increment(ProfileEvents::UpsertPayloadSyncFiles, paths.size());
     auto sync = [](const String & path)
     {
         FileDescriptor file(path, O_RDONLY);
@@ -130,10 +134,12 @@ void syncFiles(const std::vector<String> & paths)
     };
     if (paths.size() <= 1 || !getIOThreadPool().isInitialized())
     {
+        ProfileEvents::increment(ProfileEvents::UpsertPayloadSyncSequentialGroups);
         for (const auto & path : paths)
             sync(path);
         return;
     }
+    ProfileEvents::increment(ProfileEvents::UpsertPayloadSyncParallelGroups);
     ThreadPoolCallbackRunnerLocal<void> runner(getIOThreadPool().get(), ThreadName::DEFAULT_THREAD_POOL);
     for (const auto & path : paths)
         runner.enqueueAndKeepTrack([path, sync]

@@ -4,6 +4,26 @@
 
 namespace ProfileEvents
 {
+extern const Event UpsertInputFoldMicroseconds;
+extern const Event UpsertKeyEncodeMicroseconds;
+extern const Event UpsertColumnWriteMicroseconds;
+extern const Event UpsertPartIndexMicroseconds;
+extern const Event UpsertLineageEncodeMicroseconds;
+extern const Event UpsertLineageDecodeMicroseconds;
+extern const Event UpsertLineageReadbackMicroseconds;
+extern const Event UpsertLineageValidationMicroseconds;
+extern const Event UpsertPartPreparationMicroseconds;
+extern const Event UpsertPreparationLockWaitMicroseconds;
+extern const Event UpsertPreparationLockHoldMicroseconds;
+extern const Event UpsertInventoryHashMicroseconds;
+extern const Event UpsertPayloadSyncMicroseconds;
+extern const Event UpsertDirectorySyncMicroseconds;
+extern const Event UpsertWinnerDecisionMicroseconds;
+extern const Event UpsertVictimMaskPrepareMicroseconds;
+extern const Event UpsertTokenPrepareMicroseconds;
+extern const Event UpsertPayloadSyncFiles;
+extern const Event UpsertPayloadSyncParallelGroups;
+extern const Event UpsertPayloadSyncSequentialGroups;
 extern const Event UpsertMaskCacheHits;
 extern const Event UpsertMaskCacheMisses;
 extern const Event UpsertWinnerLookupMicroseconds;

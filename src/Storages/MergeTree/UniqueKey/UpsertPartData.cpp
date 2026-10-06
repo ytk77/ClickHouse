@@ -1,4 +1,5 @@
 #include <Storages/MergeTree/UniqueKey/UpsertPartData.h>
+#include <Storages/MergeTree/UniqueKey/UpsertMetrics.h>
 #include <Storages/MergeTree/UniqueKey/UpsertBinary.h>
 #include <Storages/MergeTree/UniqueKey/UpsertDurableFile.h>
 #include <Storages/MergeTree/UniqueKey/UniqueKeyEncoding.h>
@@ -77,6 +78,7 @@ void appendKeyColumns(const ColumnPtr & input, Columns & columns)
 
 VectorWithMemoryTracking<String> encodeKeys(const Block & block, const StorageInMemoryMetadata & metadata, size_t limit)
 {
+    ProfileEventTimeIncrement<Microseconds> timer(ProfileEvents::UpsertKeyEncodeMicroseconds);
     Columns columns;
     for (const auto & name : metadata.getUniqueKeyColumns())
         appendKeyColumns(block.getByName(name).column, columns);
@@ -108,6 +110,7 @@ String objectName(ObjectID id)
 
 String encodePartRows(const PartRows & rows)
 {
+    ProfileEventTimeIncrement<Microseconds> timer(ProfileEvents::UpsertLineageEncodeMicroseconds);
     if (rows.empty() || rows.size() > MAX_PART_ROWS)
         throw Exception(ErrorCodes::LIMIT_EXCEEDED, "Invalid UpsertMergeTree part row count");
     size_t encoded_size = PART_ROWS_ENVELOPE_BYTES;
@@ -146,6 +149,7 @@ String encodePartRows(const PartRows & rows)
 
 PartRows decodePartRows(std::string_view bytes)
 {
+    ProfileEventTimeIncrement<Microseconds> timer(ProfileEvents::UpsertLineageDecodeMicroseconds);
     const bool large = bytes.starts_with("UMPROW02");
     if (bytes.size() < PART_ROWS_ENVELOPE_BYTES || bytes.size() > (large ? MAX_PART_LINEAGE_BYTES : MAX_RECORD_BYTES)
         || (!large && !bytes.starts_with("UMPROW01")))
@@ -176,6 +180,7 @@ PartRows decodePartRows(std::string_view bytes)
 
 ValidatedPartRows::ValidatedPartRows(PartRows rows_, ObjectID part_) : rows(std::move(rows_)), part(part_)
 {
+    ProfileEventTimeIncrement<Microseconds> timer(ProfileEvents::UpsertLineageValidationMicroseconds);
     if (rows.empty() || rows.size() > MAX_UNIT_ROWS || part == ObjectID{})
         throw Exception(ErrorCodes::CORRUPTED_DATA, "Invalid UpsertMergeTree input row count or identity");
     std::vector<std::string_view> keys;
@@ -250,6 +255,7 @@ Block cutInputBlock(const Block & block, size_t offset, size_t max_rows, size_t 
 
 size_t foldBlock(Block & block, const StorageInMemoryMetadata & metadata, const String & version_column, size_t max_key_bytes)
 {
+    ProfileEventTimeIncrement<Microseconds> timer(ProfileEvents::UpsertInputFoldMicroseconds);
     auto keys = encodeKeys(block, metadata, max_key_bytes);
     std::map<String, size_t> winners;
     std::optional<VersionColumn> versions;
@@ -322,6 +328,7 @@ void writePartIndex(
     const String & version_column, ObjectID operation_id, const IColumn::Permutation * permutation,
     size_t max_key_bytes, ContextPtr context, MergeTreeDataPartChecksums & checksums)
 {
+    ProfileEventTimeIncrement<Microseconds> timer(ProfileEvents::UpsertPartIndexMicroseconds);
     const auto keys = encodeKeys(block, metadata, max_key_bytes);
     CurrentMemoryTracker::check();
     const auto & ordinals = *block.getByName(ORDINAL_COLUMN).column;
@@ -412,6 +419,7 @@ InventoryFiles parseInventoryFiles(const String & inventory)
 ObjectID hashPartDirectoryImpl(const String & path, bool sync_files, String * result_inventory, const String * trusted_inventory)
 {
     namespace fs = std::filesystem;
+    Stopwatch inventory_watch;
     const auto expected_files = trusted_inventory ? parseInventoryFiles(*trusted_inventory) : InventoryFiles{};
     if (fs::is_symlink(path) || !fs::is_directory(path))
         throw Exception(ErrorCodes::CORRUPTED_DATA, "Invalid UpsertMergeTree part directory {}", path);
@@ -483,6 +491,7 @@ ObjectID hashPartDirectoryImpl(const String & path, bool sync_files, String * re
         }
         ::close(fd);
     }
+    ProfileEvents::increment(ProfileEvents::UpsertInventoryHashMicroseconds, inventory_watch.elapsedMicroseconds());
     if (sync_files)
     {
         /// Finalize and authenticate every file before issuing one group of payload barriers.

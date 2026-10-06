@@ -21,6 +21,7 @@
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MergeTree/MergeTreeDataWriter.h>
 #include <Storages/MergeTree/UniqueKey/UpsertPartData.h>
+#include <Storages/MergeTree/UniqueKey/UpsertMetrics.h>
 #include <Storages/MergeTree/MergeTreeIndexGranularity.h>
 #include <Storages/MergeTree/MergeTreeMarksLoader.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
@@ -1039,7 +1040,12 @@ MergeTreeTemporaryPartPtr MergeTreeDataWriter::writeTempPartImpl(
         /*try_adaptive_codec=*/ false);
 
     Block permuted_columns_cache;
-    out->writeWithPermutation(block, perm_ptr, &permuted_columns_cache);
+    {
+        std::optional<ProfileEventTimeIncrement<Microseconds>> upsert_timer;
+        if (data.merging_params.upsert)
+            upsert_timer.emplace(ProfileEvents::UpsertColumnWriteMicroseconds);
+        out->writeWithPermutation(block, perm_ptr, &permuted_columns_cache);
+    }
 
     if (data.merging_params.upsert)
         Upsert::writePartIndex(

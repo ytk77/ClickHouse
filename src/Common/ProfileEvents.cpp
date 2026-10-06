@@ -98,6 +98,26 @@
     M(MarkCacheMisses, "Number of times an entry has not been found in the mark cache, so we had to load a mark file in memory, which is a costly operation, adding to query latency.", ValueType::Number) \
     M(UpsertMaskCacheHits, "Decoded `UpsertMergeTree` visibility masks reused from the cache.", ValueType::Number) \
     M(UpsertMaskCacheMisses, "Decoded `UpsertMergeTree` visibility masks loaded into the cache.", ValueType::Number) \
+    M(UpsertInputFoldMicroseconds, "Time folding duplicate input keys in `UpsertMergeTree`, including key encoding.", ValueType::Microseconds) \
+    M(UpsertKeyEncodeMicroseconds, "Time encoding full keys for folding and part lineage in `UpsertMergeTree`.", ValueType::Microseconds) \
+    M(UpsertColumnWriteMicroseconds, "Time writing native columns with their physical permutation in `UpsertMergeTree`.", ValueType::Microseconds) \
+    M(UpsertPartIndexMicroseconds, "Time writing `UpsertMergeTree` lineage and optional part index, including key encoding.", ValueType::Microseconds) \
+    M(UpsertLineageEncodeMicroseconds, "Time encoding immutable `UpsertMergeTree` part lineage.", ValueType::Microseconds) \
+    M(UpsertLineageDecodeMicroseconds, "Time decoding and checking immutable `UpsertMergeTree` part lineage.", ValueType::Microseconds) \
+    M(UpsertLineageReadbackMicroseconds, "Time reading and decoding a newly written `UpsertMergeTree` lineage file.", ValueType::Microseconds) \
+    M(UpsertLineageValidationMicroseconds, "Time validating `UpsertMergeTree` input identities, offsets and unique keys.", ValueType::Microseconds) \
+    M(UpsertPartPreparationMicroseconds, "Time preparing an `UpsertMergeTree` part before its commit, including native writing, authentication and payload barriers.", ValueType::Microseconds) \
+    M(UpsertPreparationLockWaitMicroseconds, "Time waiting for the advisory `UpsertMergeTree` preparation admission lock.", ValueType::Microseconds) \
+    M(UpsertPreparationLockHoldMicroseconds, "Time holding the advisory `UpsertMergeTree` preparation admission lock.", ValueType::Microseconds) \
+    M(UpsertInventoryHashMicroseconds, "Time enumerating and hashing `UpsertMergeTree` part files before payload barriers.", ValueType::Microseconds) \
+    M(UpsertPayloadSyncMicroseconds, "Wall time synchronizing a group of `UpsertMergeTree` payload files, including waiting for all workers.", ValueType::Microseconds) \
+    M(UpsertDirectorySyncMicroseconds, "Time opening and synchronizing `UpsertMergeTree` directories.", ValueType::Microseconds) \
+    M(UpsertWinnerDecisionMicroseconds, "Time applying each bounded batch of `UpsertMergeTree` winner lookup results; excludes the lookup itself.", ValueType::Microseconds) \
+    M(UpsertVictimMaskPrepareMicroseconds, "Time sorting superseded rows and merging and encoding their `UpsertMergeTree` visibility masks.", ValueType::Microseconds) \
+    M(UpsertTokenPrepareMicroseconds, "Time preparing durable `UpsertMergeTree` retry token records.", ValueType::Microseconds) \
+    M(UpsertPayloadSyncFiles, "Files submitted to `UpsertMergeTree` payload synchronization.", ValueType::Number) \
+    M(UpsertPayloadSyncParallelGroups, "`UpsertMergeTree` payload groups synchronized through the initialized IO pool.", ValueType::Number) \
+    M(UpsertPayloadSyncSequentialGroups, "`UpsertMergeTree` payload groups synchronized sequentially.", ValueType::Number) \
     M(UpsertWinnerLookupMicroseconds, "Time spent looking up `UpsertMergeTree` winners in `RocksDB`.", ValueType::Microseconds) \
     M(UpsertWinnerLookupKeys, "Number of keys probed in `UpsertMergeTree` winner lookups.", ValueType::Number) \
     M(UpsertMaskReadMicroseconds, "Time spent loading and decoding `UpsertMergeTree` visibility masks.", ValueType::Microseconds) \

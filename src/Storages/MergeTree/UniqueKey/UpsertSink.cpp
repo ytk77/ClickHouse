@@ -367,9 +367,13 @@ bool StorageMergeTree::isUpsertTokenCommitted(const String & partition, const Up
 std::unique_ptr<Upsert::PreparedInsert> StorageMergeTree::prepareUpsertBlock(
     BlockWithPartition & block, const StorageMetadataPtr & metadata, ContextPtr query_context, Upsert::Token token)
 {
+    ProfileEventTimeIncrement<Microseconds> timer(ProfileEvents::UpsertPartPreparationMicroseconds);
     const String partition_id = block.partition.getID(metadata->getPartitionKey().sample_block);
     {
+        Stopwatch lock_wait;
         auto lock = lockParts();
+        ProfileEvents::increment(ProfileEvents::UpsertPreparationLockWaitMicroseconds, lock_wait.elapsedMicroseconds());
+        ProfileEventTimeIncrement<Microseconds> hold_timer(ProfileEvents::UpsertPreparationLockHoldMicroseconds);
         if (upsert_fenced)
             throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree is fenced pending restart and recovery");
         if (upsert_store->tokenAlreadyCommitted(partition_id, token))
@@ -389,7 +393,11 @@ std::unique_ptr<Upsert::PreparedInsert> StorageMergeTree::prepareUpsertBlock(
         throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree writer returned an empty part");
     part->getDataPartStorage().commitTransaction();
     const auto path = part->getDataPartStorage().getFullPath();
-    auto rows = Upsert::decodePartRows(Upsert::readBoundedFile(std::filesystem::path(path) / Upsert::ROWS_FILE, Upsert::MAX_RECORD_BYTES));
+    Upsert::PartRows rows;
+    {
+        ProfileEventTimeIncrement<Microseconds> read_timer(ProfileEvents::UpsertLineageReadbackMicroseconds);
+        rows = Upsert::decodePartRows(Upsert::readBoundedFile(std::filesystem::path(path) / Upsert::ROWS_FILE, Upsert::MAX_RECORD_BYTES));
+    }
     Upsert::PartCommit authorization;
     authorization.part = {UUIDHelpers::getHighBytes(part->uuid), UUIDHelpers::getLowBytes(part->uuid)};
     authorization.temporary_name = part->getDataPartStorage().getPartDirectory();

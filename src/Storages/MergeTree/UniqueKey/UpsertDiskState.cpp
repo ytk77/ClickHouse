@@ -300,15 +300,18 @@ struct Database
                 options.fill_cache = fill_cache;
                 db->MultiGet(options, db->DefaultColumnFamily(), count, slices.data(), values.data(), statuses.data());
             }
-            for (size_t i = 0; i < count; ++i)
             {
-                std::optional<std::string_view> value;
-                if (!statuses[i].IsNotFound())
+                ProfileEventTimeIncrement<Microseconds> decision_timer(ProfileEvents::UpsertWinnerDecisionMicroseconds);
+                for (size_t i = 0; i < count; ++i)
                 {
-                    check(statuses[i]);
-                    value = std::string_view(values[i].data(), values[i].size());
+                    std::optional<std::string_view> value;
+                    if (!statuses[i].IsNotFound())
+                    {
+                        check(statuses[i]);
+                        value = std::string_view(values[i].data(), values[i].size());
+                    }
+                    callback(row_at(begin + i), keys[i], value);
                 }
-                callback(row_at(begin + i), keys[i], value);
             }
             CurrentMemoryTracker::check();
         }
@@ -1069,31 +1072,35 @@ StateStore::Prepared DiskState::prepare(const String & partition, PartCommit par
         batch.Put(key, winner.bytes);
         checkBatchBudget(batch);
     });
-    std::sort(part.dead.begin(), part.dead.end());
-    std::sort(part.kills.begin(), part.kills.end());
-    for (size_t position = 0; position < part.kills.size();)
     {
-        const auto id = part.kills[position].part;
-        const auto old = impl->current->getMask(objectName(id));
-        if (!old)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree winner has no visibility mask");
-        DeleteBitmap mask;
-        mask.merge(*old);
-        do
+        ProfileEventTimeIncrement<Microseconds> mask_timer(ProfileEvents::UpsertVictimMaskPrepareMicroseconds);
+        std::sort(part.dead.begin(), part.dead.end());
+        std::sort(part.kills.begin(), part.kills.end());
+        for (size_t position = 0; position < part.kills.size();)
         {
-            const auto offset = part.kills[position].offset;
-            if (mask.contains(offset))
-                throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree attempted to kill an already dead winner");
-            mask.add(offset);
-            ++position;
-        } while (position < part.kills.size() && part.kills[position].part == id);
-        result.disk->putMask(objectName(id), mask);
-        checkBatchBudget(batch);
+            const auto id = part.kills[position].part;
+            const auto old = impl->current->getMask(objectName(id));
+            if (!old)
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree winner has no visibility mask");
+            DeleteBitmap mask;
+            mask.merge(*old);
+            do
+            {
+                const auto offset = part.kills[position].offset;
+                if (mask.contains(offset))
+                    throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree attempted to kill an already dead winner");
+                mask.add(offset);
+                ++position;
+            } while (position < part.kills.size() && part.kills[position].part == id);
+            result.disk->putMask(objectName(id), mask);
+            checkBatchBudget(batch);
+        }
     }
     part.token.accepted = part.rows - part.dead.size();
     result.produces_part = part.token.accepted != 0;
     if (!part.token.client_token.empty())
     {
+        ProfileEventTimeIncrement<Microseconds> token_timer(ProfileEvents::UpsertTokenPrepareMicroseconds);
         const auto key = tokenKey(partition, part.token);
         auto retry_bytes = impl->database->integer("retry_bytes");
         const auto cost = tokenCost(key);
