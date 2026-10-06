@@ -6,6 +6,8 @@
 #include <Storages/MergeTree/UniqueKey/UpsertStateStore.h>
 #include <Storages/MergeTree/UniqueKey/UpsertMaintenanceMemory.h>
 #include <Storages/MergeTree/UniqueKey/UpsertOperationWait.h>
+#include <Storages/MergeTree/UniqueKey/UpsertInsertQueue.h>
+#include <Storages/MergeTree/MergeTreeSettings.h>
 #include <Storages/StorageInMemoryMetadata.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <Parsers/ASTIdentifier.h>
@@ -23,6 +25,43 @@ extern const int CORRUPTED_DATA;
 
 using namespace DB;
 using namespace DB::Upsert;
+
+TEST(UpsertInsertQueue, OversizedPreparationRunsAlone)
+{
+    constexpr size_t oversized = 512ULL << 20;
+    EXPECT_FALSE(insertPreparationNeedsDrain(0, 0, oversized, 4));
+    EXPECT_TRUE(insertPreparationNeedsDrain(1, oversized, 1, 4));
+    EXPECT_TRUE(insertPreparationNeedsDrain(1, oversized, oversized, 4));
+    EXPECT_TRUE(insertPreparationNeedsDrain(1, std::numeric_limits<size_t>::max(), 1, 4));
+}
+
+TEST(UpsertInsertQueue, EnforcesByteAndThreadBounds)
+{
+    constexpr size_t half_budget = MAX_PENDING_INSERT_BYTES / 2;
+    EXPECT_FALSE(insertPreparationNeedsDrain(1, half_budget, half_budget, 4));
+    EXPECT_TRUE(insertPreparationNeedsDrain(1, half_budget, half_budget + 1, 4));
+    EXPECT_TRUE(insertPreparationNeedsDrain(1, MAX_PENDING_INSERT_BYTES, 1, 4));
+    EXPECT_TRUE(insertPreparationNeedsDrain(4, 4, 1, 4));
+    EXPECT_FALSE(insertPreparationNeedsDrain(3, 3, 1, 4));
+}
+
+TEST(UpsertInsertSettings, DefaultAndHistoricalRetryBoundary)
+{
+    const MergeTreeSettings current;
+    EXPECT_EQ(current.get("upsert_insert_target_bytes").safeGet<UInt64>(), 512ULL << 20);
+
+    MergeTreeSettings legacy;
+    legacy.applyCompatibilitySetting("26.8");
+    EXPECT_EQ(legacy.get("upsert_insert_target_bytes").safeGet<UInt64>(), 32ULL << 20);
+
+    MergeTreeSettings new_version;
+    new_version.applyCompatibilitySetting("26.8.1.1");
+    EXPECT_EQ(new_version.get("upsert_insert_target_bytes").safeGet<UInt64>(), 512ULL << 20);
+
+    /// Explicit table or server settings are applied after compatibility defaults.
+    legacy.set("upsert_insert_target_bytes", UInt64{1ULL << 30});
+    EXPECT_EQ(legacy.get("upsert_insert_target_bytes").safeGet<UInt64>(), 1ULL << 30);
+}
 
 TEST(UpsertMaintenanceMemoryTest, UsesConfiguredLimitsIndependentlyOfCurrentUsage)
 {

@@ -56,6 +56,19 @@ namespace ErrorCodes
   * and should not be changed by the user without a reason.
   */
 #define MERGE_TREE_SETTINGS(DECLARE, DECLARE_WITH_ALIAS) \
+    DECLARE(UInt64, upsert_insert_target_bytes, 512ULL << 20, R"(
+Maximum uncompressed input column bytes per `UpsertMergeTree` insert unit.
+Default: 512 MiB. Allowed range: 32 MiB to 1 GiB.
+Larger values allow wide input blocks to produce larger parts directly. Input blocks are not
+combined; partitioning, duplicate folding, the 1,048,576-row limit, the 64 MiB lineage limit,
+and the 128 MiB state-batch limit can produce smaller parts.
+The target is captured when an insert sink is created. Keep it unchanged when retrying an
+insert with the same deduplication token, along with the input block boundaries.
+For outstanding retries from a build with 32 MiB units, explicitly retain 33554432 during upgrade.
+A preparation exceeding the 128 MiB pending-column budget runs alone within its sink.
+This is not a query memory limit; sorting, indexes and concurrent inserts need additional memory.
+Can be changed with `ALTER TABLE ... MODIFY SETTING`. Does not change background or mutation targets.
+)", 0) \
     DECLARE(UInt64, upsert_maintenance_target_bytes, 4ULL << 30, R"(
 Target uncompressed physical column bytes per background `UpsertMergeTree` rewrite part.
 Default: 4 GiB.

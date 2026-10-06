@@ -1345,6 +1345,7 @@ const VersionToSettingsChangesMap & getMergeTreeSettingsChangesHistory()
     {
         addSettingsChanges(merge_tree_settings_changes_history, "26.8.1.1",
         {
+            {"upsert_insert_target_bytes", 33554432, 536870912, "Make the `UpsertMergeTree` insert target configurable and increase its default to 512 MiB."},
             {"upsert_maintenance_target_bytes", 268435456, 4294967296ULL, "Increase the default background rewrite target for `UpsertMergeTree` to 4 GiB to reduce part counts."},
         });
 

@@ -4855,7 +4855,8 @@ void MergeTreeData::checkAlterIsPossible(const AlterCommands & commands, Context
             if (command.type == AlterCommand::MODIFY_SETTING && commands.isSettingsAlter())
             {
                 for (const auto & change : command.settings_changes)
-                    if (change.name != "upsert_maintenance_target_bytes" && change.name != "prewarm_mark_cache"
+                    if (change.name != "upsert_maintenance_target_bytes" && change.name != "upsert_insert_target_bytes"
+                        && change.name != "prewarm_mark_cache"
                         && change.name != "prewarm_primary_key_cache" && change.name != "columns_to_prewarm_mark_cache"
                         && change.name != "min_bytes_to_prewarm_caches")
                         throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree cannot alter setting {}", change.name);

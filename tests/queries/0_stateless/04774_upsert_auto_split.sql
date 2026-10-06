@@ -10,7 +10,8 @@ SET min_insert_block_size_bytes = 0;
 SET use_strict_insert_block_limits = 0;
 
 CREATE TABLE upsert_split (p UInt8, id UInt64, ver UInt64, value UInt64, payload String)
-ENGINE = UpsertMergeTree(ver) PARTITION BY p ORDER BY value UNIQUE KEY id;
+ENGINE = UpsertMergeTree(ver) PARTITION BY p ORDER BY value UNIQUE KEY id
+SETTINGS upsert_insert_target_bytes = 33554432;
 -- A single input exceeds 64 MiB; duplicate keys cross the internal slice boundaries.
 INSERT INTO upsert_split SETTINGS insert_deduplication_token = 'split-bytes'
 SELECT number % 2, number % 1024, 1, number, repeat(toString(number % 10), 1024) FROM numbers(65536);
@@ -38,7 +39,8 @@ SELECT 'rows', count() = 1024, uniqExact(id) = 1024,
 DROP TABLE upsert_split_rows SYNC;
 
 CREATE TABLE upsert_split_single (id UInt64, payload String)
-ENGINE = UpsertMergeTree ORDER BY id UNIQUE KEY id;
+ENGINE = UpsertMergeTree ORDER BY id UNIQUE KEY id
+SETTINGS upsert_insert_target_bytes = 33554432;
 INSERT INTO upsert_split_single SELECT 1, repeat(repeat('x', 1024), 32768); -- { serverError LIMIT_EXCEEDED }
 INSERT INTO upsert_split_single VALUES (2, 'ok');
 SELECT 'single-row', count() = 1, min(id) = 2, min(payload) = 'ok' FROM upsert_split_single;

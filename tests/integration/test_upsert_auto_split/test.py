@@ -33,7 +33,8 @@ def create_table(table, versioned):
     engine = "UpsertMergeTree(ver)" if versioned else "UpsertMergeTree"
     node.query(
         f"CREATE TABLE {table} (id UInt64, ver UInt64, value UInt64, payload String) "
-        f"ENGINE={engine} ORDER BY value UNIQUE KEY id",
+        f"ENGINE={engine} ORDER BY value UNIQUE KEY id "
+        "SETTINGS upsert_insert_target_bytes=33554432",
         settings=settings,
     )
 

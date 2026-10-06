@@ -84,6 +84,102 @@ The `_upsert_` prefix is reserved; the input-only delete flag is not connected y
 Partial-column updates remain unsupported; replace a row by inserting a new version.
 
 
+## Configurable insert units {#configurable-insert-units}
+
+`upsert_insert_target_bytes` sets the maximum uncompressed input column bytes per insert unit.
+It defaults to 536,870,912 (512 MiB) and accepts
+32 MiB through 1 GiB. For example, an import with sufficiently large input blocks can use:
+
+```sql
+ALTER TABLE player_state MODIFY SETTING upsert_insert_target_bytes = 536870912;
+```
+
+The 512 MiB target allows wide input blocks to produce larger parts directly, reducing the
+number of parts that background maintenance must combine. It is an upper bound, not a promised
+part size. The sink does not combine separate input blocks or separate insert requests. The
+source block size, partitioning and duplicate folding can all produce smaller parts.
+For `INSERT SELECT`, `min_insert_block_size_rows` and `min_insert_block_size_bytes` control
+upstream block squashing; they do not override the engine's independent limits.
+
+Each unit still has at most 1,048,576 input rows. Encoded row-to-key lineage stays within
+64 MiB and each atomic state batch stays within 128 MiB. The sink splits a unit further when
+the lineage or estimated state size would exceed these limits. Narrow rows or long unique
+keys can therefore reach those limits before the configured column-byte target. Winner
+updates and visibility masks remain one atomic state decision per partition and unit.
+When a candidate exceeds the lineage or estimated state limit, the current splitter retries
+with half as many rows. This can copy several progressively smaller slices before admission;
+a larger byte target does not remove that preparation cost.
+
+The target is captured once per insert sink. An insert already in progress keeps its target
+after a settings change. Token-based retries require the same target and input block
+boundaries as the original request; finish outstanding retries before changing the target.
+A changed boundary can produce a token/payload mismatch instead of replaying the earlier unit.
+A server default profile using `compatibility='26.8'` restores the 32 MiB insert default,
+but also reverts other changes after that version, including the background maintenance
+target from 4 GiB to 256 MiB. Both the deployed build and this build report `26.8.1.1`, so a
+compatibility value alone cannot select the deployed combination of 4 GiB maintenance and
+32 MiB inserts. Use the explicit insert-target pin in the upgrade procedure below.
+`compatibility='26.8.1.1'` and later use 512 MiB unless explicitly overridden. These storage
+defaults are initialized and shared by the server; setting `compatibility` on an individual
+insert or create query does not change them.
+
+Larger units increase preparation memory and can lengthen the final parts-lock commit.
+Ready and running preparations share a 128 MiB column-byte budget per sink; a preparation
+larger than that budget runs alone. This budget excludes additional sorting, index and state
+memory, and concurrent sinks have separate budgets. The query's `max_memory_usage` still
+applies. Larger units do not increase the background or foreground mutation targets, and do
+not make the entire multi-unit insert atomic. Explicit metadata using this setting requires
+a binary that recognizes it.
+
+### Upgrading from the 32 MiB insert default {#upsert-insert-target-upgrade}
+
+The compiled default also applies to existing tables that have no explicit insert target.
+For large input blocks, upgrading can increase each preparation's column-byte limit sixteenfold.
+Existing jobs can exceed their query or server memory limits, especially with concurrent
+bulk loads, and token retries can encounter changed slice boundaries. Use this staged upgrade:
+
+1. Before starting the upgraded binary, pin the insert target in the server configuration used
+   for that startup. The older binary does not recognize the new setting.
+
+   ```xml
+   <clickhouse>
+       <merge_tree>
+           <upsert_insert_target_bytes>33554432</upsert_insert_target_bytes>
+       </merge_tree>
+   </clickhouse>
+   ```
+
+2. Verify ingestion at the pinned target and complete outstanding token retries with their
+   original input blocks. Measure representative input widths and ingestion concurrency against
+   query and server memory limits. An explicit table setting takes precedence over the pin.
+3. Raise the target on each validated table using
+   `ALTER TABLE ... MODIFY SETTING upsert_insert_target_bytes = 536870912`. Keep the server
+   pin for tables whose ingestion has not been validated. The maintenance target remains
+   independently configured; the insert pin does not revert it to 256 MiB.
+
+### Local insert-target comparison {#upsert-insert-target-comparison}
+
+A local development run on 2026-10-06 compared identical single-block `INSERT SELECT` inputs
+at 32 MiB and 512 MiB. Each row had an eight-byte key, an eight-byte version and a compressible
+4 KiB string. One client ran with background merges stopped. `max_threads=48`,
+`max_insert_threads=48` and the 1 GiB/4 GiB minimum-free-memory-per-thread settings matched
+the observed CRM3 helper session; the sink still capped preparation concurrency at eight.
+Block settings forced one input block, and the local query limit was 8 GiB. These checks
+did not reproduce concurrent production ingestion.
+
+| String payload per request | Insert target | Parts created | Peak query memory (bytes) |
+| --- | --- | --- | --- |
+| 256 MiB | 32 MiB | 9 | 666,304,363 |
+| 256 MiB | 512 MiB | 1 | 571,717,865 |
+| 640 MiB | 32 MiB | 21 | 1,205,796,963 |
+| 640 MiB | 512 MiB | 2 | 1,929,100,977 |
+
+Larger units reduced part counts in both cases, but the 640 MiB request used about 60 percent
+more peak query memory. The 256 MiB input fit the larger target without copying slices.
+These are single local measurements, not a universal memory or throughput improvement.
+They motivate validating input sizes and concurrent loads before raising an existing table's
+target. The 512 MiB compiled default remains an upper bound for a unit, not a query memory limit.
+
 ## Incremental materialized views {#upsert-incremental-materialized-views}
 
 An `UpsertMergeTree` table can be the source of an incremental materialized view:
@@ -321,8 +417,9 @@ For wide tables, larger background parts can reduce the number of files and mark
 aggregation queries. `upsert_maintenance_target_bytes` defaults to 4 GiB and accepts 32 MiB through 8 GiB.
 Memory limits can reduce the effective target; it is logged and used consistently throughout selection.
 Reserve disk space for both selected sources and prepared outputs per concurrent rewrite.
-It applies to background maintenance; insertion units and foreground mutation output retain their
-existing limits. Physical row and lineage budgets can split a background part before this byte target.
+It applies to background maintenance; insertion units use `upsert_insert_target_bytes` and
+foreground mutation output retains its existing limits. Physical row and lineage budgets can
+split a background part before this byte target.
 Winner relocation commits in bounded state batches independently of the physical part size.
 
 ```sql

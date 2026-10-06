@@ -83,6 +83,14 @@ ALTER TABLE events MODIFY SETTING
 
 The setting above and `prewarm_mark_cache`, `prewarm_primary_key_cache`, `columns_to_prewarm_mark_cache`, and `min_bytes_to_prewarm_caches` can be changed with a settings-only `ALTER TABLE ... MODIFY SETTING`. Resource settings in the preceding table remain open-time settings. `RESET SETTING` remains unsupported; explicitly assigning 33,554,432 sets the target back to 32 MiB, rather than restoring inheritance from server defaults. Metadata containing the new setting requires a binary that recognizes it.
 
+Insertion has a separate, alterable `upsert_insert_target_bytes` setting, defaulting to 512 MiB
+and accepting up to 1 GiB. A larger target allows wider input blocks to produce larger parts
+before background maintenance. The sink does not accumulate separate blocks; its 1,048,576-row,
+64 MiB lineage and 128 MiB atomic state-batch bounds still apply. One preparation above the
+128 MiB pending-column budget runs alone within its sink, and query memory limits still apply.
+Keep the target and block boundaries unchanged for token-based retries. See
+[configurable insert units](/development/upsert-merge-tree#configurable-insert-units).
+
 Changing the target wakes maintenance and revisits existing parts. Convergence requires multiple cycles and additional rewrite I/O. The settings operation waits for an active rewrite under the operation mutex; that wait has no separate `lock_acquire_timeout`. A failed metadata operation leaves the table usable only when the old metadata can be verified unchanged. A failure after replacement, or an uncertain metadata state, fences the table until restart and full recovery.
 
 Rewrite memory is not limited to the target: input columns, filtered copies, output and rebuilding an overflowing prefix coexist. Peak memory can be several times the target (roughly 2–3 times for these buffers, plus writer and state overhead). Background work does not inherit the client's query memory limit. Concurrent maintenance across tables requires a server memory budget. Longer rewrites also retain source parts longer and temporarily increase disk use.

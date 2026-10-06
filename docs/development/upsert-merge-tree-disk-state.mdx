@@ -96,7 +96,7 @@ The table manifest authenticates the type, scale and timezone as part of the sch
 
 Asynchronous queue admission routes a direct `UpsertMergeTree` destination, or any reachable destination through aliases or cascading materialized views, to synchronous execution. Clients can retain their session and profile settings, including `async_insert=1` and `wait_for_async_insert=0`, without adding a `SETTINGS` clause to their inserts. The engine forces its effective table-level `async_insert` setting to false. HTTP input and blocks received through the native protocol are processed in the original request, preserving its deduplication token and reporting write failures before success. A successful request waits for durable publication; requests are never combined into an asynchronous flush for this engine. Admission checks the current destination graph; later schema changes can still cause a background flush failure for a request admitted for other engines, which the general `wait_for_async_insert=0` contract does not report to the original client.
 
-`max_insert_threads` controls part preparation within one ordered sink. Its effective concurrency also respects `max_threads` and the corresponding minimum-free-memory settings, and is capped at eight in-flight parts per query. The queue counts both running preparations and completed parts awaiting publication, with an additional 128-MiB budget for their input blocks, including internal ordinals. Part metadata, encoded indexes and compression buffers consume additional query-accounted memory within the existing per-unit limits. Setting `max_insert_threads=1` prepares and commits each part synchronously.
+`max_insert_threads` controls part preparation within one ordered sink. Its effective concurrency also respects `max_threads` and the corresponding minimum-free-memory settings, and is capped at eight in-flight parts per query. The queue counts both running preparations and completed parts awaiting publication, with an additional 128-MiB budget for their input blocks, including internal ordinals. A single preparation above that budget runs alone in the sink. Part metadata, encoded indexes and compression buffers consume additional query-accounted memory within the existing per-unit limits. Setting `max_insert_threads=1` prepares and commits each part synchronously.
 
 The sink assigns token units before dispatch, validates and folds all partitions of each bounded input unit, and publishes completed preparations in input-unit and partition order. Workers only create temporary durable payloads; they never publish winners. Input completion drains the queue before success. On cancellation or an exception, outstanding preparations are joined and discarded without committing later units. Previously committed units retain the existing partial-insert and retry semantics. The engine continues to reject multiple independent sink chains, so retry identities and equal-version winner order do not depend on worker completion order.
 
@@ -121,15 +121,15 @@ Measure this against `max_insert_threads=1` using identical input blocks. A sing
 
 ### Automatic input splitting {#disk-state-automatic-input-splitting}
 
-An incoming block may exceed 32 MiB or 1,048,576 rows. The sink processes contiguous slices satisfying both bounds, then applies the existing partition routing and key folding. It measures column data, not compressed transport bytes. Range copies compact dictionaries, and the actual slice size is checked after copying. Small blocks keep their original columns without copying. A single row that cannot fit is rejected with its input position and the byte limit; rows are never truncated or discarded.
+An incoming block may exceed `upsert_insert_target_bytes` (512 MiB by default) or 1,048,576 rows. The sink processes contiguous slices satisfying both bounds, then applies the existing partition routing and key folding. It measures column data, not compressed transport bytes. Range copies compact dictionaries, and the actual slice size is checked after copying. Small blocks keep their original columns without copying. A single row that cannot fit is rejected with its input position and the byte limit; rows are never truncated or discarded.
 
 The folded lineage size is also checked before preparing any partition of the unit. If its `upsert_rows.bin` would exceed the independent 64-MiB serialization limit, the sink halves the candidate row count and retries the slice before publication. This accounts for the encoded key and the 50- or 58-byte per-row envelope and metadata overhead. For example, 1,048,576 versioned rows with eight-byte keys need 66 MiB plus a 16-byte file envelope, even though two eight-byte input columns occupy only 16 MiB.
 
 The splitter also estimates the input-dependent portion of the 128-MiB state batch: winner records including partition prefixes, overwrite kill records, authorization, retry records and the new part's visibility mask. This handles narrow million-row inputs whose columns and lineage fit their budgets but whose overwrite state would not. Existing affected parts' full mask rewrites depend on stored history and remain subject to the actual pre-append batch limit; the estimate does not eliminate that state-dependent limit.
 
-Original row ordinals survive slicing, and units commit in input order. Later equal-version duplicates therefore still win across slices. Token unit numbers advance for each accepted slice, shared by its partitions. Identical retries must retain the original input block boundaries, values, order and splitting policy; changing preparation concurrency does not change the slices. Blocks within the new state estimate retain their original token hashes and numbering. Before splitting an oversized state unit with a retry token, the sink probes every partition. Any exact, unexpired match preserves the entire original input-unit boundary, including a small partition already committed before a failure in a larger partition. The remaining partitions retain the old admission limits. If no partition matches, the unit is split; actual preparation and commit still reject mismatched payloads. The internal size is deliberately not a runtime tuning setting, because changing boundaries during the retry window would change token identity.
+Original row ordinals survive slicing, and units commit in input order. Later equal-version duplicates therefore still win across slices. Token unit numbers advance for each accepted slice, shared by its partitions. Identical retries must retain the original input block boundaries, values, order and splitting policy; changing preparation concurrency does not change the slices. Blocks within the new state estimate retain their original token hashes and numbering. Before splitting an oversized state unit with a retry token, the sink probes every partition. Any exact, unexpired match preserves the entire original input-unit boundary, including a small partition already committed before a failure in a larger partition. The remaining partitions retain the old admission limits. If no partition matches, the unit is split; actual preparation and commit still reject mismatched payloads. The byte target is captured once per sink. Keep it unchanged for outstanding retries, including across a binary upgrade; changing boundaries during the retry window changes token identity. Explicitly retain 33,554,432 when retrying requests originally split at 32 MiB.
 
-Atomicity is per slice and partition. A later invalid row, cancellation, or write failure can leave earlier slices committed, including slices from the same original input block. Retrying an identical request with its original token reuses committed results within the existing retention window. Splitting bounds incremental preparation work; it does not remove the original incoming block from memory or cap the query's total allocations at 32 MiB.
+Atomicity is per slice and partition. A later invalid row, cancellation, or write failure can leave earlier slices committed, including slices from the same original input block. Retrying an identical request with its original token reuses committed results within the existing retention window. Splitting bounds incremental preparation work; it does not remove the original incoming block from memory or cap the query's total allocations at the configured input target.
 
 ### Atomic truncation {#disk-state-truncate}
 
@@ -159,16 +159,24 @@ marker do not trigger this compaction. The part format and table manifest are un
 `UpsertTruncateCompactions` and `UpsertTruncateCompactionMicroseconds` record completed
 cleanups and elapsed cleanup time, including recovery attempts.
 
-### Why retain a 32-MiB internal unit {#disk-state-input-unit-budget}
+### Configurable input-unit budget {#disk-state-input-unit-budget}
 
-64-MiB and larger client blocks are supported through automatic splitting. The internal target remains 32 MiB for these reasons:
+`upsert_insert_target_bytes` defaults to 512 MiB and accepts 32 MiB through 1 GiB.
+The default allows wide bulk input blocks to produce larger parts directly while limiting
+individual preparations more conservatively than the 1 GiB maximum. It is not a measured
+universal optimum. Smaller upstream blocks, partitioning, duplicate folding and independent
+row and state limits can produce smaller parts.
 
-- The preparation queue has a 128-MiB input budget including ordinals. Two units containing 64 MiB of input columns would already exceed it once ordinals are added; larger units can reduce available preparation concurrency.
-- The 64-MiB serialized lineage limit is independent of column size. Increasing the column target does not increase safe row counts or encoded-key capacity.
-- Maintenance currently skips sources above its 32-MiB uncompressed-column budget. Admitting 64-MiB parts without changing maintenance would create additional parts that it cannot reclaim or consolidate.
-- Larger units increase individual preparation and serialized commit work. Fewer parts and sync operations may improve some workloads, but that tradeoff requires end-to-end measurements of throughput, peak memory and commit latency.
+The preparation queue retains a 128 MiB column-byte budget including ordinals. A unit larger
+than that budget runs alone within its sink. The 1,048,576-row, 64 MiB serialized-lineage and
+128 MiB atomic state-batch bounds remain independent of the column target. Query memory can
+exceed the input target because source columns, copied slices, sorting and indexes coexist.
+Background maintenance has its own 4 GiB configured default with memory-aware admission.
 
-32 MiB is a conservative implementation budget, not a measured universal optimum. Raising it to 64 MiB requires coordinated maintenance and queue budgets, a retry-boundary compatibility policy, and workload-specific validation; changing the constant alone is insufficient.
+The earlier 32 MiB default and the measurements below describe the original bounded splitter.
+Upgrades with outstanding token retries must retain the original target until those requests
+finish. See [configurable insert units](/development/upsert-merge-tree#configurable-insert-units)
+for setting and compatibility behavior.
 
 ### Local split validation (2026-09-27) {#disk-state-local-split-validation-20260927}
 
@@ -216,7 +224,7 @@ SET min_insert_block_size_rows = 48000;
 SET min_insert_block_size_bytes = 0;
 ```
 
-The benchmark uses an 8-GiB query memory limit and sets both thread minimum-free-memory thresholds to zero; resource policies may otherwise reduce concurrency. The first successful bulk `Compact` run reports approximately 424 MiB peak query memory and 21 compact parts. The 64-MiB setting selects the part format; the engine's internal input-unit limit remains 32 MiB. A 32-MiB format threshold can unexpectedly select `Wide` for near-limit units once internal columns are added. `ALTER ... MODIFY SETTING` remains gated, so this configuration is for a new table; it is not an instruction to edit an existing table's metadata. Narrow-column read performance and long-running mixed ingestion still need separate evaluation.
+The benchmark uses an 8-GiB query memory limit and sets both thread minimum-free-memory thresholds to zero; resource policies may otherwise reduce concurrency. The first successful bulk `Compact` run reports approximately 424 MiB peak query memory and 21 compact parts. In that benchmark revision, the 64-MiB setting selected the part format and the internal input-unit limit was 32 MiB. A 32-MiB format threshold can unexpectedly select `Wide` for near-limit units once internal columns are added. `ALTER ... MODIFY SETTING` was gated in that revision, so this historical configuration was for a new table; it is not an instruction to edit an existing table's metadata. Narrow-column read performance and long-running mixed ingestion still need separate evaluation.
 
 The changes group payload file barriers, omit an unused input hash when no retry token is present, and enable complete-key Bloom filters in the state database. A diagnostic run before the filter change spent approximately 5.6 of 18.2 sampled CPU seconds in `RocksDB` `MultiGet`, predominantly searching for absent keys. The final binary passed 59 unit tests, two stateless regressions and sixteen local-adapter integration cases. The payload barrier path also passed a blocked-`WAL` test: readers used the prior published version while the writer waited for its real sync operation. These short runs are not a long-term throughput guarantee or full container integration certification.
 

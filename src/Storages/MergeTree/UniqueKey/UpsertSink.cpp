@@ -1,4 +1,5 @@
 #include <Storages/MergeTree/UniqueKey/UpsertSink.h>
+#include <Storages/MergeTree/UniqueKey/UpsertInsertQueue.h>
 #include <Storages/MergeTree/UniqueKey/UpsertMetrics.h>
 #include <Storages/MergeTree/UniqueKey/UpsertStateStore.h>
 #include <Storages/MergeTree/UniqueKey/UpsertDurableFile.h>
@@ -51,6 +52,10 @@ extern const int FAULT_INJECTED;
 extern const int LOGICAL_ERROR;
 extern const int LIMIT_EXCEEDED;
 }
+namespace DB::MergeTreeSetting
+{
+extern const MergeTreeSettingsUInt64 upsert_insert_target_bytes;
+}
 namespace DB::FailPoints
 {
 extern const char upsert_throw_during_cache_prewarm[];
@@ -76,7 +81,7 @@ struct PreparedInsert
 struct Sink::Impl
 {
     /// Both ready parts and running preparations count against these bounds.
-    static constexpr size_t max_pending_bytes = 128U << 20;
+    /// One oversized preparation may run alone; query memory limits still apply.
     static constexpr size_t max_preparing_parts = 8;
     struct Pending
     {
@@ -115,7 +120,8 @@ struct Sink::Impl
 Sink::Sink(StorageMergeTree & storage_, StorageMetadataPtr metadata_, ContextPtr context_)
     : SinkToStorage(std::make_shared<const Block>(metadata_->getSampleBlock())), storage(storage_), metadata(std::move(metadata_)),
       context(std::move(context_)), schema_lock(storage.tryLockTimed(storage.upsert_schema_lock,
-          RWLockImpl::Read, context->getCurrentQueryId(), context->getSettingsRef()[Setting::lock_acquire_timeout]))
+          RWLockImpl::Read, context->getCurrentQueryId(), context->getSettingsRef()[Setting::lock_acquire_timeout])),
+      input_target_bytes((*storage.getSettings())[MergeTreeSetting::upsert_insert_target_bytes])
 {
     const auto current_metadata = storage.getInMemoryMetadataPtr(context, true);
     if (metadata->getColumns().toString(false) != current_metadata->getColumns().toString(false)
@@ -218,7 +224,7 @@ void Sink::consume(Chunk & chunk)
         if (auto process = context->getProcessListElement())
             process->checkTimeLimit();
         CurrentMemoryTracker::check();
-        auto block = cutInputBlock(input, offset, max_rows);
+        auto block = cutInputBlock(input, offset, max_rows, input_target_bytes);
         const size_t rows = block.rows();
         if (!consumeBlock(std::move(block), offset, client_token, forwarded.empty() ? nullptr : &forwarded))
         {
@@ -327,8 +333,7 @@ bool Sink::consumeBlock(Block block, size_t first_row, const String & client_tok
         }
         CurrentMemoryTracker::check();
         const size_t bytes = partitions[i].block->bytes();
-        while (!impl->pending.empty() && (impl->pending.size() >= impl->max_threads
-            || bytes > Impl::max_pending_bytes - impl->pending_bytes))
+        while (insertPreparationNeedsDrain(impl->pending.size(), impl->pending_bytes, bytes, impl->max_threads))
             finishFront();
         if (isCancelled())
             return true;

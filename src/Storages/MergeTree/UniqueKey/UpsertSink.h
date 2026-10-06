@@ -27,6 +27,7 @@ private:
     StorageMetadataPtr metadata;
     ContextPtr context;
     RWLockImpl::LockHolder schema_lock;
+    const size_t input_target_bytes;
     UInt64 unit = 0;
     bool synchronously_commit_for_views = false;
     bool has_dependent_views = false;
