@@ -127,7 +127,36 @@ TEST(UpsertRowMetadata, StableLittleEndianFixture)
     const auto fixture = fromHex(
         "554d525601013412000001000000000000000200000000000000030000000000000004000000000000000500000000000000");
     EXPECT_EQ(encodeIndexValue(value), fixture);
+    String scratch(1000, 'x');
+    encodeIndexValue(value, scratch);
+    EXPECT_EQ(scratch, fixture);
     EXPECT_EQ(decodeIndexValue(fixture), value);
+}
+
+TEST(UpsertRowMetadata, ReusableEncodingPreservesVariantsAndFailureOutput)
+{
+    String scratch(1000, 'x');
+    for (const auto offset : {UInt32{0}, MAX_PART_ROWS - 1})
+        for (bool versioned : {true, false})
+            for (bool self_binding : {true, false})
+            {
+                IndexValue value{.row_offset = offset,
+                    .row = {.operation_id = {1, 2}, .block_ordinal = 3,
+                        .write_csn = self_binding ? 0ULL : 4ULL,
+                        .version = versioned ? std::optional<UInt64>{5} : std::nullopt,
+                        .self_binding = self_binding}};
+                encodeIndexValue(value, scratch);
+                EXPECT_EQ(scratch.size(), versioned ? 50 : 42);
+                EXPECT_EQ(scratch, encodeIndexValue(value));
+                EXPECT_EQ(decodeIndexValue(scratch), value);
+            }
+    const auto original = scratch;
+    EXPECT_THROW(encodeIndexValue({}, scratch), Exception);
+    EXPECT_EQ(scratch, original);
+    IndexValue invalid_offset{.row_offset = MAX_PART_ROWS,
+        .row = {.operation_id = {1, 2}, .write_csn = 4}};
+    EXPECT_THROW(encodeIndexValue(invalid_offset, scratch), Exception);
+    EXPECT_EQ(scratch, original);
 }
 
 TEST(UpsertRowMetadata, WinnerOrder)
@@ -297,6 +326,19 @@ TEST(UpsertLogRecord, SequenceExhaustionAndInvalidBoundaries)
     EXPECT_THROW((LogReplayCursor({}, "p")), Exception);
     EXPECT_THROW((LogReplayCursor({1, 2}, "p", 1, {})), Exception);
     EXPECT_THROW((LogReplayCursor({1, 2}, "p", 0, {1, 1})), Exception);
+}
+
+TEST(UpsertPartRows, StablePhysicalLineageFixture)
+{
+    PartRows rows{
+        {String("\0\xff", 2), {0, {.operation_id = {1, 2}, .block_ordinal = 3, .write_csn = 4, .version = 5}}},
+        {"key", {1, {.operation_id = {1, 2}, .block_ordinal = 6, .self_binding = true}}}};
+    const auto fixture = fromHex(
+        "554d50524f573031020000000200000000ff32000000554d5256010100000000010000000000000002000000000000000300"
+        "00000000000004000000000000000500000000000000030000006b65792a000000554d525601020100000001000000000000"
+        "00020000000000000006000000000000000000000000000000594751a6");
+    EXPECT_EQ(encodePartRows(rows), fixture);
+    EXPECT_EQ(decodePartRows(fixture), rows);
 }
 
 TEST(UpsertPartRows, PrevalidationRejectsInvalidImmutableInput)

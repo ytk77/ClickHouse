@@ -273,6 +273,11 @@ struct Database
         constexpr size_t lookup_batch_size = 1024;
         const auto key_prefix = prefix('W', partition);
         const size_t size = offsets ? offsets->size() : rows.size();
+        const size_t capacity = std::min(lookup_batch_size, size);
+        std::vector<String> keys(capacity);
+        std::vector<rocksdb::Slice> slices(capacity);
+        std::vector<rocksdb::PinnableSlice> values(capacity);
+        std::vector<rocksdb::Status> statuses(capacity);
         auto row_at = [&](size_t position) -> const PartRow &
         {
             const auto offset = offsets ? (*offsets)[position] : position;
@@ -283,22 +288,30 @@ struct Database
         for (size_t begin = 0; begin < size; begin += lookup_batch_size)
         {
             const auto count = std::min(lookup_batch_size, size - begin);
-            std::vector<String> keys;
-            keys.reserve(count);
             for (size_t i = 0; i < count; ++i)
-                keys.push_back(key_prefix + row_at(begin + i).key);
-            std::vector<rocksdb::Slice> slices;
-            slices.reserve(count);
-            for (const auto & key : keys)
-                slices.emplace_back(key);
-            std::vector<rocksdb::PinnableSlice> values(count);
-            std::vector<rocksdb::Status> statuses(count);
+            {
+                keys[i].assign(key_prefix);
+                keys[i].append(row_at(begin + i).key);
+            }
+            /// Build views only after assigning strings, since an assignment can reallocate.
+            for (size_t i = 0; i < count; ++i)
+                slices[i] = rocksdb::Slice(keys[i]);
+            for (auto & value : values)
+                value.Reset();
+            /// The state database uses the default bytewise comparator. Never reorder callbacks.
+            bool sorted_input = true;
+            for (size_t i = 1; i < count; ++i)
+                if (slices[i - 1].compare(slices[i]) >= 0)
+                {
+                    sorted_input = false;
+                    break;
+                }
             {
                 ProfileEventTimeIncrement<Microseconds> timer(ProfileEvents::UpsertWinnerLookupMicroseconds);
                 ProfileEvents::increment(ProfileEvents::UpsertWinnerLookupKeys, count);
                 rocksdb::ReadOptions options;
                 options.fill_cache = fill_cache;
-                db->MultiGet(options, db->DefaultColumnFamily(), count, slices.data(), values.data(), statuses.data());
+                db->MultiGet(options, db->DefaultColumnFamily(), count, slices.data(), values.data(), statuses.data(), sorted_input);
             }
             {
                 ProfileEventTimeIncrement<Microseconds> decision_timer(ProfileEvents::UpsertWinnerDecisionMicroseconds);
@@ -313,6 +326,10 @@ struct Database
                     callback(row_at(begin + i), keys[i], value);
                 }
             }
+            /// Keep small-key reuse without retaining oversized keys across successive batches.
+            for (auto & key : keys)
+                if (key.capacity() > (64U << 10))
+                    String{}.swap(key);
             CurrentMemoryTracker::check();
         }
     }
@@ -1048,6 +1065,8 @@ StateStore::Prepared DiskState::prepare(const String & partition, PartCommit par
     auto dead = std::make_shared<DeleteBitmap>();
     part.dead.clear();
     part.kills.clear();
+    BinaryWriter winner;
+    String encoded_value;
     impl->database->forEachWinner(partition, rows, [&](const PartRow & row, const String & key, std::optional<std::string_view> incumbent)
     {
         auto candidate = row.value;
@@ -1066,9 +1085,10 @@ StateStore::Prepared DiskState::prepare(const String & partition, PartCommit par
             }
             part.kills.push_back({old_part, old.row_offset});
         }
-        BinaryWriter winner;
+        winner.bytes.clear();
         winner.id(part.part);
-        winner.string(encodeIndexValue(candidate));
+        encodeIndexValue(candidate, encoded_value);
+        winner.string(encoded_value);
         batch.Put(key, winner.bytes);
         checkBatchBudget(batch);
     });

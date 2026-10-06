@@ -128,6 +128,7 @@ String encodePartRows(const PartRows & rows)
     CurrentMemoryTracker::check();
     out.bytes = large ? "UMPROW02" : "UMPROW01";
     out.number(rows.size(), 4);
+    String value;
     for (size_t i = 0; i < rows.size(); ++i)
     {
         if (i % 65536 == 0)
@@ -136,7 +137,7 @@ String encodePartRows(const PartRows & rows)
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "UpsertMergeTree row metadata is not in physical order");
         out.number(rows[i].key.size(), 4);
         out.bytes += rows[i].key;
-        const auto value = encodeIndexValue(rows[i].value);
+        encodeIndexValue(rows[i].value, value);
         out.number(value.size(), 4);
         out.bytes += value;
     }

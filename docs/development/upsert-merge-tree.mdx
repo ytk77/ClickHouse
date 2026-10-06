@@ -205,6 +205,26 @@ whether the initialized IO pool was used. `UpsertPayloadSyncMicroseconds` measur
 time through completion of all file barriers. `UpsertInventoryHashMicroseconds` includes enumeration
 and file hashing and is recorded only when that work succeeds.
 
+## Insert allocation reuse {#upsert-insert-allocation-reuse}
+
+Winner lookups retain a bounded set of 1,024 key, slice, status and pinned-value slots for
+one call. Each batch rebuilds slices after assigning keys and releases previous pins before
+`MultiGet`. A strict bytewise order check enables `sorted_input` only for an ascending batch;
+callbacks still run in the original row order. Keys retaining more than 64 KiB are released
+at the end of a batch. Retirement scans retain their existing `fill_cache=false` policy.
+
+`encodeIndexValue`, lineage encoding and winner records reuse local string buffers. Their
+bytes, validation, row boundaries, token hashes and durability barriers are unchanged.
+The state batch is not reserved at its worst-case size. These changes reduce allocation work
+without enlarging the lookup batch or the independent memory budgets.
+
+In five measured warm repetitions after one warmup, the 262,144-row fixed-input fixture
+with a 512 MiB target reduced median state preparation from 240 to 181 ms for fresh keys,
+and from 416 to 336 ms for 90 percent updates, relative to the SST-omission binary.
+Median client wall time was 1.033 to 0.898 seconds and 1.154 to 1.085 seconds respectively.
+The 32 MiB update case was approximately unchanged. These are local comparisons, not
+production throughput or tail-latency guarantees; inclusive stage timers must not be added.
+
 ## Incremental materialized views {#upsert-incremental-materialized-views}
 
 An `UpsertMergeTree` table can be the source of an incremental materialized view:

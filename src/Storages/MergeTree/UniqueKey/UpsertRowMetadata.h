@@ -40,6 +40,8 @@ inline constexpr UInt32 MAX_PART_ROWS = 1U << 28;
 
 /// Versioned, little-endian encoding. Legacy four-byte SST values are never accepted.
 String encodeIndexValue(const IndexValue & value);
+/// Replace the output, retaining its allocation. Invalid input leaves it unchanged.
+void encodeIndexValue(const IndexValue & value, String & output);
 IndexValue decodeIndexValue(std::string_view bytes);
 
 }

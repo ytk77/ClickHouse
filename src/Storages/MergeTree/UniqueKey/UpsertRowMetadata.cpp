@@ -63,10 +63,19 @@ std::strong_ordering RowMetadata::compareWinner(const RowMetadata & rhs) const
 
 String encodeIndexValue(const IndexValue & value)
 {
+    String result;
+    encodeIndexValue(value, result);
+    return result;
+}
+
+void encodeIndexValue(const IndexValue & value, String & result)
+{
     validate(value.row);
     if (value.row_offset >= MAX_PART_ROWS)
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "UpsertMergeTree row offset exceeds the part row limit");
-    String result("UMRV", 4);
+    result.clear();
+    result.reserve(50);
+    result.append("UMRV", 4);
     appendLE(result, 1, 1);
     appendLE(result, (value.row.version ? 1 : 0) | (value.row.self_binding ? 2 : 0), 1);
     appendLE(result, value.row_offset, 4);
@@ -76,7 +85,6 @@ String encodeIndexValue(const IndexValue & value)
     appendLE(result, value.row.write_csn, 8);
     if (value.row.version)
         appendLE(result, *value.row.version, 8);
-    return result;
 }
 
 IndexValue decodeIndexValue(std::string_view bytes)

@@ -552,6 +552,50 @@ TEST_F(UpsertDiskStateTest, DurableWinnersAndSnapshots)
     commit(reopened, tie);
 }
 
+TEST_F(UpsertDiskStateTest, WinnerLookupScratchPreservesUnsortedRowsAndPartialBatches)
+{
+    StateStore store(directory, incarnation, false, true);
+    std::vector<std::pair<String, UInt64>> initial;
+    constexpr size_t count = 2057;
+    for (size_t i = 0; i < count; ++i)
+    {
+        String key;
+        for (size_t shift : {24, 16, 8, 0})
+            key.push_back(static_cast<char>(i >> shift));
+        key.append(i % 2 ? 100 : 1, '\xff');
+        if (i % 129 == 0)
+            key.append(128U << 10, 'k');
+        initial.emplace_back(std::move(key), 1000 + i);
+    }
+    auto first = prepare(store, initial);
+    commit(store, first);
+    const auto first_id = objectName(first.record.part);
+    std::vector<std::pair<String, UInt64>> incoming;
+    std::vector<size_t> source_offsets;
+    for (size_t i = 0; i < count; ++i)
+    {
+        const size_t source = (i * 19) % count;
+        source_offsets.push_back(source);
+        incoming.emplace_back(initial[source].first, initial[source].second + (source % 3 ? 1 : -1));
+    }
+    auto next = prepare(store, incoming);
+    EXPECT_EQ(next.record.dead.size(), (count + 2) / 3);
+    EXPECT_EQ(next.record.kills.size(), count - (count + 2) / 3);
+    commit(store, next);
+    const auto next_id = objectName(next.record.part);
+    const auto snapshot = store.snapshot();
+    for (size_t i = 0; i < count; ++i)
+    {
+        EXPECT_EQ(snapshot->getMask(first_id)->contains(i), i % 3 != 0);
+        EXPECT_EQ(snapshot->getMask(next_id)->contains(i), source_offsets[i] % 3 == 0);
+    }
+    auto singleton = prepare(store, {{initial[0].first, initial[0].second + 2}});
+    ASSERT_EQ(singleton.record.kills.size(), 1);
+    EXPECT_EQ(objectName(singleton.record.kills[0].part), first_id);
+    EXPECT_EQ(singleton.record.kills[0].offset, 0);
+    commit(store, singleton);
+}
+
 TEST_F(UpsertDiskStateTest, DurableCommitBeforeRenameRecovers)
 {
     String name;
