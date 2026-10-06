@@ -22,6 +22,8 @@
 #include <mutex>
 
 #if USE_ROCKSDB
+#include <Storages/MergeTree/UniqueKey/UpsertLookupMetrics.h>
+#include <rocksdb/advanced_cache.h>
 #include <rocksdb/cache.h>
 #include <rocksdb/db.h>
 #include <rocksdb/filter_policy.h>
@@ -176,6 +178,7 @@ void putInventory(rocksdb::WriteBatch & batch, const PartCommit & part)
 struct Database
 {
     std::unique_ptr<rocksdb::DB> db;
+    std::shared_ptr<rocksdb::Cache> index_cache;
     std::unique_ptr<DeleteBitmapCache> mask_cache;
     MaskVersions mask_versions;
     UInt64 mask_generation = 0;
@@ -309,6 +312,7 @@ struct Database
             {
                 ProfileEventTimeIncrement<Microseconds> timer(ProfileEvents::UpsertWinnerLookupMicroseconds);
                 ProfileEvents::increment(ProfileEvents::UpsertWinnerLookupKeys, count);
+                WinnerLookupMetrics lookup_metrics;
                 rocksdb::ReadOptions options;
                 options.fill_cache = fill_cache;
                 db->MultiGet(options, db->DefaultColumnFamily(), count, slices.data(), values.data(), statuses.data(), sorted_input);
@@ -332,6 +336,11 @@ struct Database
                     String{}.swap(key);
             CurrentMemoryTracker::check();
         }
+        /// Sample once per lookup call, avoiding a cache-shard walk for each bounded batch.
+        ProfileEvents::increment(ProfileEvents::UpsertWinnerLookupCacheSamples);
+        ProfileEvents::increment(ProfileEvents::UpsertWinnerLookupCacheCapacityByteSamples, index_cache->GetCapacity());
+        ProfileEvents::increment(ProfileEvents::UpsertWinnerLookupCacheUsageByteSamples, index_cache->GetUsage());
+        ProfileEvents::increment(ProfileEvents::UpsertWinnerLookupCachePinnedByteSamples, index_cache->GetPinnedUsage());
     }
 
     UInt64 integer(const String & key) const
@@ -774,7 +783,8 @@ DiskState::DiskState(const String & table_path, ObjectID incarnation, bool attac
     options.keep_log_file_num = 2;
     options.max_background_jobs = static_cast<int>(resources.background_jobs);
     rocksdb::BlockBasedTableOptions table_options;
-    table_options.block_cache = rocksdb::NewLRUCache(resources.index_cache_bytes);
+    impl->database->index_cache = rocksdb::NewLRUCache(resources.index_cache_bytes);
+    table_options.block_cache = impl->database->index_cache;
     table_options.cache_index_and_filter_blocks = true;
     table_options.filter_policy.reset(rocksdb::NewBloomFilterPolicy(10));
     table_options.whole_key_filtering = true;

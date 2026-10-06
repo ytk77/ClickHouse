@@ -120,6 +120,27 @@
     M(UpsertPayloadSyncSequentialGroups, "`UpsertMergeTree` payload groups synchronized sequentially.", ValueType::Number) \
     M(UpsertWinnerLookupMicroseconds, "Time spent looking up `UpsertMergeTree` winners in `RocksDB`.", ValueType::Microseconds) \
     M(UpsertWinnerLookupKeys, "Number of keys probed in `UpsertMergeTree` winner lookups.", ValueType::Number) \
+    M(UpsertWinnerLookupCacheHits, "Block-cache hits during bounded `UpsertMergeTree` winner lookups; includes data, index and filter blocks.", ValueType::Number) \
+    M(UpsertWinnerLookupIndexCacheHits, "Index-block cache hits during `UpsertMergeTree` winner lookups.", ValueType::Number) \
+    M(UpsertWinnerLookupFilterCacheHits, "Filter-block cache hits during `UpsertMergeTree` winner lookups.", ValueType::Number) \
+    M(UpsertWinnerLookupCacheHitBytes, "Uncompressed cached block bytes accessed during `UpsertMergeTree` winner lookups.", ValueType::Bytes) \
+    M(UpsertWinnerLookupBlockReads, "Block reads on cache misses during `UpsertMergeTree` winner lookups; reads may be served by the operating system cache.", ValueType::Number) \
+    M(UpsertWinnerLookupIndexBlockReads, "Index-block reads during `UpsertMergeTree` winner lookups.", ValueType::Number) \
+    M(UpsertWinnerLookupFilterBlockReads, "Filter-block reads during `UpsertMergeTree` winner lookups.", ValueType::Number) \
+    M(UpsertWinnerLookupReadBytes, "Block bytes read during `UpsertMergeTree` winner lookups; excludes lineage and column files.", ValueType::Bytes) \
+    M(UpsertWinnerLookupBlockReadNanoseconds, "Time reading blocks through the single-block fetch path during `UpsertMergeTree` winner lookups; batched data-block reads are counted but not timed here.", ValueType::Nanoseconds) \
+    M(UpsertWinnerLookupDecompressNanoseconds, "Time decompressing blocks through the single-block fetch path during `UpsertMergeTree` winner lookups; excludes batched data-block decompression.", ValueType::Nanoseconds) \
+    M(UpsertWinnerLookupChecksumNanoseconds, "Time checking block checksums during `UpsertMergeTree` winner lookups.", ValueType::Nanoseconds) \
+    M(UpsertWinnerLookupMemtableProbes, "Non-empty memtable probes during `UpsertMergeTree` winner lookups; one per internal `MultiGet` sub-batch and memtable, not per key.", ValueType::Number) \
+    M(UpsertWinnerLookupMemtableNanoseconds, "Time probing memtables during `UpsertMergeTree` winner lookups.", ValueType::Nanoseconds) \
+    M(UpsertWinnerLookupTableNanoseconds, "Time looking up SST files during `UpsertMergeTree` winner lookups; may overlap block read and decompression time.", ValueType::Nanoseconds) \
+    M(UpsertWinnerLookupKeyComparisons, "User-key comparisons during `UpsertMergeTree` winner lookups.", ValueType::Number) \
+    M(UpsertWinnerLookupBloomPositives, "Positive key/SST filter probes during `UpsertMergeTree` winner lookups; one key can probe multiple files, positives do not prove existence, and memtable filters are excluded.", ValueType::Number) \
+    M(UpsertWinnerLookupBloomNegatives, "Negative key/SST filter probes during `UpsertMergeTree` winner lookups; one key can probe multiple files and memtable filters are excluded.", ValueType::Number) \
+    M(UpsertWinnerLookupCacheSamples, "Successful `UpsertMergeTree` winner lookup calls that sampled the table block cache.", ValueType::Number) \
+    M(UpsertWinnerLookupCacheCapacityByteSamples, "Sum of block-cache capacity byte samples after `UpsertMergeTree` winner lookup calls; divide by `UpsertWinnerLookupCacheSamples` for mean capacity.", ValueType::Bytes) \
+    M(UpsertWinnerLookupCacheUsageByteSamples, "Sum of block-cache usage byte samples after `UpsertMergeTree` winner lookup calls; divide by `UpsertWinnerLookupCacheSamples` for mean sampled usage, not a peak.", ValueType::Bytes) \
+    M(UpsertWinnerLookupCachePinnedByteSamples, "Sum of pinned block-cache usage byte samples after `UpsertMergeTree` winner lookup calls; divide by `UpsertWinnerLookupCacheSamples` for mean sampled usage, not a peak.", ValueType::Bytes) \
     M(UpsertMaskReadMicroseconds, "Time spent loading and decoding `UpsertMergeTree` visibility masks.", ValueType::Microseconds) \
     M(UpsertMaskReadBytes, "Encoded bytes loaded for `UpsertMergeTree` visibility masks.", ValueType::Bytes) \
     M(UpsertMaskWriteBytes, "Encoded visibility mask bytes prepared by `UpsertMergeTree`.", ValueType::Bytes) \

@@ -205,6 +205,173 @@ whether the initialized IO pool was used. `UpsertPayloadSyncMicroseconds` measur
 time through completion of all file barriers. `UpsertInventoryHashMicroseconds` includes enumeration
 and file hashing and is recorded only when that work succeeds.
 
+### Winner lookup cache counters {#upsert-winner-lookup-cache-counters}
+
+Winner lookup instrumentation exports deltas from the calling thread's `RocksDB` `PerfContext`
+around each `MultiGet`. It preserves existing counters and restores the previous profiling level,
+including on exceptions. The default is `kEnableCount`; a stronger level already selected by the
+caller is preserved. Counts mode does not collect the internal nanosecond timers. Missing timer
+events mean that timing was not collected, rather than that the operation took no time.
+
+Use the inserting query's `ProfileEvents`, because maintenance, retirement and partition operations
+also use the lookup helper. The external batch remains 1,024 keys. This vendored `RocksDB` implementation
+subdivides it into internal batches of at most 32 keys; memtable probes count those internal batches
+per non-empty memtable, not individual keys.
+
+- `UpsertWinnerLookupCacheHits` includes data, index and filter hits. The index and filter events are
+  subsets and must not be added to the total. Report data hits separately from index and filter hits.
+- `UpsertWinnerLookupBlockReads` counts block fetches on cache misses. A fetch may be served by the OS
+  page cache and does not establish device I/O. `UpsertWinnerLookupReadBytes` excludes lineage and column files.
+- Bloom positive and negative events count key/filter probes in SST files, excluding memtable filters.
+  One key can probe multiple files, and a positive filter result does not establish key existence.
+- When internal timing is explicitly enabled, `UpsertWinnerLookupTableNanoseconds` is inclusive SST
+  lookup time. The block-read and decompression timers cover the single-block fetch path only;
+  batched data-block fetches are counted but not timed there. These times overlap and must not be summed.
+
+After each successful lookup call, cache sampling records capacity, usage and pinned usage from the
+same cache object used by the table. Divide each byte-sample sum by `UpsertWinnerLookupCacheSamples`
+to obtain the sampled mean, not a peak. Pinned usage includes the final batch's live `PinnableSlice`
+values. Usage includes uncompressed data blocks, index/filter blocks and entry charges, so compressed
+SST file size is not the cache working-set size. The current LRU uses a 0.5 high-priority pool ratio,
+with index/filter blocks at high priority and no strict capacity limit. Pinned entries can temporarily
+take usage above capacity.
+
+`upsert_index_cache_bytes` is per table. Account for every table's cache and observe server RSS as
+well as tracked query/server memory. Filling a cache during an insert can increase that query's
+memory peak; retained cache allocations also outlive the query. Raising capacity is not a substitute
+for validating concurrent ingestion under real memory limits.
+This resource setting is applied when the table opens and does not support `ALTER`.
+
+### Cache capacity experiment {#upsert-cache-capacity-experiment}
+
+The local cache experiment compares fresh isolated table opens at 64, 256 and 512 MiB. It restores
+the same closed-server snapshot before each cell, checks its immutable master hashes before and
+after the matrix, and rejects symlinks resolving outside the restored runtime. Each query confirms
+the actual cache capacity through its byte samples. Maintenance is stopped and background payload
+verification is paused during measurements; the payloads are verified before the measured updates.
+The experiment uses `DETACH`/`ATTACH` to reopen the state database at the requested capacity; it
+does not test resizing an existing cache in place.
+The server and background memory ceilings are explicitly 64 GiB, and each insert has a 4 GiB query
+limit, one insert thread and a 512 MiB input target.
+
+The fixtures separate physical column data from the winner-state working set:
+
+| Fixture | Existing winners | Largest uncompressed part | Compressed state SST bytes | Raw winner key/value bytes |
+| --- | ---: | ---: | ---: | ---: |
+| Small integer keys | 262,144 | 73,400,320 | 5,549,113 | 22,544,384 |
+| Large physical source, integer keys | 1,250,000 | 4,120,000,000 | 24,313,438 | 107,500,000 |
+| Dense 128-byte binary keys | 4,000,000 | 46,137,344 | 672,297,575 | 834,002,105 |
+
+The dense keys concatenate eight raw MD5 digests of the row identity and fixed salts. Snapshots are
+offline-compacted, giving a favorable SST layout rather than an ingestion workload's compaction debt.
+Compressed SST sizes are lower bounds, not estimates of the decoded cache footprint. Even 512 MiB
+does not hold the entire dense fixture's raw winner state.
+
+All incoming keys already exist. A fixed coprime permutation spreads approximately 26,000 or 236,000
+updates across the source. These counts are 10 or 90 percent of a 262,144-row candidate range, not
+percentages of the whole fixture or mixtures of fresh keys and updates. Each cell uses one or sixteen
+clients and a concurrent bounded `SELECT` reader. Count, unique identity, identity sum and version
+sum are checked before and after the updates.
+
+Warm cells first probe the exact update keys with lower-version, all-losing inserts without tokens.
+This creates no published part, but changes sequence/memtable metadata identically for all capacities;
+it measures favorable key reuse. Advisory-cold cells skip that prelookup, synchronize each restored
+state SST, request page eviction with `posix_fadvise` and record `mincore` residency immediately before
+the update. This establishes OS-page residency, not device-cache coldness. Fresh opens may already
+cache metadata. Block misses must not be interpreted as device reads.
+
+The main matrix rotates capacities within each repetition. The first repetition is warmup and is
+excluded, leaving five paired repetitions. Lookup and lock-hold times are ratios of summed stage
+microseconds to summed keys; sixteen concurrent members stay in one repetition cluster. The report
+retains all five paired ratios and uses bootstrap median ranges only as coarse exploratory ranges,
+without a confidence-coverage or significance claim. This sample size does not certify p95 or p99.
+A credible capacity effect should also have higher data-block hit fractions, fewer reads per key and
+cache-usage evidence. Block hit/read counts are amortized within internal batches and depend on key
+locality, so compare them within the same fixture and key-set design.
+
+#### Local cache experiment results {#upsert-local-cache-experiment-results}
+
+The counts-only binary SHA256 is
+`b7a7d1fdc06e67041ee923c1e39c21c57af8815fbf1f69e7f446fdad5fe127b3`,
+built from the reviewed working tree on `dfbf8aaa295`. The host uses an Intel Xeon Gold 6152
+and approximately 755 GiB RAM; the explicit memory limits above govern these isolated runs.
+The main matrix passed 288 cells and 2,448 inserts, including warmup. Five measured repetitions
+remain for each cell after excluding warmup. The small confirmation passed another 12 cells,
+with one measured repetition; it is a descriptive check rather than a performance conclusion.
+
+Before the matrix, the same-source overhead comparison passed 48 cells and 408 inserts against
+the uninstrumented hash-fold binary. Ratios of cell median lookup times ranged from -3.6 to
++1.8 percent in counts mode: no detectable overhead at this resolution, not zero overhead.
+Internal timing increased lookup time by approximately 7–26 percent in a separate comparison.
+The main capacity matrix therefore uses counts only. A separate timed diagnostic passed 12 cells
+and must not be pooled with the counts matrix. For example, its cold dense 64 MiB lookup took
+5,906 ms, with 5,773 ms inclusive SST time but only 1.8 ms in the single-block read timer;
+the latter omits the batched path and cannot estimate total I/O cost.
+
+Median warm lookup microseconds per key:
+
+| Fixture | Clients | Updates | 64 MiB | 256 MiB | 512 MiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Large physical source | 1 | ~26k | 1.500 | 1.425 | 1.364 |
+| Large physical source | 1 | ~236k | 1.170 | 1.162 | 1.179 |
+| Large physical source | 16 | ~26k | 2.999 | 2.813 | 2.951 |
+| Large physical source | 16 | ~236k | 2.034 | 2.015 | 1.944 |
+| Dense binary keys | 1 | ~26k | 10.708 | 4.284 | 2.963 |
+| Dense binary keys | 1 | ~236k | 8.102 | 7.596 | 5.691 |
+| Dense binary keys | 16 | ~26k | 8.508 | 4.194 | 4.259 |
+| Dense binary keys | 16 | ~236k | 9.506 | 8.104 | 6.325 |
+
+For warm dense sixteen-client cells, the paired median 512/64 lookup ratios were 0.495 and
+0.667, lower in all five repetitions. Corresponding group wall-time ratios were 0.715 and
+0.859, also lower in all five. At approximately 26k updates, both larger caches reached a
+100 percent data-block hit fraction and about 103 MiB sampled usage, compared with 29.5 percent
+hits at 64 MiB. The 256 and 512 MiB sixteen-client lookup results were similar; additional
+capacity provides no further hit-rate evidence in this cell. Single-client differences between
+those two capacities likewise cannot be attributed to a capacity mechanism when hits are identical.
+
+For warm dense sixteen-client cells at approximately 236k updates, data-block hit fractions
+were 9.1, 39.5 and 79.1 percent at 64, 256 and 512 MiB. Sampled usage was near each capacity.
+This supports a capacity effect for the larger update working set. The large physical source's
+tested warm key sets instead had at least 97.8 percent hits at 64 MiB and approximately
+21–41 MiB sampled usage. Its small time differences did not show a consistent capacity benefit.
+Neither a large physical part nor raw winner byte totals alone establish cache sensitivity.
+
+Advisory-cold SST residency was 0–0.00122 percent, and warm residency was 100 percent.
+Cold results do not establish a speed improvement. In the dense sixteen-client cells, the paired
+median 512/64 group wall-time ratios were 1.497 at approximately 26k updates and 1.916 at
+approximately 236k updates, with slower times in five and four repetitions respectively.
+Cold I/O timings varied widely, and these measurements do not isolate the cause of the slower
+512 MiB cells. In those sixteen-client cells, median `OSReadBytes` per key was identical across
+capacities: approximately 6,413 bytes at 26k updates and 2,623 bytes at 236k. Hard page faults were
+zero. The additional time was I/O wait, and spikes also occurred at 64 and 256 MiB. This is consistent
+with I/O latency variance whose source was not isolated, possibly including restore writeback or
+memory-pressure effects. It does not demonstrate a cache-induced cost. Report the adverse result
+alongside the warm benefit rather than extrapolating warm reuse to first-touch ingestion.
+
+For cold dense single-client cells at approximately 236k updates, median query memory peaks were
+347, 543 and 804 MiB at the three capacities. Warm query peaks were approximately 283 MiB,
+because the earlier prelookup had filled the cache. Cache fills are charged to the query that
+allocates the blocks, and retained memory remains in the server. In the warm cells, sampled process
+RSS including verification was approximately 1,137, 1,359 and 1,646 MiB; these are whole-cell
+samples rather than insert-only RSS peaks. Validate both cold query limits and aggregate table
+cache memory before choosing a larger capacity.
+
+All snapshots have bottom-level `L6` SSTs: one file for each integer-key fixture and ten files
+for the dense fixture. The favorable compacted layout, exact-key warmup, existing-key-only updates,
+five repetitions and single-host execution limit these conclusions. The 64 MiB default remains
+unchanged. A 256 MiB cache is a candidate for a validated smaller hot working set; 512 MiB requires
+evidence for a larger working set and additional memory/cold-ingestion validation. No production
+configuration or group-commit protocol is changed by this experiment.
+
+The final binary SHA256 is
+`f1c3f4b9161592cb9326c8a433ee05663fd5230eb41fa47e3d7b3c1b99e60a25`.
+Its engine source hashes match the measured counts binary; only an event description clarifying
+internal memtable sub-batches changed after measurement. It passed 243 focused C++ tests
+(three disabled), 46 local-adapter integration cases and 19 SQL/shell cases, including
+`03999_stateless_settings_history`. Read-only review accepted the instrumentation and the results,
+and separate log review confirmed the builds, tests, matrix, residency and snapshot checks.
+These local checks do not replace Docker integration, ASan/TSan or production validation.
+
 ## Insert allocation reuse {#upsert-insert-allocation-reuse}
 
 Winner lookups retain a bounded set of 1,024 key, slice, status and pinned-value slots for
