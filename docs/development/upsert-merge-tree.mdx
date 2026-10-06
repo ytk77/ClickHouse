@@ -245,6 +245,67 @@ row zero and every 65,536 rows. Both inserts and partition imports pass their qu
 These checks do not preempt key encoding, a native write or an individual hash-table operation.
 The database lookup batch remains 1,024 keys and the foreground state budgets remain unchanged.
 
+## Local insert optimization validation {#upsert-local-insert-optimization-validation}
+
+The instrumentation, optional SST omission, allocation reuse and hash fold were landed as
+four separate commits ending at `40df6ff3d7d`. The measured final binary was built from the
+working tree before that commit; its engine source hashes match the committed implementation.
+Its SHA256 is `b6c60c7d6d7d02bad5765805601094ecf905686723ac6cb8f4280cdcb672b48d`.
+Git metadata stamping and documentation are not insert performance measurements.
+
+The final local adapter run passed 241 focused C++ tests (three remain disabled),
+46 integration cases and 19 SQL/shell cases. Six fixed-input persistence fixtures per binary
+compared unversioned, `UInt64` and `DateTime64` versions at both input targets: logical contents,
+raw column-file hashes, decoded lineage and selected winner, mask, authorization and token
+fields matched the baseline after remapping operation identities to physical part names.
+The SST gate separately covered recovery and verification, authorized-temporary token retry,
+partition transfers and imports, and `FREEZE`/offline-copy/attach in both directions against
+`27d0e2bf34f`, including a new-to-old-to-new round trip.
+
+The bulk fixture uses 262,144 rows with `id UInt64`, `v UInt64` and 256-byte strings; a 512 MiB
+setting is the unit target, not the size of this input. Five measured warm repetitions follow
+one warmup. A separate fixture first consolidated 1 GiB insert units into a 4,120,000,000-byte
+uncompressed source and a tail, with 1,250,000 rows in total, under explicit 64 GiB server and
+background ceilings. Before each update it restored the same starting snapshot. Each of the
+four binaries passed 24 count, uniqueness and version-sum checks plus native checksums.
+
+Median client wall times in seconds:
+
+| Fixture | Baseline | Final candidate |
+| --- | ---: | ---: |
+| Warm bulk, 512 MiB target, fresh keys | 1.229 | 0.897 |
+| Warm bulk, 512 MiB target, 90 percent updates | 1.396 | 0.992 |
+| Large source, 32 MiB target, 10 percent updates | 0.882 | 0.830 |
+| Large source, 32 MiB target, 90 percent updates | 7.850 | 6.763 |
+| Large source, 512 MiB target, 10 percent updates | 0.973 | 0.734 |
+| Large source, 512 MiB target, 90 percent updates | 8.337 | 7.411 |
+
+The concurrent rerun rotated baseline, allocation-only and final binaries within each round,
+restored an identical blank server snapshot, and ran 16 inserters with a 20 Hz `SELECT` reader.
+It passed 9,792 inserts. Excluding the first round leaves 33 paired rounds and 528 inserts per
+binary in each of six cells (32/512 MiB targets, fresh/10/90 percent updates). Individual
+inserts in this matrix are smaller than 32 MiB; it does not certify concurrent large-unit memory.
+The median of paired within-round median latency ratios was 0.838–0.941 against baseline,
+with all six 95 percent confidence intervals below parity. Bootstrap resampling retained
+whole paired rounds and their 16 correlated inserts; individual inserts were not treated as
+independent samples. Group throughput excludes the reader's final completion time.
+
+The hash step reduces fold work, including 16,384-row inputs, but its incremental concurrent
+median improvement over allocation reuse is not established. Against allocation reuse,
+32 MiB fresh pooled p95 had a latency ratio of 1.051 (95 percent CI 1.002–1.081), and the
+10 percent update point was 1.090 (CI 0.988–1.179). These did not exceed the agreed alarm of
+a confidence-interval lower bound above 1.05. Descriptive p99 in the 32 MiB/10 percent cell
+was 154 ms client wall time versus 144 ms baseline and 131 ms allocation-only; its p95
+interval included parity. The serialized commit lock remains the concurrency bottleneck.
+
+All baseline-to-final `SELECT` p95 intervals included parity, including the 512 MiB/10 percent
+point of 60.6 versus 51.1 ms. No query or sampled server memory comparison exceeded the
+10 percent alarm; sampling can miss brief server peaks. Advisory-cold wall times were mixed,
+although fold-stage time fell in every measured cell. These are local, single-host measurements;
+they establish neither production throughput nor memory or tail-latency certification, and do
+not replace Docker, ASan or TSan validation. Independent read-only review accepted the code
+and this interpretation without rerunning the test suites.
+
 ## Incremental materialized views {#upsert-incremental-materialized-views}
 
 An `UpsertMergeTree` table can be the source of an incremental materialized view:
