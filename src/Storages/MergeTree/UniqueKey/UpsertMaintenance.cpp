@@ -775,8 +775,7 @@ void StorageMergeTree::runUpsertMaintenance()
             thread_group->memory_tracker.setMetric(CurrentMetrics::UpsertMaintenanceMemoryTracking);
             SCOPE_EXIT({
                 ProfileEvents::increment(ProfileEvents::UpsertMaintenancePeakMemoryBytes, thread_group->memory_tracker.getPeak());
-                background_memory_tracker.adjustOnBackgroundTaskEnd(&thread_group->memory_tracker);
-                CurrentMetrics::sub(CurrentMetrics::UpsertMaintenanceMemoryTracking, thread_group->memory_tracker.get());
+                /// `MemoryTracker` destruction settles background usage and its metric together.
             });
             ThreadGroupSwitcher switcher(thread_group, ThreadName::MERGE_MUTATE, /*allow_existing_group=*/true);
             ProfileEvents::increment(ProfileEvents::UpsertMaintenanceRewritesStarted);

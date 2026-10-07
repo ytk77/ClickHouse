@@ -99,12 +99,11 @@ protected:
         rocksdb::Options options;
         options.avoid_flush_during_shutdown = true;
         options.track_and_verify_wals = true;
-        rocksdb::DB * raw = nullptr;
+        std::unique_ptr<rocksdb::DB> database;
         const auto path = directory / "upsert_state_v2";
-        const auto status = rocksdb::DB::Open(options, path.string(), &raw);
+        const auto status = rocksdb::DB::Open(options, path.string(), &database);
         if (!status.ok())
             throw std::runtime_error(status.ToString());
-        std::unique_ptr<rocksdb::DB> database(raw);
         std::filesystem::path wal;
         for (const auto & entry : std::filesystem::directory_iterator(path))
             if (entry.path().extension() == ".log" && entry.path() > wal)
@@ -279,9 +278,8 @@ TEST_F(UpsertDiskStateTest, RecoveryRejectsVisibleOutputWithoutDurableProgress)
         auto first = store.prepareMerge("p", authorization, {output[0]}, {source.record.final_name}, {}, false, &input, false);
         commit(store, first);
     }
-    rocksdb::DB * raw = nullptr;
-    ASSERT_TRUE(rocksdb::DB::Open(rocksdb::Options{}, (directory / "upsert_state_v2").string(), &raw).ok());
-    std::unique_ptr<rocksdb::DB> database(raw);
+    std::unique_ptr<rocksdb::DB> database;
+    ASSERT_TRUE(rocksdb::DB::Open(rocksdb::Options{}, (directory / "upsert_state_v2").string(), &database).ok());
     String progress;
     {
         WriteBufferFromString out(progress);
@@ -310,9 +308,8 @@ TEST_F(UpsertDiskStateTest, TruncateRemovesInterruptedOutputProgress)
         store.publish(truncated);
         EXPECT_EQ(store.authorizedPartCount(), 0);
     }
-    rocksdb::DB * raw = nullptr;
-    ASSERT_TRUE(rocksdb::DB::Open(rocksdb::Options{}, (directory / "upsert_state_v2").string(), &raw).ok());
-    std::unique_ptr<rocksdb::DB> database(raw);
+    std::unique_ptr<rocksdb::DB> database;
+    ASSERT_TRUE(rocksdb::DB::Open(rocksdb::Options{}, (directory / "upsert_state_v2").string(), &database).ok());
     std::unique_ptr<rocksdb::Iterator> iterator(database->NewIterator(rocksdb::ReadOptions{}));
     iterator->Seek("B");
     EXPECT_FALSE(iterator->Valid() && iterator->key().starts_with("B"));
@@ -388,9 +385,8 @@ TEST_F(UpsertDiskStateTest, RetirementOmitsHistoricalKillsBeyondTheStateBatchBud
         auto retirement = merge(store, {}, {seed_name});
         commit(store, retirement);
     }
-    rocksdb::DB * raw = nullptr;
-    ASSERT_TRUE(rocksdb::DB::Open(rocksdb::Options{}, (directory / "upsert_state_v2").string(), &raw).ok());
-    std::unique_ptr<rocksdb::DB> database(raw);
+    std::unique_ptr<rocksdb::DB> database;
+    ASSERT_TRUE(rocksdb::DB::Open(rocksdb::Options{}, (directory / "upsert_state_v2").string(), &database).ok());
     for (const auto & source : sources)
     {
         String payload;
@@ -455,9 +451,8 @@ TEST_F(UpsertDiskStateTest, AttachStateCreatedWithoutWalTracking)
     rocksdb::Options options;
     options.create_if_missing = true;
     options.avoid_flush_during_shutdown = true;
-    rocksdb::DB * raw = nullptr;
-    ASSERT_TRUE(rocksdb::DB::Open(options, path.string(), &raw).ok());
-    std::unique_ptr<rocksdb::DB> database(raw);
+    std::unique_ptr<rocksdb::DB> database;
+    ASSERT_TRUE(rocksdb::DB::Open(options, path.string(), &database).ok());
     rocksdb::WriteBatch batch;
     batch.Put("identity", "upsert_disk_state_v2:" + objectName(incarnation));
     batch.Put("part_count", String(8, '\0'));
@@ -489,9 +484,8 @@ TEST_F(UpsertDiskStateTest, TruncatedPredecessorWalFailsClosed)
     options.write_buffer_size = 64U << 10;
     options.max_write_buffer_number = 4;
     const auto path = directory / "upsert_state_v2";
-    rocksdb::DB * raw = nullptr;
-    ASSERT_TRUE(rocksdb::DB::Open(options, path.string(), &raw).ok());
-    std::unique_ptr<rocksdb::DB> database(raw);
+    std::unique_ptr<rocksdb::DB> database;
+    ASSERT_TRUE(rocksdb::DB::Open(options, path.string(), &database).ok());
     ASSERT_TRUE(database->PauseBackgroundWork().ok());
     rocksdb::WriteOptions write;
     write.sync = true;
@@ -862,9 +856,8 @@ TEST_F(UpsertDiskStateTest, EmptyRetirementNeverAuthorizesDeletingTheTableDirect
         commit(store, first);
     }
     {
-        rocksdb::DB * raw = nullptr;
-        ASSERT_TRUE(rocksdb::DB::Open(rocksdb::Options{}, (directory / "upsert_state_v2").string(), &raw).ok());
-        std::unique_ptr<rocksdb::DB> database(raw);
+        std::unique_ptr<rocksdb::DB> database;
+        ASSERT_TRUE(rocksdb::DB::Open(rocksdb::Options{}, (directory / "upsert_state_v2").string(), &database).ok());
         rocksdb::WriteOptions options;
         options.sync = true;
         ASSERT_TRUE(database->Put(options, "R", encodePartCommit({})).ok());
@@ -1071,9 +1064,8 @@ TEST_F(UpsertDiskStateTest, TruncateCompactionReclaimsUnpinnedStateBeforeReload)
         commit(store, part);
     }
     {
-        rocksdb::DB * raw = nullptr;
-        ASSERT_TRUE(rocksdb::DB::Open(rocksdb::Options{}, (directory / "upsert_state_v2").string(), &raw).ok());
-        std::unique_ptr<rocksdb::DB> database(raw);
+        std::unique_ptr<rocksdb::DB> database;
+        ASSERT_TRUE(rocksdb::DB::Open(rocksdb::Options{}, (directory / "upsert_state_v2").string(), &database).ok());
         /// Establish actual old SSTs, so cleanup cannot pass by dropping only memtable entries.
         ASSERT_TRUE(database->Flush(rocksdb::FlushOptions{}).ok());
         rocksdb::TablePropertiesCollection properties;
@@ -1097,9 +1089,8 @@ TEST_F(UpsertDiskStateTest, TruncateCompactionReclaimsUnpinnedStateBeforeReload)
         EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::UpsertTruncateCompactions] - before, 1);
     }
     {
-        rocksdb::DB * raw = nullptr;
-        ASSERT_TRUE(rocksdb::DB::Open(rocksdb::Options{}, (directory / "upsert_state_v2").string(), &raw).ok());
-        std::unique_ptr<rocksdb::DB> database(raw);
+        std::unique_ptr<rocksdb::DB> database;
+        ASSERT_TRUE(rocksdb::DB::Open(rocksdb::Options{}, (directory / "upsert_state_v2").string(), &database).ok());
         rocksdb::TablePropertiesCollection properties;
         ASSERT_TRUE(database->GetPropertiesOfAllTables(&properties).ok());
         UInt64 entries = 0;
@@ -1181,9 +1172,8 @@ TEST_F(UpsertDiskStateTest, InvalidTruncateCompactionMarkerFailsClosed)
     {
         StateStore store(directory, incarnation, false, true);
     }
-    rocksdb::DB * raw = nullptr;
-    ASSERT_TRUE(rocksdb::DB::Open(rocksdb::Options{}, (directory / "upsert_state_v2").string(), &raw).ok());
-    std::unique_ptr<rocksdb::DB> database(raw);
+    std::unique_ptr<rocksdb::DB> database;
+    ASSERT_TRUE(rocksdb::DB::Open(rocksdb::Options{}, (directory / "upsert_state_v2").string(), &database).ok());
     ASSERT_TRUE(database->Put(rocksdb::WriteOptions{}, "truncate_compaction_pending", "invalid").ok());
     database.reset();
     try
@@ -1416,9 +1406,8 @@ TEST_F(UpsertDiskStateTest, InventoryCorruptionCannotAuthorizeMetadata)
         identity = objectName(part.record.part);
         commit(store, part);
     }
-    rocksdb::DB * raw = nullptr;
-    ASSERT_TRUE(rocksdb::DB::Open(rocksdb::Options{}, (directory / "upsert_state_v2").string(), &raw).ok());
-    std::unique_ptr<rocksdb::DB> database(raw);
+    std::unique_ptr<rocksdb::DB> database;
+    ASSERT_TRUE(rocksdb::DB::Open(rocksdb::Options{}, (directory / "upsert_state_v2").string(), &database).ok());
     ASSERT_TRUE(database->Put(rocksdb::WriteOptions{}, "V" + identity, "forged").ok());
     database.reset();
     try
@@ -1444,9 +1433,8 @@ TEST_F(UpsertDiskStateTest, LegacyInventoryIsEstablishedOnlyAfterFullVerificatio
         identity = objectName(part.record.part);
         commit(store, part);
     }
-    rocksdb::DB * raw = nullptr;
-    ASSERT_TRUE(rocksdb::DB::Open(rocksdb::Options{}, (directory / "upsert_state_v2").string(), &raw).ok());
-    std::unique_ptr<rocksdb::DB> database(raw);
+    std::unique_ptr<rocksdb::DB> database;
+    ASSERT_TRUE(rocksdb::DB::Open(rocksdb::Options{}, (directory / "upsert_state_v2").string(), &database).ok());
     ASSERT_TRUE(database->Delete(rocksdb::WriteOptions{}, "V" + identity).ok());
     database.reset();
     const auto full_before = ProfileEvents::global_counters[ProfileEvents::UpsertRecoveryParts];

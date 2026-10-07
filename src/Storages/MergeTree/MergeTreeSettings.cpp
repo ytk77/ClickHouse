@@ -67,7 +67,8 @@ For outstanding retries from a build with 32 MiB units, explicitly retain 335544
 A preparation exceeding the 128 MiB pending-column budget runs alone within its sink.
 This is not a query memory limit; sorting, indexes and concurrent inserts need additional memory.
 Can be changed with `ALTER TABLE ... MODIFY SETTING`. Does not change background or mutation targets.
-)", 0) \
+)", 0, \
+        {"26.8.1.1", 33554432, 536870912, "Make the `UpsertMergeTree` insert target configurable and increase its default to 512 MiB."}) \
     DECLARE(UInt64, upsert_maintenance_target_bytes, 4ULL << 30, R"(
 Target uncompressed physical column bytes per background `UpsertMergeTree` rewrite part.
 Default: 4 GiB.
@@ -78,44 +79,55 @@ Allowed range: 32 MiB to 8 GiB. Physical row and lineage limits can split output
 Winner relocation uses bounded state batches independently of the physical part size.
 Larger targets increase rewrite memory and temporary disk usage. Does not change insert units.
 Can be changed with `ALTER TABLE ... MODIFY SETTING`.
-)", 0) \
+)", 0, \
+        {"26.8.1.1", 268435456, 4294967296ULL, "Increase the default background rewrite target for `UpsertMergeTree` to 4 GiB to reduce part counts."}, \
+        {"26.8", 33554432, 268435456, "Increase the default background rewrite target for `UpsertMergeTree` to 256 MiB to reduce part counts."}) \
     DECLARE(UInt64, upsert_index_cache_bytes, 64ULL << 20, R"(
 Resource limit for the 64 MiB block cache in `UpsertMergeTree`. Applied when the table opens.
 No query or database setting is required. `ALTER` of this setting is not supported.
-)", 0) \
+)", 0, \
+        {"26.8", 64ULL << 20, 64ULL << 20, "New resource setting for `UpsertMergeTree`."}) \
     DECLARE(UInt64, upsert_write_buffer_bytes, 16ULL << 20, R"(
 Resource limit for the 16 MiB write buffer in `UpsertMergeTree`. Applied when the table opens.
 No query or database setting is required. `ALTER` of this setting is not supported.
-)", 0) \
+)", 0, \
+        {"26.8", 16ULL << 20, 16ULL << 20, "New resource setting for `UpsertMergeTree`."}) \
     DECLARE(UInt64, upsert_write_buffer_count, 3, R"(
 Resource limit for the write buffer count in `UpsertMergeTree`. Applied when the table opens.
 No query or database setting is required. `ALTER` of this setting is not supported.
-)", 0) \
+)", 0, \
+        {"26.8", 3, 3, "New resource setting for `UpsertMergeTree`."}) \
     DECLARE(UInt64, upsert_wal_bytes, 64ULL << 20, R"(
 Resource limit for the WAL byte budget in `UpsertMergeTree`. Applied when the table opens.
 No query or database setting is required. `ALTER` of this setting is not supported.
-)", 0) \
+)", 0, \
+        {"26.8", 64ULL << 20, 64ULL << 20, "New resource setting for `UpsertMergeTree`."}) \
     DECLARE(UInt64, upsert_background_jobs, 2, R"(
 Resource limit for the background jobs in `UpsertMergeTree`. Applied when the table opens.
 No query or database setting is required. `ALTER` of this setting is not supported.
-)", 0) \
+)", 0, \
+        {"26.8", 2, 2, "New resource setting for `UpsertMergeTree`."}) \
     DECLARE(UInt64, upsert_max_open_files, 128, R"(
 Resource limit for the open file budget in `UpsertMergeTree`. Applied when the table opens.
 No query or database setting is required. `ALTER` of this setting is not supported.
-)", 0) \
+)", 0, \
+        {"26.8", 128, 128, "New resource setting for `UpsertMergeTree`."}) \
     DECLARE(UInt64, upsert_recovery_threads, 4, R"(
 Resource limit for the parallel recovery workers in `UpsertMergeTree`. Applied when the table opens.
 No query or database setting is required. `ALTER` of this setting is not supported.
-)", 0) \
+)", 0, \
+        {"26.8", 4, 4, "New resource setting for `UpsertMergeTree`."}) \
     DECLARE(UInt64, upsert_mask_cache_bytes, 32ULL << 20, R"(
 Maximum retained decoded visibility mask cache bytes per `UpsertMergeTree` table.
 Zero disables the cache. Readers can retain evicted immutable masks until their query finishes.
 Applied when the table opens.
-)", 0) \
+)", 0, \
+        {"26.8", 32ULL << 20, 32ULL << 20, "New resource setting for `UpsertMergeTree`."}) \
     DECLARE(Bool, upsert_partitioned_filters, true, R"(
 Use partitioned `RocksDB` index and Bloom filters in `UpsertMergeTree`.
 Applied when the table opens; this does not change the commit or durability protocol.
-)", 0) \
+)", 0, \
+        {"26.8", true, true, "New setting for `UpsertMergeTree`."}) \
     DECLARE(UInt64, min_compress_block_size, 0, R"(
 Minimum size of blocks of uncompressed data required for compression when
 writing the next mark. You can also specify this setting in the global settings

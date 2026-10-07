@@ -284,6 +284,7 @@ namespace Setting
     extern const SettingsUInt64 dead_blobs_to_throw_insert;
     extern const SettingsUInt64 parts_to_delay_insert;
     extern const SettingsUInt64 parts_to_throw_insert;
+    extern const SettingsBool parallel_replicas_for_non_replicated_merge_tree;
     extern const SettingsBool enable_shared_storage_snapshot_in_query;
     extern const SettingsUInt64 merge_tree_storage_snapshot_sleep_ms;
     extern const SettingsUInt64 min_insert_block_size_rows;

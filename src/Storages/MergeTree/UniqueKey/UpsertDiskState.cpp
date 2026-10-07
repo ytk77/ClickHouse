@@ -794,9 +794,7 @@ DiskState::DiskState(const String & table_path, ObjectID incarnation, bool attac
         table_options.partition_filters = true;
     }
     options.table_factory.reset(rocksdb::NewBlockBasedTableFactory(table_options));
-    rocksdb::DB * database = nullptr;
-    check(rocksdb::DB::Open(options, path.string(), &database));
-    impl->database->db.reset(database);
+    check(rocksdb::DB::Open(options, path.string(), &impl->database->db));
     const auto identity = "upsert_disk_state_v2:" + objectName(incarnation);
     if (!attach)
     {

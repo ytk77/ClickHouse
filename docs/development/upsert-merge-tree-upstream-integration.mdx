@@ -72,5 +72,19 @@ Conflict resolution and source-interface inspection are source-level checks.
 The previously recorded build, unit, integration and performance results apply
 to the pre-merge binaries. They do not validate this merged revision.
 
-This merge has not been compiled, tested, packaged or deployed. It needs a new
-build and runtime validation before a production upgrade.
+The original merge was committed without a build. A compilation follow-up on
+`2026-10-07` repairs the upstream API integration and completes the `clickhouse`
+build with `Clang 21` in `build_release_concurrency_clang21_norust`.
+
+The follow-up restores `addSettingChangesHistory` and moves all 12 custom
+history records into the 11 setting declarations without changing their versions
+or values. It also adapts `StorageOverwriteCache::alter`, background schedule-pool
+access, `RocksDB` database ownership and background `MemoryTracker` settlement.
+The removed manual settlement is now handled by tracker destruction, including
+both background and maintenance metrics.
+
+The compilation fixes were reviewed read-only by `run-557a2072`. The existing
+`RocksDB` fixtures were adapted to the new ownership API but were not run.
+No runtime, integration or performance tests were run for this follow-up, and
+this revision has not been packaged or deployed. Runtime validation is still
+required before a production upgrade.
