@@ -324,18 +324,40 @@ void StorageMergeTree::startup()
 {
     if (merging_params.upsert)
     {
-        if (upsert_store->usesDiskState())
+        try
         {
-            upsert_verification_task = getContext()->getSchedulePool()->createTask(
-                getStorageID(), "UpsertMergeTree::verification", [this] { runUpsertVerification(); });
-            upsert_verification_task->activate();
-            upsert_verification_task->scheduleAfter(1000);
+            if (upsert_store->usesDiskState())
+            {
+                upsert_verification_task = getContext()->getSchedulePool()->createTask(
+                    getStorageID(), "UpsertMergeTree::verification", [this] { runUpsertVerification(); });
+                upsert_verification_task->activate();
+                upsert_verification_task->scheduleAfter(1000);
+            }
+            if (upsert_store->usesDiskState() && !isTableReadonly())
+            {
+                upsert_maintenance_task = getContext()->getSchedulePool()->createTask(
+                    getStorageID(), "UpsertMergeTree::maintenance", [this] { runUpsertMaintenance(); });
+                upsert_maintenance_task->activateAndSchedule();
+            }
+            if (!isTableReadonly())
+            {
+                /// `UpsertMergeTree` shares cleanup's worker gate while keeping its dedicated merge tasks.
+                enableBackgroundWorkers();
+                cleanup_thread.start();
+            }
         }
-        if (upsert_store->usesDiskState() && !isTableReadonly())
+        catch (...)
         {
-            upsert_maintenance_task = getContext()->getSchedulePool()->createTask(
-                getStorageID(), "UpsertMergeTree::maintenance", [this] { runUpsertMaintenance(); });
-            upsert_maintenance_task->activateAndSchedule();
+            /// Stop already activated tasks if a later `UpsertMergeTree` startup step fails.
+            try
+            {
+                shutdown(false);
+            }
+            catch (...)
+            {
+                std::terminate();
+            }
+            throw;
         }
         return;
     }
