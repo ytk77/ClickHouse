@@ -1,0 +1,76 @@
+---
+description: 'Source integration of the custom engines with the 2026-10-07 upstream ClickHouse development branch.'
+sidebarTitle: 'Upstream integration'
+slug: /development/upsert-merge-tree-upstream-integration
+title: 'Upstream integration of the custom engines'
+doc_type: 'reference'
+---
+
+# Upstream integration {#upstream-integration}
+
+## Source revisions {#source-revisions}
+
+This merge integrates upstream `master` as observed on 2026-10-07:
+
+- Custom branch parent: `efb63367d313c1e8f75b676ea7c235d4763a422d`.
+- Official parent: [`ccdfcc459119f6707d2dba3d3cfa624134530ba1`](https://github.com/ClickHouse/ClickHouse/commit/ccdfcc459119f6707d2dba3d3cfa624134530ba1).
+- Common ancestor: `52788b97733e3e3a54d3d1d6ec9dd41fb2eaa053`.
+
+The upstream version is `26.10.1.1-testing`. It is a development revision,
+not a stable release. The merge retains both parents and their histories.
+
+## Engine integration {#engine-integration}
+
+`UpsertMergeTree` keeps its own durable state, visibility snapshots, bounded
+winner lookups, retry tokens and maintenance path. The upstream bitmap
+transaction manager is constructed for ordinary `UNIQUE KEY` tables.
+
+The integration adapts projection analysis to the upstream query-condition-cache
+and TopK cache gates while passing the pinned `UpsertMergeTree` snapshot.
+Projection reads continue to require a parent part without hidden rows.
+Range estimation also carries that snapshot through the new upstream interface.
+
+`UpsertMergeTree` continues to write local `Full` part storage, including with
+settings that otherwise select packed storage. Its authenticated inventory and
+recovery operate on individual files in a local directory. Temporary directories
+use the upstream `claimTemporaryPartDirectory` lifecycle while retaining the
+`tmp_upsert_` names and fencing protection for ambiguously persisted payloads.
+
+The upstream `enable_unique_key` setting retains
+`allow_experimental_unique_key` as an alias. Ordinary `UNIQUE KEY` table definitions
+use the new setting and fresh-definition checks. `UpsertMergeTree` still accepts
+its required `UNIQUE KEY` clause without enabling that experimental setting.
+
+`OverwriteCache` retains its `KEYS` and lookup `INDEX` clauses. The new
+`ASTStorage::isEmpty` check accounts for these clauses, and tuple lookup
+extraction retains source types when converting date-family literals.
+
+The source defaults remain:
+
+| Setting | Default |
+|---|---|
+| `upsert_insert_target_bytes` | 512 MiB |
+| `upsert_maintenance_target_bytes` | 4 GiB, reduced when required by maintenance admission |
+| `upsert_index_cache_bytes` | 64 MiB per table |
+
+Winner lookup batches remain bounded at 1,024 keys. Synchronous insert routing for
+`UpsertMergeTree` destinations and materialized views is retained, with the new
+upstream queued-data tracker argument forwarded on the asynchronous path.
+
+## Native specification {#native-specification}
+
+Upstream moved the `Native` specification into developer documentation. This fork
+keeps the complete, updated specification at
+[`NativeFormat`](/interfaces/specs/NativeFormat), as required by its repository
+instructions. The upstream developer-documentation entry links to that canonical
+body. Its contents incorporate the upstream encodings and the existing synchronous
+insert behavior; this integration adds no custom `Native` wire fields.
+
+## Validation status {#validation-status}
+
+Conflict resolution and source-interface inspection are source-level checks.
+The previously recorded build, unit, integration and performance results apply
+to the pre-merge binaries. They do not validate this merged revision.
+
+This merge has not been compiled, tested, packaged or deployed. It needs a new
+build and runtime validation before a production upgrade.

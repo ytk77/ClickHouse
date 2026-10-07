@@ -56,6 +56,9 @@ xray-log.*
 # callgrind files
 callgrind.out.*
 
+# jemalloc heap profiles
+jeprof.*.heap
+
 # ignore kdevelop files
 *.kdev4
 *.kdev_include_paths
@@ -200,6 +203,10 @@ tests/casa_del_dolor/_instances*
 # Claude preferences
 .claude/*.local.*
 
+# fuzzer dictionary: generated from the sources by the fuzzing configure step,
+# overwritten from a release binary by tests/fuzz/update_dict.sh
+/tests/fuzz/all.dict
+
 # praktika test-mode HTML deploy artifacts (regenerated from json.html by infrastructure --test)
 ci/praktika/json_test.html
 ci/praktika/json_test.html.gz
@@ -211,3 +218,7 @@ ci/praktika/json.html.gz
 # Local CRM2 → VM `PLAYER_TAG_LONG` probe and `PLAYER_TAG_CACHE` stress-test artifacts.
 /tests/local_vm_concurrency/
 /tests/local_vm_rw_stress/
+
+# nvcomp is not redistributed here, it is unpacked into place - see
+# contrib/nvcomp-cmake/CMakeLists.txt
+/contrib/nvcomp

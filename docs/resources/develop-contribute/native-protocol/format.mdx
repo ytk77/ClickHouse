@@ -1,0 +1,17 @@
+---
+description: 'Specification of the ClickHouse Native columnar format: wire primitives, the Block and Column structure, every data type encoding, and the compression frame'
+sidebarTitle: 'Native Format'
+slug: /native-protocol/format
+title: 'Native Format'
+doc_type: 'reference'
+keywords: ['native format', 'columnar', 'block', 'wire format', 'serialization', 'compression']
+---
+
+# Native format specification {#native-format-specification}
+
+The complete `Native` wire specification is maintained in this fork at
+[`NativeFormat`](/interfaces/specs/NativeFormat). It includes the upstream `26.10`
+encodings and the synchronous insert behavior of `UpsertMergeTree`.
+
+For packet framing and version negotiation, see the
+[native protocol specification](/resources/develop-contribute/native-protocol/protocol).
