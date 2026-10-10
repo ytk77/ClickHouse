@@ -1,0 +1,5 @@
+<clickhouse><merge_tree>
+    <upsert_lineage_compression>0</upsert_lineage_compression>
+    <upsert_lineage_compact>0</upsert_lineage_compact>
+    <upsert_state_compression>0</upsert_state_compression>
+</merge_tree></clickhouse>

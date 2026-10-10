@@ -1,0 +1,8 @@
+<clickhouse>
+    <remote_servers>
+        <upsert_defaults>
+            <shard><replica><host>enabled</host><port>9000</port></replica></shard>
+            <shard><replica><host>disabled</host><port>9000</port></replica></shard>
+        </upsert_defaults>
+    </remote_servers>
+</clickhouse>

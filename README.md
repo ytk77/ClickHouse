@@ -76,7 +76,11 @@ winner without `FINAL`, including before background parts finish merging.
   for the RocksDB SST state by default. The effective `upsert_lineage_compression`,
   `upsert_lineage_compact`, and `upsert_state_compression` values are saved in the table metadata.
   Explicit table settings and server defaults take precedence; older table definitions are not
-  automatically opted in. Native column codecs retain their existing policy, and the `WAL` codec
+  automatically opted in. A CREATE query with `compatibility` below `26.10.1.1` does not inject
+  these defaults. Explicit opt-ins still work. The initiating server pins the effective values
+  before replicated or normalized cluster DDL; all hosts receive the same flags.
+  Old distributed-DDL formats pin only explicit engines; inherited engines use each host's defaults. Profile constraints still
+  apply and can reject creation. Native column codecs retain their existing policy, and the `WAL` codec
   is unchanged. New compressed parts cannot be read by older binaries; see the
   [disk-efficiency guide](docs/development/upsert-merge-tree-disk-efficiency.mdx).
 

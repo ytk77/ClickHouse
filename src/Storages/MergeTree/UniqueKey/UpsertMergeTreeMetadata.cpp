@@ -6,6 +6,10 @@
 #include <Interpreters/ExpressionActions.h>
 #include <Common/Exception.h>
 #include <Common/typeid_cast.h>
+#include <Common/ClickHouseVersion.h>
+#include <Parsers/ASTCreateQuery.h>
+#include <Parsers/ASTSetQuery.h>
+#include <Parsers/ASTFunction.h>
 
 namespace DB
 {
@@ -17,6 +21,7 @@ namespace MergeTreeSetting
     extern const MergeTreeSettingsUInt64 upsert_lineage_compression_level;
     extern const MergeTreeSettingsBool upsert_lineage_compression;
     extern const MergeTreeSettingsBool upsert_lineage_compact;
+    extern const MergeTreeSettingsBool upsert_state_compression;
     extern const MergeTreeSettingsUInt64 upsert_rewrite_state_reserve_bytes;
 }
 
@@ -43,6 +48,48 @@ bool supportedKeyType(const IDataType & type)
     }
     return false;
 }
+}
+
+void applyUpsertCreationCompressionDefaults(
+    ASTCreateQuery & create, const MergeTreeSettings & server_settings, const String & compatibility)
+{
+    auto * storage = create.is_materialized_view ? create.getTargetInnerEngine(ViewTarget::To) : create.storage;
+    if (!storage || !storage->engine || storage->engine->name != "UpsertMergeTree")
+        return;
+
+    /// Older `compatibility` must not introduce either a new payload format or unknown metadata settings.
+    if (!compatibility.empty() && ClickHouseVersion(compatibility) < ClickHouseVersion("26.10.1.1"))
+        return;
+
+    MergeTreeSettings settings(server_settings);
+    const auto names = {"upsert_lineage_compression", "upsert_lineage_compact", "upsert_state_compression"};
+    if (storage->settings)
+    {
+        for (const auto * name : names)
+        {
+            if (const auto * value = storage->settings->changes.tryGet(name))
+                settings.set(name, *value);
+        }
+    }
+
+    if (!settings[MergeTreeSetting::upsert_lineage_compression].changed)
+        settings.set("upsert_lineage_compression", true);
+    if (!settings[MergeTreeSetting::upsert_lineage_compact].changed)
+        settings.set("upsert_lineage_compact", settings[MergeTreeSetting::upsert_lineage_compression].value);
+    if (!settings[MergeTreeSetting::upsert_state_compression].changed)
+        settings.set("upsert_state_compression", true);
+
+    if (!storage->settings)
+    {
+        auto settings_ast = make_intrusive<ASTSetQuery>();
+        settings_ast->is_standalone = false;
+        storage->set(storage->settings, settings_ast);
+    }
+    for (const auto * name : names)
+    {
+        if (!storage->settings->changes.tryGet(name))
+            storage->settings->changes.push_back(SettingChange{name, settings.get(name)});
+    }
 }
 
 void validateUpsertMergeTreeMetadata(

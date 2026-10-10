@@ -50,6 +50,7 @@
 #include <Storages/MaterializedView/RefreshSet.h>
 #include <Storages/MaterializedView/RefreshTask.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
+#include <Storages/MergeTree/UniqueKey/UpsertMergeTreeMetadata.h>
 #include <Storages/StorageAlias.h>
 #include <Storages/StorageFactory.h>
 #include <Storages/StorageProxy.h>
@@ -132,6 +133,7 @@ namespace Setting
     extern const SettingsBool allow_materialized_view_with_bad_select;
     extern const SettingsBool compatibility_ignore_collation_in_create_table;
     extern const SettingsBool compatibility_ignore_auto_increment_in_create_table;
+    extern const SettingsString compatibility;
     extern const SettingsBool create_if_not_exists;
     extern const SettingsFloat create_replicated_merge_tree_fault_injection_probability;
     extern const SettingsBool database_atomic_wait_for_drop_and_detach_synchronously;
@@ -2096,6 +2098,15 @@ BlockIO InterpreterCreateQuery::createTable(ASTCreateQuery & create)
     /// Set and retrieve list of columns, indices and constraints. Set table engine if needed. Rewrite query in canonical way.
     TableProperties properties = getTablePropertiesAndNormalizeCreateQuery(create, mode);
 
+    /// Pin `UpsertMergeTree` defaults before the `Replicated` database enqueues this definition.
+    /// Replayed metadata and `RESTORE` must use their stored values, including absent legacy flags.
+    if (mode == LoadingStrictnessLevel::CREATE && !create.attach && !is_restore_from_backup
+        && !getContext()->isRecoveryFromStoredMetadata())
+    {
+        applyUpsertCreationCompressionDefaults(
+            create, getContext()->getMergeTreeSettings(), getContext()->getSettingsRef()[Setting::compatibility]);
+    }
+
     /// The definition persisted below must not depend on the session setting, because reloads and
     /// replicas re-derive the key type from the stored text. This must happen after normalization:
     /// `CREATE TABLE ... AS` materializes copied columns and key expressions only there. A replayed
@@ -3718,6 +3729,13 @@ void InterpreterCreateQuery::prepareOnClusterQuery(ASTCreateQuery & create, Cont
 
 BlockIO InterpreterCreateQuery::executeQueryOnCluster(ASTCreateQuery & create)
 {
+    /// Older distributed DDL formats do not normalize on the initiator. Pin explicit
+    /// `UpsertMergeTree` engines without resolving sources that may exist only on other hosts.
+    if (!create.attach && !is_restore_from_backup && !getContext()->isRecoveryFromStoredMetadata())
+    {
+        applyUpsertCreationCompressionDefaults(
+            create, getContext()->getMergeTreeSettings(), getContext()->getSettingsRef()[Setting::compatibility]);
+    }
     prepareOnClusterQuery(create, getContext(), create.cluster);
     DDLQueryOnClusterParams params;
     params.access_to_check = getRequiredAccess();

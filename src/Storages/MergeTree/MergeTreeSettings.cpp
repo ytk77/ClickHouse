@@ -58,6 +58,8 @@ namespace ErrorCodes
     DECLARE(Bool, upsert_state_compression, false, R"(
 Use `ZSTD(1)` for upper `RocksDB` levels and `ZSTD(3)` for bottommost state blocks in `UpsertMergeTree`.
 New `CREATE TABLE` definitions using `UpsertMergeTree` enable this setting unless explicitly overridden.
+The effective CREATE query `compatibility` below `26.10.1.1` suppresses this creation default, without adding metadata settings.
+Explicit table settings and server `<merge_tree>` settings take precedence. The initiator persists the effective value before distributed DDL.
 Stored definitions without the setting retain the false default. Applied when the table opens; `ALTER` is not supported.
 Existing blocks keep their codec until normal compaction rewrites them. Compaction requires temporary disk space.
 This does not change state records, durability or the 64 MiB index-cache default.
@@ -78,6 +80,8 @@ Changes apply to new parts and do not change the decoded format or rewrite exist
     DECLARE(Bool, upsert_lineage_compact, false, R"(
 Store complete unique keys and columnar row metadata in new compressed `UpsertMergeTree` lineage sidecars.
 New `CREATE TABLE` definitions using `UpsertMergeTree` enable this setting when lineage compression is enabled, unless explicitly overridden.
+The effective CREATE query `compatibility` below `26.10.1.1` suppresses this creation default, without adding metadata settings.
+Explicit table settings and server `<merge_tree>` settings take precedence. The initiator persists the effective value before distributed DDL.
 Stored definitions without the setting retain the false default. Requires `upsert_lineage_compression`. Logical row, lineage and state budgets stay unchanged.
 Existing parts are not modified in place. Older compressed-lineage readers reject the new inner format.
 Can be changed with `ALTER TABLE ... MODIFY SETTING`. Take a backup before enabling.
@@ -86,6 +90,8 @@ Can be changed with `ALTER TABLE ... MODIFY SETTING`. Take a backup before enabl
     DECLARE(Bool, upsert_lineage_compression, false, R"(
 Write new `UpsertMergeTree` lineage sidecars as `UMPROW03` with bounded `ZSTD(1)` frames.
 New `CREATE TABLE` definitions using `UpsertMergeTree` enable this setting unless explicitly overridden.
+The effective CREATE query `compatibility` below `26.10.1.1` suppresses this creation default, without adding metadata settings.
+Explicit table settings and server `<merge_tree>` settings take precedence. The initiator persists the effective value before distributed DDL.
 Stored definitions without the setting retain the false default. Existing parts are not changed in place. The decoded row and state limits remain unchanged.
 Enabling creates a downgrade barrier: older binaries cannot read new sidecars. Disabling does not convert them back.
 Can be changed with `ALTER TABLE ... MODIFY SETTING`. Take a backup before enabling on an existing table.

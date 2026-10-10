@@ -1,0 +1,17 @@
+<clickhouse>
+    <profiles>
+        <default><allow_experimental_unique_key>1</allow_experimental_unique_key><async_insert>0</async_insert></default>
+        <compression_limited>
+            <allow_experimental_unique_key>1</allow_experimental_unique_key><async_insert>0</async_insert>
+            <constraints>
+                <merge_tree_upsert_lineage_compression><max>0</max></merge_tree_upsert_lineage_compression>
+                <merge_tree_upsert_lineage_compact><max>0</max></merge_tree_upsert_lineage_compact>
+                <merge_tree_upsert_state_compression><max>0</max></merge_tree_upsert_state_compression>
+            </constraints>
+        </compression_limited>
+    </profiles>
+    <users><compression_limited>
+        <password></password><networks><ip>::/0</ip></networks>
+        <profile>compression_limited</profile><quota>default</quota>
+    </compression_limited></users>
+</clickhouse>

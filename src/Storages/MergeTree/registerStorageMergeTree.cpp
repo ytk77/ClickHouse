@@ -86,9 +86,6 @@ namespace MergeTreeSetting
     extern const MergeTreeSettingsString primary_key_compression_codec;
     extern const MergeTreeSettingsString storage_policy;
     extern const MergeTreeSettingsBool table_readonly;
-    extern const MergeTreeSettingsBool upsert_lineage_compression;
-    extern const MergeTreeSettingsBool upsert_lineage_compact;
-    extern const MergeTreeSettingsBool upsert_state_compression;
 }
 
 namespace ServerSetting
@@ -991,26 +988,6 @@ static StoragePtr create(const StorageFactory::Arguments & args)
         storage_settings->loadFromQuery(
             *args.storage_def, args.getLocalContext(), isLoadingFromExistingMetadata(args.mode),
             args.table_id.database_name == DatabaseCatalog::SYSTEM_DATABASE);
-
-        if (merging_params.upsert && args.mode == LoadingStrictnessLevel::CREATE)
-        {
-            /// Enable compression for new `UpsertMergeTree` tables without changing stored definitions.
-            /// Explicit table settings and server defaults take precedence.
-            if (!(*storage_settings)[MergeTreeSetting::upsert_lineage_compression].changed)
-                storage_settings->set("upsert_lineage_compression", true);
-            if (!(*storage_settings)[MergeTreeSetting::upsert_lineage_compact].changed)
-                storage_settings->set("upsert_lineage_compact", (*storage_settings)[MergeTreeSetting::upsert_lineage_compression].value);
-            if (!(*storage_settings)[MergeTreeSetting::upsert_state_compression].changed)
-                storage_settings->set("upsert_state_compression", true);
-
-            /// Persist the effective values so restarts and unrelated `ALTER` operations retain them.
-            auto & changes = args.storage_def->settings->changes;
-            for (const auto * name : {"upsert_lineage_compression", "upsert_lineage_compact", "upsert_state_compression"})
-            {
-                if (!changes.tryGet(name))
-                    changes.push_back(SettingChange{name, storage_settings->get(name)});
-            }
-        }
 
         /// What this query changes from the settings the server has in effect, which already include the
         /// `merge_tree` config section and `compatibility`: those are not changes made by the query. A
