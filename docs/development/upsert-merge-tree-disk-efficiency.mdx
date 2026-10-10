@@ -1,0 +1,177 @@
+---
+description: 'Compressed lineage, state compression and disk admission for bulk inserts into UpsertMergeTree.'
+sidebarTitle: 'UpsertMergeTree disk efficiency'
+slug: /development/upsert-merge-tree-disk-efficiency
+title: 'UpsertMergeTree disk efficiency'
+doc_type: 'guide'
+---
+
+# `UpsertMergeTree` disk efficiency {#upsert-disk-efficiency}
+
+## Scope and target {#disk-efficiency-scope}
+
+This change implements optional compressed and compact lineage, state compression, diagnostic-log rotation and disk admission. The goal is total disk occupancy at most 1.3 times a matched `ReplacingMergeTree` table during bulk ingestion. That goal is not yet certified. Compression flags default to false; there is no automatic rewrite of every existing part and no production configuration change.
+
+The changes preserve full-key equality, version and ordinal winner selection, retry hashes, authenticated immutable payloads, synchronous state durability and read snapshots. They do not change the 1,024-key lookup batch, the insert-unit boundaries or the `WAL` codec.
+
+## Inspection and comparison limits {#disk-efficiency-observations}
+
+The October 9 inspection of `ENIGMA.EVENT_merged` reported:
+
+| Category | Reported allocation |
+| --- | ---: |
+| Entire table directory | 1,038.79 GiB |
+| `upsert_rows.bin` | 576.421 GiB |
+| Column files | 302.143 GiB |
+| State `.sst` files | 121.499 GiB |
+| Other metadata and indexes | 34.557 GiB |
+| Diagnostic `LOG` | 1.022 GiB |
+
+There were 6,192,349,182 physical rows and 604,316 active parts. Derived from these allocation totals, lineage occupied about 55.5 percent of the directory and about 100 bytes per physical row. These were observations at different times, not an atomic filesystem snapshot.
+
+A subsequent read-only connection found the clone fenced after an `ENOSPC` state write. No table was altered, unfenced, restarted or cleaned remotely. `ENIGMA.EVENT_dedup` held 9,820,896,986 physical rows and used `LowCardinality(String)` for `EVENT`, whereas the upsert copy used `String`. The populations and schemas differ, so their raw directory ratio cannot certify the target. A comparison must use identical source rows, keys, schema, codecs and retention.
+
+## Compressed lineage {#disk-efficiency-compressed-lineage}
+
+### Settings and compatibility {#disk-efficiency-lineage-settings}
+
+For a new table, combine its normal `UpsertMergeTree` definition with:
+
+```sql
+SETTINGS
+    upsert_lineage_compression = 1,
+    upsert_lineage_compression_level = 1,
+    upsert_lineage_compact = 1,
+    upsert_state_compression = 1
+```
+
+`upsert_lineage_compression` defaults to false. `upsert_lineage_compression_level` accepts 1 through 9 and defaults to 1. `upsert_lineage_compact` also defaults to false and requires `upsert_lineage_compression`. All three lineage settings support settings-only `ALTER`; the writer captures them together for each part. `CREATE`, `ALTER` and `ATTACH` reject compact lineage without compression. A server default enabling only compact lineage can therefore prevent existing upsert tables from attaching. A higher level changes compression effort and size, not the stored format or decoder. Level 6 is a measurement candidate rather than a production recommendation: large maintenance outputs incur additional CPU and compressor memory.
+
+New writes with compression enabled produce `UMPROW03`. Legacy `UMPROW01` and `UMPROW02` remain readable. Previously healthy large parts are not automatically selected just to change compression; only new inserts and rewrites already selected for consolidation, masks, expiration or mutations convert.
+
+Enabling the writer creates a downgrade barrier. Older binaries cannot decode `UMPROW03`; source decoding fails closed with `CORRUPTED_DATA` and the existing fence. Retain a pre-enable backup. Turning the setting off changes future writes and does not convert existing compressed files back. Builds that understand `UMPROW03` but only inner format 0 also reject compact inner format 1 and fence on source decoding; compact lineage adds a separate downgrade barrier.
+
+### Stored envelope and authentication {#disk-efficiency-lineage-format}
+
+The 32-byte `UMPROW03` header contains the magic, envelope version, codec, inner-format identifier, flags, row count, decoded size, reserved bytes and a header CRC. It is followed by standard ClickHouse compression frames with at most 1 MiB of decoded bytes each. Inner format 0 decodes to exactly the existing `UMPROW01` or `UMPROW02` serialization, including its CRC. Inner format 1 decodes to `UMPCOL01`: a 16-byte magic/count/CRC envelope, all full keys with their length framing, then columns of row flags, operation identifiers, ordinals and CSNs. Versions are stored only for rows whose flags indicate a version. Physical row offsets are implicit. There is no key elision or state-format change.
+
+The compact payload removes exactly 13 bytes per row: the legacy value length, value magic, value format version and row offset. Its logical legacy size is therefore decoded payload size plus 13 times the row count. Both inner formats require zero reserved bytes. Readers validate this derived logical size before allocation and parse compact columns directly without constructing an expanded legacy string. The writer uses `ZSTD`; the reader allows `ZSTD`, `LZ4` and `NONE` frames.
+
+The native part checksum entry remains opaque: `is_compressed = false`, physical size and physical hash only. Setting its native compressed flag would add lineage to `getTotalSizeUncompressedOnDisk`, changing maintenance tiers, prewarm decisions and `system.parts` accounting. The engine instead handles its sidecar separately. This does not change the `Native` wire format or compression-frame encoding.
+
+The committed inventory authenticates the complete stored envelope. Before decoded allocation, the reader validates header fields, codec, row bounds, caller size limits and every frame's size and method. The sum of frame decoded sizes must exactly equal the declaration, with no trailing bytes. It then verifies frame checksums, decompression lengths, inner magic, inner CRC, offsets and inner/outer row-count agreement. Unsupported or corrupt representations are rejected. Memory-limit, allocation and cancellation errors retain their original classification; malformed decoding is classified as corruption.
+
+Physical read limits allow worst-case codec expansion and framing. Logical legacy size limits remain 64 MiB for foreground insert/import units and 2 GiB for maintenance lineage, including compact payloads. Query readers check cancellation during frame decoding; existing memory checks remain active. The writer can hold raw and compressed buffers simultaneously, so compression is not a reduction in peak preparation memory.
+
+### Planner sizes {#disk-efficiency-planner-sizes}
+
+The writer seeds an immutable cached logical legacy size. After restart, maintenance fills missing caches by reading a small header outside the parts lock, at a bounded candidate slice per tick. It must also open legacy sidecars once to discover the representation. Thus a 600,000-part table can incur approximately 600,000 deferred header reads during its first full scan; the change does not add an eager startup scan.
+
+A cached header is planning data, never authorization. Declared sizes outside row/minimum-width and decoded-limit bounds are rejected rather than clamped. Source use authenticates and validates all stored bytes again. Memory and lineage selection budgets use logical legacy sizes for both inner formats, while disk planning uses physical source sizes.
+
+## Column codec selection for rewrites {#disk-efficiency-column-codec}
+
+The native merge path chooses its default column codec using the compressed size of the complete source set. Upsert rewrites previously used the insert writer with a size argument of zero, keeping large outputs on the small-part codec. The writer now accepts a source-size hint: maintenance and mutation rewrites pass the complete source size to every output chunk, and partition import passes its source part size. Ordinary inserts still pass zero. Explicit column codecs and `default_compression_codec` retain their precedence.
+
+This matters after the upstream size-aware codec policy: the derived 4-million-row comparison found native merged columns using `ZSTD` while upsert outputs still used `LZ4`. Codec selection must be aligned before attributing a directory ratio to lineage or state. A read-only check found that both remote clone tables currently contain only `LZ4` active parts. The size-policy defect therefore does not explain that clone’s current gap; the correction affects future rewrites on servers with size-based compression rules.
+
+## State compression and diagnostic logs {#disk-efficiency-state-compression}
+
+`upsert_state_compression` defaults to false and is applied when the state database opens. It is not allowlisted for settings-only `ALTER`. When enabled, newly flushed and compacted SST blocks use `ZSTD` level 1 at upper levels and level 3 at the bottommost level. Existing SSTs change only through compaction. Each SST block records its codec; the older bundled library supports these codecs, but older binaries cannot attach table metadata containing `upsert_state_compression`, `upsert_lineage_compression*` or `upsert_lineage_compact`: these settings are unknown to them. This metadata barrier is separate from the SST codec compatibility.
+
+The `WAL` is unchanged. Compressing its bounded allocation would add CPU to the serialized synced-write path without addressing the dominant lineage and SST allocations. Measure flush stalls, compaction debt and commit hold time before enabling state compression for sustained production ingestion.
+
+`max_log_file_size` is now 64 MiB with the existing `keep_log_file_num = 2`. It takes effect on the next state open. This is a rotation threshold, not a strict total cap. An old oversized `LOG` can remain in the retained window until enough subsequent rotations remove it. Rotation does not immediately recover the reported 1 GiB.
+
+## Disk admission and reclamation {#disk-efficiency-admission}
+
+Maintenance reserves a physical output estimate plus `upsert_rewrite_state_reserve_bytes` before loading source lineage. The allowance defaults to 1 GiB, accepts 256 MiB through 64 GiB, and supports settings-only `ALTER`. The estimate uses live-row fractions of source physical bytes with 25 percent slack. Source bytes include legacy lineage, metadata and old SST sidecars, so conversion can substantially over-reserve; this is deliberately conservative.
+
+Admission requires that reservation plus one external 1-GiB floor. The reservation stays alive across output and retirement batches and is released on return, yield or exception. Transient denial restores the scan position and backs off without fencing. A single source or prospective prefix that cannot fit total disk capacity does not prevent other candidates from progressing.
+
+The native writer's separate reservation of the uncompressed bytes returned by `block.bytes` remains in place. It is checked later during output writing and is not replaced by the upsert reservation. Effective headroom is therefore conservative: the physical reservation and the native output-block reservation can overlap. Neither budget covers every possible concurrent filesystem consumer.
+
+Foreground preparation checks unreserved disk space against an advisory 1-GiB floor. Immediately before durability, insert, rewrite and payload-adding partition commits check unreserved space against twice the actual state batch plus the floor. A rewrite credits only the state allowance in its own held reservation. Pure removal and `TRUNCATE` instead use a 16-MiB minimum, so operators can release data below the insert floor. These checks occur before ambiguous persistence; denial is a clean `NOT_ENOUGH_SPACE` error. Space can still disappear after checking, and a real ambiguous state-write failure still fences.
+
+Every rewrite first increases occupancy by new columns, compressed lineage and state growth. Sources return space only after durable replacement, native retirement, reader unpinning and `pruneRetired`, including recovered-verification requirements. A planning lower bound is output bytes times concurrent rewrites, plus state/compaction allowance and the foreground floor; the independent native block reservation, retained sources and readers can raise the peak further. Do not begin migration on a nearly full filesystem or edit part files in place.
+
+## Local evidence {#disk-efficiency-evidence}
+
+Actual exported rows from the reference were replayed locally with the same nine-column schema and `EVENT String` for both engines. Sidecar compression samples cover 8,192 rows and two 32,768-row insert units; they do not represent all event groups or resolved maintenance lineage.
+
+| Insert sample | Raw lineage bytes/row | `ZSTD(1)` | `ZSTD(6)` |
+| --- | ---: | ---: | ---: |
+| 8,192 rows | approximately 102 | 6.732 | 5.714 |
+| First 32,768 rows | approximately 102 | 8.769 | 6.697 |
+| Second 32,768 rows | approximately 102 | 7.163 | 5.708 |
+
+### Matched actual-row measurements {#disk-efficiency-real-row-measurements}
+
+A later export contains 4,194,304 actual rows from three `BetRecord` parts and one `BetLog` part. Each source slice is contiguous in key order. These slices represent sorted bulk-import units, but may compress better than the full population. The local comparison replays identical ordered rows into both engines. A nested one-million-row sample is selected deterministically from that same export. Both schemas use `EVENT String`, because the current upsert key validator rejects `LowCardinality` keys; the production reference schema therefore still differs.
+
+The following ratios include table and state directories, live WAL, diagnostic logs, database metadata and filesystem files. The natural settled observation waits for stable files, completed table consolidation and retirement pruning; it does not force a state flush or full compaction. Peaks are sampled during import and consolidation and may miss shorter peaks. The peak ratio divides each upsert run’s sampled maximum by the reference run’s sampled maximum; it is not a simultaneous comparison or a ratio against the settled reference. Decimal byte units are used for these measurements.
+
+| Actual rows | Lineage configuration | Natural logical ratio | Natural allocated ratio | Sampled peak logical ratio |
+| ---: | --- | ---: | ---: | ---: |
+| 1,048,576 | Inner 0, `ZSTD(6)` | 1.547 | 1.563 | 1.178 |
+| 1,048,576 | Compact inner 1, `ZSTD(1)` | 1.679 | 1.694 | 1.303 |
+| 4,194,304 | Inner 0, `ZSTD(6)` | 1.400 | 1.434 | 1.037 |
+| 4,194,304 | Compact inner 1, `ZSTD(1)` | 1.352 | 1.385 | 1.143 |
+
+All upsert arms enable state compression. At four million rows, reference native part files total 226.61 MB and compact upsert native part files total 226.69 MB. Compact lineage adds 12.74 MB, or 3.04 bytes per row; the state directory adds 67.01 MB. Each final row count, unique-key count and order-independent row hash matches its reference. There are four reference parts and eight upsert parts. These observations do not meet the 1.3-times target.
+
+The larger natural state total in the one-million-row compact arm does not establish a compression regression: arms ended at different WAL, memtable and compaction cycles. Fixed per-table files and live WAL must remain in total ratios but must not be fitted as a per-row state cost from only these two totals.
+
+### Closed state audits {#disk-efficiency-closed-state-audits}
+
+Closed copies are audited with the engine’s whole-key 10-bit Bloom filter, partitioned two-level index and resource options. Earlier small offline estimates without those options are not used as the state budget. The actual one-million-row state from the earlier export occupies 12,115,054 SST bytes after a full bottommost compaction with `ZSTD(3)`, or 11.55 bytes per winner. Levels 6 and 9 reduce that copy’s SST size by approximately 3.4 and 3.7 percent; they are not enabled in the engine and have not passed a bulk-ingest stall gate.
+
+For the later four-million-row compact arm, three closed copies preserve identical full key/value digests and namespace counts:
+
+| Closed-copy operation | Live SST bytes | Layout |
+| --- | ---: | --- |
+| Read-only audit of natural state | 61,198,931 | `L0` plus `L6` |
+| Flush, then wait for automatic compaction | 61,705,336 | Two `L0` files plus one `L6` file |
+| Flush and force full bottommost compaction | 48,520,431 | One `L6` file |
+
+The flushed copy has empty memtables, no pending flush or compaction and zero estimated compaction debt. Nevertheless it remains larger than the fully compacted copy: quiescence does not require every superseded version to have reached the bottommost level. The forced result is an offline size estimate, not the measured live ratio. A separate copy that takes and releases a `RocksDB` snapshot before waiting for automatic compaction drops to 51,727,370 SST bytes without manual compaction, preserving the full key/value digest. Snapshot release activates existing bottommost cleanup, so a clone opened without snapshot activity does not model every live-engine reclamation trigger. Queries share the published state cut; a new publication and release can advance the oldest cut. During sustained writes, publications repeatedly permit reclamation after older readers release their cuts. At idle, the latest cut can retain the final file until another publication. This retained tail and the live WAL belong in the per-table fixed component. These diagnostic copies must not be substituted for a live engine measurement.
+
+These small states cannot establish the distribution across levels for a production state of hundreds of GiB. A separate derived state fixture expands partition prefixes of real winner records to populate a state of several GiB. At 268,435,456 derived winner keys, live SST files total 3,347,686,701 bytes, or 12.47 bytes per key. The total-to-bottommost size factor is 1.118; pending compaction bytes are zero at the recorded checkpoints, but cumulative RocksDB write stalls reach 1,127.62 seconds during a 1,718.72-second run. It measures state layout and write stalls only: keys are inserted once in sequential disjoint prefix ranges, with no snapshots or update churn. It is not an engine table, does not include authorization records or payloads, and cannot certify the table-footprint target. The large stall time is a throughput risk: state writes can wait for compaction while holding the commit lock. A matched codec and background-job comparison is needed before recommending compressed state for a production bulk workload. No compact winner-value format or periodic flush behavior has been introduced on the basis of small-table fixed costs.
+
+### Live snapshot-publication diagnostic {#disk-efficiency-live-snapshot-diagnostic}
+
+A copy of the actual four-million-row compact runtime was restarted with the candidate binary. SELECT-only polling measured 301,456,084 logical bytes, or 1.330 times the 226,611,538-byte reference. One additional stale insert then lost version comparison and changed no visible row or native part. Its state publication released the previous cut and permitted the existing automatic bottommost cleanup. The directory then measured 291,482,677 logical bytes, or 1.286 times the reference; allocation was 292,708,352 bytes versus 227,188,736, or 1.288 times.
+
+Native part and lineage bytes were unchanged, as were row count, unique-key count and the order-independent full-row hash. No manual state flush or compaction was performed. This demonstrates existing reclamation after a subsequent publication in this local fixture. It does not replace the original 1.352 bulk-end ratio or certify a production result: the diagnostic includes a restart and another losing insert. No targeted compaction policy, periodic flush or compact winner-value format has been added because of this result.
+
+### Compression-level diagnostic {#disk-efficiency-compression-level-diagnostic}
+
+A separate compact-lineage `ZSTD(6)` run on the same actual four-million-row source reduced lineage from 12.74 MB to 11.77 MB, approximately 7.6 percent. Insert wall time was 51.55 seconds versus 42.89 seconds at level 1; part-index preparation increased from 3.65 to 5.30 seconds. These are descriptive observations: the runs were not interleaved, background state experiments shared the host, and the output part counts and state cycles differed. They do not establish a causal latency change. The level-6 natural total remained 1.349 times the reference, and a subsequent stale-publication diagnostic remained 1.305 times. Increasing the lineage level alone did not demonstrate the target. The default remains level 1.
+
+### Existing resource-setting diagnostic {#disk-efficiency-resource-setting-diagnostic}
+
+A configuration-only comparison repeats the same actual four-million-row bulk import in default/smaller/default order on a quiet host. The smaller arm uses the existing `upsert_write_buffer_bytes = 4194304` and `upsert_wal_bytes = 16777216`; all arms retain compact lineage at level 1, compressed state and eight final parts. No idle flush, state-format change or default change is introduced.
+
+| Arm | Bulk-end logical ratio | Bulk-end allocated ratio | After next publication, logical | After next publication, allocated | Insert seconds |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Default, first | 1.353 | 1.387 | 1.308 | 1.343 | 48.00 |
+| Smaller buffers | 1.331 | 1.334 | 1.298 | 1.301 | 49.72 |
+| Default, second | 1.353 | 1.394 | 1.309 | 1.350 | 48.57 |
+
+The smaller arm reduces retained live WAL from approximately 5.53 MB to 1.7 KB; its SST tail differs as well. The publication columns are short observation windows, not proof of final compaction quiescence; additional cleanup occurred during shutdown, so closed-copy sizes must not replace these live observations. The two default observations agree closely on logical size. All content counts, unique-key counts and full-row aggregate hashes match. Sampled absolute peaks are 459.6, 498.5 and 447.8 MB, respectively; these are not ratios against a newly measured reference peak. The RocksDB logs show 36/38/36 flushes and 14 compactions per arm, without write-stall warnings. Exact live stall microseconds and memtable properties were not collected, and the local server emitted background scheduling pauses. Query state-write and commit-hold totals are descriptive, rather than latency distributions. This small comparison isolates some fixed WAL cost; it does not support changing resource defaults or certify bulk throughput at production scale. The smaller arm still misses the bulk-end target and remains slightly above 1.3 times by allocation even after the extra publication.
+
+### Admission performance diagnostic {#disk-efficiency-admission-performance-diagnostic}
+
+A local paired comparison uses the deployed-line binary at `553e922a8c42091467a38b7a7e6f35aea82123c1` and the candidate, with all compression flags disabled. Sixteen HTTP clients each insert 16,384 rows, first fresh and then with 90 percent existing keys. Binary order rotates across eleven repetitions; the first repetition is excluded. Maintenance is stopped during these cells, and every count, unique-key count and version sum matches.
+
+Across the ten measured pairs, the median candidate/baseline batch-wall ratio is 1.019 for fresh inserts and 0.970 for updates. The median paired ratio of key-weighted commit-lock hold is 1.017 and 0.965, respectively. Query memory peaks remain near parity. The comparison includes all candidate changes with optional compression paths disabled; it does not isolate admission from the other fixes. The batch-wall ratios range from 0.859 to 1.225 for fresh inserts and 0.894 to 1.107 for updates. This comparison does not show a consistent slowdown at its resolution; it does not establish zero admission overhead or certify tail latency. It excludes concurrent readers, and stopping maintenance isolates foreground admission rather than the rewrite-reservation cost.
+
+### Correctness evidence and limits {#disk-efficiency-correctness-evidence}
+
+The current local adapter passed ten integration cases. They cover mixed raw, compressed inner-0 and compact inner-1 sources; a 1.2-million-row rewrite; mutation, TTL and partition transfers; 16 inserters; restart and full payload verification; ambiguous synced-insert and TTL rewrite recovery with compact lineage both disabled and enabled; and disk backoff, preflight, removal and resume on an isolated 3-GiB tmpfs. The focused current unit binary passed 142 tests, including 45 format and admission fixtures covering fixed envelopes, compact differential equivalence, logical-size derivation, malformed bounds, all allowed codecs and checksum-valid but undecodable frames. Twenty-two stateless SQL cases also passed, including compact settings, async insert routing, partition-scoped deletes and settings history. These runs are local adapter evidence, not Docker, ASan, TSan or production certification.
+
+A separate downgrade test wrote compressed inner-0 and compact inner-1 parts using server `merge_tree` defaults, without new settings in the table metadata. The deployed-line binary at `553e922a8c42091467a38b7a7e6f35aea82123c1` attached both tables, rejected the first attempted lineage decode with `CORRUPTED_DATA`, and refused subsequent reads pending recovery. Returning to the candidate recovered both tables with unchanged counts and versions. This exercises the storage-format barrier separately from the unknown-setting metadata barrier. The old binary rejects the format rather than misreading it; recovery requires the candidate binary or a pre-enable backup. It does not make downgrades supported.
+
+An earlier derived scaling fixture repeats 65,536 source rows with disjoint prefixed IDs. Its reference columns compress unusually well, so it is not representative of the production population. It also exposed the column-codec mismatch described above. Actual-row matched runs take precedence over that fixture.
+
+The target remains unproven. Peak occupancy during import and consolidation must be reported separately from settled occupancy, including state, WAL, logs, temporary and retired parts. Fixed costs are per table; projected production per-row costs must also account for upper-level state files and versions awaiting compaction. A forced single-bottom-level estimate must not be substituted for a natural footprint measurement.
