@@ -181,7 +181,8 @@ UInt64 estimateRewriteMemory(const MergeTreeData::DataPartsVector & sources, UIn
         if (source_bytes > static_cast<UInt64>(std::numeric_limits<Int64>::max()) - selected_bytes)
             return std::numeric_limits<UInt64>::max();
         selected_bytes += source_bytes;
-        const auto lineage_size = source->checksums.files.at(Upsert::ROWS_FILE).file_size;
+        const auto lineage_size = source->upsert_lineage_decoded_size.load(std::memory_order_relaxed);
+        chassert(lineage_size != 0);
         lineage += lineage_size;
         rows += source->rows_count;
         state_bytes += Upsert::estimateInsertStateBytes(lineage_size, source->rows_count, source->info.getPartitionId().size(), 1024);
@@ -521,6 +522,8 @@ void StorageMergeTree::runUpsertMaintenance()
             LOG_WARNING(log, "UpsertMergeTree maintenance admission denied {} consecutive times; retry in {} ms", denials, delay);
         upsert_maintenance_task->scheduleAfter(delay);
     };
+    const auto previous_cursor = upsert_maintenance_cursor;
+    const auto previous_pending = upsert_maintenance_pending;
     try
     {
         if (!MaintenanceAdmission::canAttempt(getContext()->getServerSettings()))
@@ -577,17 +580,12 @@ void StorageMergeTree::runUpsertMaintenance()
         const auto now = time(nullptr);
         const bool apply_ttl = metadata->hasAnyTTL() && !merger_mutator.ttl_merges_blocker.isCancelled();
         const auto policy_checksum = Upsert::ttlPolicyChecksum(*metadata);
-        const auto previous_cursor = upsert_maintenance_cursor;
-        const auto previous_pending = upsert_maintenance_pending;
+        DataPartsVector candidates;
+        bool more_candidates = false;
         {
             auto lock = lockParts();
             if (upsert_fenced)
                 return;
-            size_t bytes = 0;
-            size_t rows = 0;
-            size_t lineage_bytes = 0;
-            bool needs_rewrite = false;
-            auto worthy = [&] { return sources.size() >= 2 || needs_rewrite; };
             /// The native ordered index is maintained incrementally on publication. Visit a bounded slice
             /// per tick; the cursor also advances over healthy parts instead of repeatedly rescanning them.
             constexpr size_t max_candidates = 256;
@@ -602,13 +600,36 @@ void StorageMergeTree::runUpsertMaintenance()
                 next = active.begin();
                 upsert_maintenance_pending.reset();
             }
-            DataPartsVector candidates;
             candidates.reserve(max_candidates + 1);
             if (upsert_maintenance_pending && upsert_maintenance_pending->getState() == DataPartState::Active)
                 candidates.push_back(upsert_maintenance_pending);
             upsert_maintenance_pending.reset();
             for (size_t visited = 0; next != active.end() && visited < max_candidates; ++next, ++visited)
                 candidates.push_back(*next);
+            more_candidates = next != active.end();
+        }
+        /// Pinned sources and the operation mutex keep lineage immutable. Read planner headers
+        /// outside the parts lock; cached sizes never substitute for authenticated source reads.
+        phase = "reading lineage planner headers";
+        for (const auto & candidate : candidates)
+        {
+            const auto checksum = candidate->checksums.files.find(Upsert::ROWS_FILE);
+            if (checksum == candidate->checksums.files.end() || checksum->second.is_compressed)
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree maintenance source has invalid lineage checksum");
+            if (!candidate->upsert_lineage_decoded_size.load(std::memory_order_relaxed))
+                candidate->upsert_lineage_decoded_size.store(Upsert::readPartRowsDecodedSize(
+                    (std::filesystem::path(candidate->getDataPartStorage().getFullPath()) / Upsert::ROWS_FILE).string(),
+                    checksum->second.file_size, candidate->rows_count), std::memory_order_relaxed);
+        }
+        {
+            auto lock = lockParts();
+            if (upsert_fenced)
+                return;
+            size_t bytes = 0;
+            size_t rows = 0;
+            size_t lineage_bytes = 0;
+            bool needs_rewrite = false;
+            auto worthy = [&] { return sources.size() >= 2 || needs_rewrite; };
             const auto advance_cursor = [&](const DataPartPtr & candidate)
             {
                 /// A carried candidate is behind the cursor and must never move it backwards.
@@ -641,10 +662,11 @@ void StorageMergeTree::runUpsertMaintenance()
                 const auto checksum = candidate->checksums.files.find(Upsert::ROWS_FILE);
                 if (checksum == candidate->checksums.files.end() || checksum->second.is_compressed
                     || checksum->second.file_size <= Upsert::PART_ROWS_ENVELOPE_BYTES
-                    || checksum->second.file_size > Upsert::MAX_PART_LINEAGE_BYTES)
+                    || checksum->second.file_size > Upsert::partRowsStoredSizeLimit(Upsert::MAX_PART_LINEAGE_BYTES))
                     throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree maintenance source has invalid lineage size");
                 /// Resolving `SELF` and sorting preserve encoded row widths. Filtering can only reduce this bound.
-                const auto candidate_lineage_bytes = checksum->second.file_size - Upsert::PART_ROWS_ENVELOPE_BYTES;
+                const auto candidate_lineage_bytes = candidate->upsert_lineage_decoded_size.load(std::memory_order_relaxed)
+                    - Upsert::PART_ROWS_ENVELOPE_BYTES;
                 const auto mask = snapshot->getMask(candidate->getDeleteBitmapCacheIdentity());
                 if (!mask)
                     throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree maintenance source lacks a mask");
@@ -743,7 +765,7 @@ void StorageMergeTree::runUpsertMaintenance()
                 if (sources.size() == max_sources)
                     break;
             }
-            continue_scan = next != active.end()
+            continue_scan = more_candidates
                 || (!candidates.empty() && (!upsert_maintenance_cursor || *upsert_maintenance_cursor < candidates.back()->info));
             if (!worthy())
             {
@@ -936,7 +958,7 @@ bool StorageMergeTree::rewriteUpsertParts(const DataPartsVector & sources, const
             auto & part = temporary->part;
             part->getDataPartStorage().commitTransaction();
             const auto path = part->getDataPartStorage().getFullPath();
-            output_rows = Upsert::decodePartRows(Upsert::readBoundedFile(std::filesystem::path(path) / Upsert::ROWS_FILE, Upsert::MAX_PART_LINEAGE_BYTES));
+            output_rows = Upsert::decodePartRows(Upsert::readBoundedFile(std::filesystem::path(path) / Upsert::ROWS_FILE, Upsert::partRowsStoredSizeLimit(Upsert::MAX_PART_LINEAGE_BYTES)), Upsert::MAX_PART_LINEAGE_BYTES);
             authorization.part = {UUIDHelpers::getHighBytes(part->uuid), UUIDHelpers::getLowBytes(part->uuid)};
             authorization.temporary_name = part->getDataPartStorage().getPartDirectory();
             authorization.files_hash = Upsert::hashPartDirectory(path, true, &authorization.files_inventory);

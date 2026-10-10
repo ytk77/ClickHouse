@@ -58,8 +58,13 @@ private:
 
 ObjectID newObjectID();
 String objectName(ObjectID id);
-String encodePartRows(const PartRows & rows);
-PartRows decodePartRows(std::string_view bytes);
+String encodePartRows(const PartRows & rows, bool compact = false);
+/// `UMPROW03` wraps legacy or compact full-key lineage in bounded standard compression frames.
+String compressPartRows(std::string_view bytes, int level = 1);
+PartRows decodePartRows(std::string_view bytes, size_t decoded_limit = MAX_PART_LINEAGE_BYTES, QueryStatus * process = nullptr);
+size_t partRowsStoredSizeLimit(size_t decoded_limit);
+/// Read only planner metadata; source use must still authenticate and decode the entire file.
+size_t readPartRowsDecodedSize(const String & path, size_t stored_size, size_t rows);
 
 /// Take a bounded contiguous slice. Small inputs retain their columns without copying.
 Block cutInputBlock(const Block & block, size_t offset, size_t max_rows = MAX_UNIT_ROWS, size_t max_bytes = MAX_UNIT_BYTES);
@@ -75,10 +80,10 @@ ObjectID hashInputBlock(const Block & block);
 /// Identify the exact policy used to calculate a part's cached `TTL` information.
 MergeTreeDataPartChecksum ttlPolicyChecksum(const StorageInMemoryMetadata & metadata);
 
-void writePartIndex(
+size_t writePartIndex(
     IDataPartStorage & storage, const Block & block, const StorageInMemoryMetadata & metadata,
     const String & version_column, ObjectID operation_id, const IColumn::Permutation * permutation,
-    size_t max_key_bytes, ContextPtr context, MergeTreeDataPartChecksums & checksums);
+    size_t max_key_bytes, ContextPtr context, MergeTreeDataPartChecksums & checksums, bool compress_lineage = false, int compression_level = 1, bool compact_lineage = false);
 
 /// Authenticate all immutable part files, including sidecars. Optional barriers precede authorization.
 ObjectID hashPartDirectory(const String & path, bool sync_files, String * inventory = nullptr);

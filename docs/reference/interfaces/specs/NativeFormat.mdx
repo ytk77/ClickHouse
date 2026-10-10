@@ -1394,6 +1394,8 @@ The non-flattened `Object` encodings are what the server emits over the wire whe
 
 ## Compression frame {#compression-frame}
 
+A valid compression frame identifies a codec and its compressed and decoded lengths; it does not identify the decoded payload as a `Native` block. Other storage readers can use the same frame layout with separate envelopes and stricter size bounds. These storage envelopes do not change the `Native` wire format or its codec negotiation.
+
 ClickHouse can compress the column data of a `Native` stream with an internal frame format. The [frame layout](#frame-format) below is **transport-independent** — the same frames appear on both the native TCP protocol and over HTTP — but how compression is requested, and what surrounds the frames, differs by transport.
 
 - **Native TCP protocol.** Compression is opt-in per query via the `compression` flag in the [Query packet](/resources/develop-contribute/native-protocol/protocol#query). When active, the body of each `Data`, `Totals`, `Extremes`, `Log`, and `ProfileEvents` packet — the bytes after the `table_name` string — is wrapped in the frame format. The packet envelope itself, the packet-type code and the `table_name` string, is **not** compressed; the server writes those to the raw stream. Everything the `NativeWriter` emits goes into the compressed stream, so the `BlockInfo` prefix is the first thing inside the frame, along with the dimensions and columns. A client must therefore decompress the frame before it can read `BlockInfo`.

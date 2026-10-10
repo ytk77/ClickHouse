@@ -849,7 +849,7 @@ PartRows DiskState::loadPartRows(const String & name, PartCommit * authorization
         if (!inventory || hashLogRecord(*inventory) != record.files_hash)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree maintenance source lacks its authenticated inventory");
         /// Authenticate the bytes being decoded even for new or previously verified parts, without the sweep mutex.
-        auto rows = decodePartRows(readInventoryFile(std::filesystem::path(impl->table_path) / name, ROWS_FILE, *inventory, MAX_PART_LINEAGE_BYTES));
+        auto rows = decodePartRows(readInventoryFile(std::filesystem::path(impl->table_path) / name, ROWS_FILE, *inventory, partRowsStoredSizeLimit(MAX_PART_LINEAGE_BYTES)), MAX_PART_LINEAGE_BYTES);
         if (rows.size() != record.rows)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree maintenance source row count mismatch");
         const auto csn = impl->database->integer("O" + objectName(record.part));

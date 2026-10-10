@@ -34,6 +34,65 @@ def poll(predicate, timeout=90):
     raise AssertionError("Condition did not become true before deadline")
 
 
+def create(name, extra=""):
+    query(f"CREATE TABLE {name} (p UInt8,id UInt64,v UInt64) "
+          "ENGINE=UpsertMergeTree(v) PARTITION BY p ORDER BY id UNIQUE KEY id "
+          "SETTINGS upsert_lineage_compression=1, upsert_state_compression=1" + extra)
+    query(f"SYSTEM STOP MERGES {name}")
+
+
+def test_mixed_lineage_chunked_output_mutation_and_partition_transfer():
+    names = ["disk_mixed", "disk_raw_import", "disk_v3_import", "disk_parallel"]
+    try:
+        create(names[0], ", upsert_lineage_compression_level=6")
+        query("ALTER TABLE disk_mixed MODIFY SETTING upsert_lineage_compression=0")
+        query("INSERT INTO disk_mixed SELECT 1,number,1 FROM numbers(600000)")
+        query("ALTER TABLE disk_mixed MODIFY SETTING upsert_lineage_compression=1")
+        query("INSERT INTO disk_mixed SELECT 1,number+600000,1 FROM numbers(600000)")
+        query("SYSTEM START MERGES disk_mixed")
+        poll(lambda: query("SELECT count(),max(rows) FROM system.parts "
+                           "WHERE database=currentDatabase() AND table='disk_mixed' AND active") == "1\t1200000\n")
+        assert query("SELECT count(),uniqExact(id),sum(v) FROM disk_mixed") == "1200000\t1200000\t1200000\n"
+        node.restart_clickhouse(kill=True)
+        assert query("SELECT count(),uniqExact(id),sum(v) FROM disk_mixed") == "1200000\t1200000\t1200000\n"
+        query("ALTER TABLE disk_mixed DELETE WHERE id=42")
+        assert query("SELECT count(),uniqExact(id),sum(v) FROM disk_mixed") == "1199999\t1199999\t1199999\n"
+        create(names[1])
+        query("ALTER TABLE disk_raw_import MODIFY SETTING upsert_lineage_compression=0")
+        query("ALTER TABLE disk_raw_import ATTACH PARTITION 1 FROM disk_mixed")
+        assert query("SELECT count(),uniqExact(id),sum(v) FROM disk_raw_import") == "1199999\t1199999\t1199999\n"
+        create(names[2])
+        query("ALTER TABLE disk_v3_import REPLACE PARTITION 1 FROM disk_raw_import")
+        assert query("SELECT count(),uniqExact(id),sum(v) FROM disk_v3_import") == "1199999\t1199999\t1199999\n"
+        create(names[3])
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            list(pool.map(lambda i: query(f"INSERT INTO disk_parallel SELECT 1,number+{i*4096},{i+1} FROM numbers(4096)"), range(16)))
+        assert query("SELECT count(),uniqExact(id),sum(v) FROM disk_parallel") == "65536\t65536\t557056\n"
+        node.restart_clickhouse(kill=True)
+        assert query("SELECT count(),uniqExact(id),sum(v) FROM disk_parallel") == "65536\t65536\t557056\n"
+    finally:
+        for name in names:
+            query(f"DROP TABLE IF EXISTS {name} SYNC")
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_v3_ambiguous_insert_recovers_and_retry_keeps_winners(compact):
+    name = "disk_recovery"
+    try:
+        create(name, f", upsert_lineage_compression_level=6, upsert_lineage_compact={int(compact)}")
+        query(f"INSERT INTO {name} VALUES (1,1,1)")
+        query("SYSTEM ENABLE FAILPOINT upsert_log_throw_after_sync")
+        retry = f"INSERT INTO {name} SETTINGS insert_deduplication_token='disk-v3-retry' VALUES (1,1,2),(1,2,2)"
+        assert "FAULT_INJECTED" in node.query_and_get_error(retry, settings=SETTINGS)
+        assert "fenced" in node.query_and_get_error(f"SELECT * FROM {name}")
+        node.restart_clickhouse(kill=True)
+        query(retry)
+        assert query(f"SELECT count(),uniqExact(id),sum(v) FROM {name}") == "2\t2\t4\n"
+    finally:
+        query("SYSTEM DISABLE FAILPOINT upsert_log_throw_after_sync")
+        query(f"DROP TABLE IF EXISTS {name} SYNC")
+
+
 def test_rewrite_codec_matches_native_size_policy_and_explicit_override():
     names = ["codec_upsert", "codec_native", "codec_import", "codec_explicit"]
 
@@ -48,9 +107,9 @@ def test_rewrite_codec_matches_native_size_policy_and_explicit_override():
         for name in names:
             engine = "MergeTree" if name == "codec_native" else "UpsertMergeTree(v)"
             key = "" if name == "codec_native" else " UNIQUE KEY id"
-            settings = ""
+            settings = "" if name == "codec_native" else " SETTINGS upsert_lineage_compression=1"
             if name == "codec_explicit":
-                settings = " SETTINGS default_compression_codec='LZ4'"
+                settings += ", default_compression_codec='LZ4'"
             query(f"CREATE TABLE {name} (p UInt8,id UInt64,v UInt64,payload String) "
                   f"ENGINE={engine} PARTITION BY p ORDER BY id{key}{settings}")
             query(f"SYSTEM STOP MERGES {name}")
@@ -78,6 +137,92 @@ def test_rewrite_codec_matches_native_size_policy_and_explicit_override():
         query("ALTER TABLE codec_import ATTACH PARTITION 1 FROM codec_upsert")
         assert codecs(names[2]) == "ZSTD(1)\n"
         assert contents(names[2]) == expected_after_delete
+    finally:
+        for name in names:
+            query(f"DROP TABLE IF EXISTS {name} SYNC")
+
+
+@pytest.mark.parametrize("compact", [False, True])
+@pytest.mark.parametrize("point", ["upsert_log_throw_after_sync", "upsert_throw_after_rename"])
+def test_v3_ttl_rewrite_recovers_after_ambiguous_durable_failure(point, compact):
+    name = "disk_ttl_recovery"
+    try:
+        query(f"CREATE TABLE {name} (id UInt64,v UInt64,expires DateTime) "
+              "ENGINE=UpsertMergeTree(v) ORDER BY id UNIQUE KEY id TTL expires "
+              f"SETTINGS upsert_lineage_compression=1,upsert_lineage_compression_level=6,upsert_state_compression=1,upsert_lineage_compact={int(compact)}")
+        query(f"SYSTEM STOP TTL MERGES {name}")
+        query(f"INSERT INTO {name} VALUES (1,10,'2000-01-01'),(2,10,'2100-01-01')")
+        query("SYSTEM ENABLE FAILPOINT upsert_pause_before_merge_commit")
+        query(f"SYSTEM START TTL MERGES {name}")
+        query("SYSTEM WAIT FAILPOINT upsert_pause_before_merge_commit PAUSE")
+        query(f"SYSTEM ENABLE FAILPOINT {point}")
+        query("SYSTEM DISABLE FAILPOINT upsert_pause_before_merge_commit")
+
+        def fenced():
+            try:
+                query(f"SELECT count() FROM {name}")
+            except Exception as error:
+                assert "fenced" in str(error)
+                return True
+            return False
+
+        poll(fenced)
+        node.restart_clickhouse(kill=True)
+        assert query(f"SELECT id,v FROM {name} ORDER BY id") == "2\t10\n"
+        part_path = query(f"SELECT path FROM system.parts WHERE database=currentDatabase() "
+                          f"AND table='{name}' AND active").strip()
+        node.exec_in_container(["python3", "-c", "from pathlib import Path; "
+            "assert (Path(" + repr(part_path) + ")/'upsert_rows.bin').read_bytes()[:8]==b'UMPROW03'"])
+        query(f"INSERT INTO {name} SETTINGS insert_deduplication_token='ttl-v3-retry' "
+              "VALUES (1,1,'2100-01-01')")
+        query(f"INSERT INTO {name} SETTINGS insert_deduplication_token='ttl-v3-retry' "
+              "VALUES (1,1,'2100-01-01')")
+        assert query(f"SELECT id,v FROM {name} ORDER BY id") == "1\t1\n2\t10\n"
+    finally:
+        query("SYSTEM DISABLE FAILPOINT upsert_pause_before_merge_commit")
+        query(f"SYSTEM DISABLE FAILPOINT {point}")
+        query(f"DROP TABLE IF EXISTS {name} SYNC")
+
+
+
+def test_compact_mixed_formats_restart_sweep_and_large_rewrite():
+    names = ["compact_mixed", "compact_import", "compact_parallel"]
+    try:
+        create(names[0])
+        query("ALTER TABLE compact_mixed MODIFY SETTING upsert_lineage_compression=0")
+        query("INSERT INTO compact_mixed SELECT 1,number,1 FROM numbers(400000)")
+        query("ALTER TABLE compact_mixed MODIFY SETTING upsert_lineage_compression=1")
+        query("INSERT INTO compact_mixed SELECT 1,number+400000,1 FROM numbers(400000)")
+        query("ALTER TABLE compact_mixed MODIFY SETTING upsert_lineage_compact=1")
+        query("INSERT INTO compact_mixed SELECT 1,number+800000,1 FROM numbers(400000)")
+        paths = query("SELECT path FROM system.parts WHERE database=currentDatabase() "
+                      "AND table='compact_mixed' AND active").splitlines()
+        assert len(paths) == 3
+        node.exec_in_container(["python3", "-c", "from pathlib import Path; "
+            "headers=[(Path(p)/'upsert_rows.bin').read_bytes()[:32] for p in " + repr(paths) + "]; "
+            "assert sorted((h[:8],h[10] if h[:8]==b'UMPROW03' else -1) for h in headers) "
+            "==[(b'UMPROW01',-1),(b'UMPROW03',0),(b'UMPROW03',1)]"])
+        # Verify all three immutable sources before restart; maintenance then reloads their planner headers.
+        poll(lambda: int(query("SELECT value FROM system.events WHERE event='UpsertPayloadVerificationParts'") or 0) >= 3)
+        node.restart_clickhouse(kill=True)
+        assert query("SELECT count(),uniqExact(id),sum(v) FROM compact_mixed") == "1200000\t1200000\t1200000\n"
+        poll(lambda: int(query("SELECT value FROM system.events WHERE event='UpsertPayloadVerificationParts'") or 0) >= 1)
+        query("SYSTEM START MERGES compact_mixed")
+        poll(lambda: query("SELECT count(),max(rows) FROM system.parts WHERE database=currentDatabase() "
+                           "AND table='compact_mixed' AND active") == "1\t1200000\n")
+        query("ALTER TABLE compact_mixed DELETE WHERE id=42")
+        assert query("SELECT count(),uniqExact(id),sum(v) FROM compact_mixed") == "1199999\t1199999\t1199999\n"
+        create(names[1])
+        query("ALTER TABLE compact_import ATTACH PARTITION 1 FROM compact_mixed")
+        assert query("SELECT count(),sum(v) FROM compact_import") == "1199999\t1199999\n"
+        query("ALTER TABLE compact_import MODIFY SETTING upsert_lineage_compact=1")
+        query("ALTER TABLE compact_import REPLACE PARTITION 1 FROM compact_mixed")
+        assert query("SELECT count(),sum(v) FROM compact_import") == "1199999\t1199999\n"
+        create(names[2], ", upsert_lineage_compact=1")
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            list(pool.map(lambda i: query(f"INSERT INTO compact_parallel SELECT 1,number+{i*4096},1 FROM numbers(4096)"), range(16)))
+        node.restart_clickhouse(kill=True)
+        assert query("SELECT count(),uniqExact(id),sum(v) FROM compact_parallel") == "65536\t65536\t65536\n"
     finally:
         for name in names:
             query(f"DROP TABLE IF EXISTS {name} SYNC")

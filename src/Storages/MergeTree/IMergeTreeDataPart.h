@@ -324,6 +324,9 @@ public:
 
     size_t rows_count = 0;
 
+    /// Immutable `UpsertMergeTree` planner size; zero means the sidecar header has not been read.
+    mutable std::atomic<UInt64> upsert_lineage_decoded_size{0};
+
     /// Existing rows count (excluding lightweight deleted rows)
     std::optional<size_t> existing_rows_count;
 

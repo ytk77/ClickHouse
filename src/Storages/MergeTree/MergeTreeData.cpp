@@ -5617,6 +5617,9 @@ void MergeTreeData::checkAlterIsPossible(const AlterCommands & commands, Context
             {
                 for (const auto & change : command.settings_changes)
                     if (change.name != "upsert_maintenance_target_bytes" && change.name != "upsert_insert_target_bytes"
+                        && change.name != "upsert_lineage_compact"
+                        && change.name != "upsert_lineage_compression"
+                        && change.name != "upsert_lineage_compression_level"
                         && change.name != "prewarm_mark_cache"
                         && change.name != "prewarm_primary_key_cache" && change.name != "columns_to_prewarm_mark_cache"
                         && change.name != "min_bytes_to_prewarm_caches")

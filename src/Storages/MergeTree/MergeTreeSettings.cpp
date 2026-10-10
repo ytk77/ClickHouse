@@ -62,6 +62,26 @@ Existing blocks keep their codec until normal compaction rewrites them. Compacti
 This does not change state records, durability or the 64 MiB index-cache default.
 )", 0, \
         {"26.10", false, false, "New opt-in state compression setting for `UpsertMergeTree`."}) \
+    DECLARE(UInt64, upsert_lineage_compression_level, 1, R"(
+`ZSTD` compression level for new `UpsertMergeTree` lineage sidecars when compression is enabled.
+Default: 1. Allowed range: 1 to 9. Higher levels trade preparation CPU and memory for smaller sidecars.
+Changes apply to new parts and do not change the decoded format or rewrite existing files.
+)", 0, \
+        {"26.10", UInt64(1), UInt64(1), "New lineage compression level for `UpsertMergeTree`."}) \
+    DECLARE(Bool, upsert_lineage_compact, false, R"(
+Store complete unique keys and columnar row metadata in new compressed `UpsertMergeTree` lineage sidecars.
+Default: false. Requires `upsert_lineage_compression`. Logical row, lineage and state budgets stay unchanged.
+Existing parts are not modified in place. Older compressed-lineage readers reject the new inner format.
+Can be changed with `ALTER TABLE ... MODIFY SETTING`. Take a backup before enabling.
+)", 0, \
+        {"26.10", false, false, "New opt-in compact lineage setting for `UpsertMergeTree`."}) \
+    DECLARE(Bool, upsert_lineage_compression, false, R"(
+Write new `UpsertMergeTree` lineage sidecars as `UMPROW03` with bounded `ZSTD(1)` frames.
+Default: false. Existing parts are not changed in place. The decoded row and state limits remain unchanged.
+Enabling creates a downgrade barrier: older binaries cannot read new sidecars. Disabling does not convert them back.
+Can be changed with `ALTER TABLE ... MODIFY SETTING`. Take a backup before enabling on an existing table.
+)", 0, \
+        {"26.10", false, false, "New opt-in compressed lineage setting for `UpsertMergeTree`."}) \
     DECLARE(UInt64, upsert_insert_target_bytes, 512ULL << 20, R"(
 Maximum uncompressed input column bytes per `UpsertMergeTree` insert unit.
 Default: 512 MiB. Allowed range: 32 MiB to 1 GiB.

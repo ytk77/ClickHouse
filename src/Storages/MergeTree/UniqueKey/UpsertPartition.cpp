@@ -183,7 +183,7 @@ Pipe StorageMergeTree::alterPartition(
             size_t key_limit = settings[Setting::unique_key_max_encoded_size];
             const auto lineage_path = std::filesystem::path(part->getDataPartStorage().getFullPath()) / Upsert::ROWS_FILE;
             if (std::filesystem::exists(lineage_path))
-                for (const auto & row : Upsert::decodePartRows(Upsert::readBoundedFile(lineage_path, Upsert::MAX_PART_LINEAGE_BYTES)))
+                for (const auto & row : Upsert::decodePartRows(Upsert::readBoundedFile(lineage_path, Upsert::partRowsStoredSizeLimit(Upsert::MAX_PART_LINEAGE_BYTES)), Upsert::MAX_PART_LINEAGE_BYTES, query_context->getProcessListElement().get()))
                     key_limit = std::max(key_limit, row.key.size());
             import_context->setSetting("unique_key_max_encoded_size", static_cast<UInt64>(key_limit));
             const auto mask = visibility ? visibility->getMask(part->getDeleteBitmapCacheIdentity()) : readVisibility(part);
@@ -232,7 +232,7 @@ Pipe StorageMergeTree::alterPartition(
                     temporary->finalize();
                     temporary->part->getDataPartStorage().commitTransaction();
                     const auto path = temporary->part->getDataPartStorage().getFullPath();
-                    auto rows = Upsert::decodePartRows(Upsert::readBoundedFile(std::filesystem::path(path) / Upsert::ROWS_FILE, Upsert::MAX_RECORD_BYTES));
+                    auto rows = Upsert::decodePartRows(Upsert::readBoundedFile(std::filesystem::path(path) / Upsert::ROWS_FILE, Upsert::partRowsStoredSizeLimit(Upsert::MAX_RECORD_BYTES)), Upsert::MAX_RECORD_BYTES, query_context->getProcessListElement().get());
                     Upsert::PartCommit authorization;
                     authorization.part = {UUIDHelpers::getHighBytes(temporary->part->uuid), UUIDHelpers::getLowBytes(temporary->part->uuid)};
                     authorization.temporary_name = temporary->part->getDataPartStorage().getPartDirectory();

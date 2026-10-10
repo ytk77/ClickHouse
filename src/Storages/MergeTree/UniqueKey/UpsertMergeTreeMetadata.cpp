@@ -14,6 +14,9 @@ namespace MergeTreeSetting
     extern const MergeTreeSettingsBool ttl_only_drop_parts;
     extern const MergeTreeSettingsUInt64 upsert_maintenance_target_bytes;
     extern const MergeTreeSettingsUInt64 upsert_insert_target_bytes;
+    extern const MergeTreeSettingsUInt64 upsert_lineage_compression_level;
+    extern const MergeTreeSettingsBool upsert_lineage_compression;
+    extern const MergeTreeSettingsBool upsert_lineage_compact;
 }
 
 namespace ErrorCodes
@@ -44,6 +47,11 @@ bool supportedKeyType(const IDataType & type)
 void validateUpsertMergeTreeMetadata(
     const StorageInMemoryMetadata & metadata, const String & version_column, MergeTreeSettings & settings)
 {
+    if (settings[MergeTreeSetting::upsert_lineage_compact] && !settings[MergeTreeSetting::upsert_lineage_compression])
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Setting upsert_lineage_compact requires upsert_lineage_compression");
+    const UInt64 lineage_level = settings[MergeTreeSetting::upsert_lineage_compression_level];
+    if (lineage_level < 1 || lineage_level > 9)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Setting upsert_lineage_compression_level={} must be between 1 and 9", lineage_level);
     const UInt64 insert_target_bytes = settings[MergeTreeSetting::upsert_insert_target_bytes];
     if (insert_target_bytes < (32ULL << 20) || insert_target_bytes > (1ULL << 30))
         throw Exception(ErrorCodes::BAD_ARGUMENTS,

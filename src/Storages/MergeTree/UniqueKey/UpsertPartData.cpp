@@ -17,11 +17,16 @@
 #include <Common/ErrnoException.h>
 #include <Common/SipHash.h>
 #include <Common/CurrentMemoryTracker.h>
+#include <Common/scope_guard_safe.h>
 #include <IO/HashingWriteBuffer.h>
 #include <IO/WriteBufferFromFileBase.h>
 #include <IO/WriteHelpers.h>
 #include <IO/WriteBufferFromString.h>
 #include <Parsers/IAST.h>
+#include <Compression/CompressionFactory.h>
+#include <Compression/CompressedWriteBuffer.h>
+#include <Compression/ICompressionCodec.h>
+#include <city.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -35,12 +40,20 @@ extern const int BAD_ARGUMENTS;
 extern const int LOGICAL_ERROR;
 extern const int CANNOT_OPEN_FILE;
 extern const int CANNOT_READ_FROM_FILE_DESCRIPTOR;
+extern const int MEMORY_LIMIT_EXCEEDED;
+extern const int CANNOT_ALLOCATE_MEMORY;
+extern const int QUERY_WAS_CANCELLED;
+extern const int TIMEOUT_EXCEEDED;
+extern const int ABORTED;
 }
 
 namespace DB::Upsert
 {
 namespace
 {
+/// `UMPCOL01` omits the value length, `UMRV` magic/version and physical offset.
+constexpr UInt64 COMPACT_ELIDED_BYTES_PER_ROW = 4 + 4 + 1 + 4;
+
 class VersionColumn
 {
 public:
@@ -107,30 +120,31 @@ String objectName(ObjectID id)
     return toString(uuid);
 }
 
-String encodePartRows(const PartRows & rows)
+String encodePartRows(const PartRows & rows, bool compact)
 {
     ProfileEventTimeIncrement<Microseconds> timer(ProfileEvents::UpsertLineageEncodeMicroseconds);
     if (rows.empty() || rows.size() > MAX_PART_ROWS)
         throw Exception(ErrorCodes::LIMIT_EXCEEDED, "Invalid UpsertMergeTree part row count");
     size_t encoded_size = PART_ROWS_ENVELOPE_BYTES;
+    String value;
     for (const auto & row : rows)
     {
         if (row.value.row_offset % 65536 == 0)
             CurrentMemoryTracker::check();
         if (row.key.size() > MAX_UNIT_BYTES)
             throw Exception(ErrorCodes::LIMIT_EXCEEDED, "UpsertMergeTree part key exceeds its byte limit");
-        const auto size = row.key.size() + 8 + encodeIndexValue(row.value).size();
+        encodeIndexValue(row.value, value);
+        const auto size = row.key.size() + 8 + value.size();
         if (size > MAX_PART_LINEAGE_BYTES - encoded_size)
             throw Exception(ErrorCodes::LIMIT_EXCEEDED, "UpsertMergeTree part lineage exceeds its byte limit");
         encoded_size += size;
     }
     const bool large = rows.size() > MAX_UNIT_ROWS || encoded_size > MAX_RECORD_BYTES;
     BinaryWriter out;
-    out.bytes.reserve(encoded_size);
+    out.bytes.reserve(compact ? encoded_size - COMPACT_ELIDED_BYTES_PER_ROW * rows.size() : encoded_size);
     CurrentMemoryTracker::check();
-    out.bytes = large ? "UMPROW02" : "UMPROW01";
+    out.bytes = compact ? "UMPCOL01" : large ? "UMPROW02" : "UMPROW01";
     out.number(rows.size(), 4);
-    String value;
     for (size_t i = 0; i < rows.size(); ++i)
     {
         if (i % 65536 == 0)
@@ -139,19 +153,37 @@ String encodePartRows(const PartRows & rows)
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "UpsertMergeTree row metadata is not in physical order");
         out.number(rows[i].key.size(), 4);
         out.bytes += rows[i].key;
-        encodeIndexValue(rows[i].value, value);
-        out.number(value.size(), 4);
-        out.bytes += value;
+        if (!compact)
+        {
+            encodeIndexValue(rows[i].value, value);
+            out.number(value.size(), 4);
+            out.bytes += value;
+        }
+    }
+    if (compact)
+    {
+        /// `UMPCOL01` preserves full keys and stores metadata in contiguous columns.
+        for (const auto & row : rows)
+            out.number((row.value.row.version ? 1 : 0) | (row.value.row.self_binding ? 2 : 0), 1);
+        for (const auto & row : rows)
+            out.id(row.value.row.operation_id);
+        for (const auto & row : rows)
+            out.number(row.value.row.block_ordinal);
+        for (const auto & row : rows)
+            out.number(row.value.row.write_csn);
+        for (const auto & row : rows)
+            if (row.value.row.version)
+                out.number(*row.value.row.version);
     }
     out.number(crc(out.bytes), 4);
     return std::move(out.bytes);
 }
 
-PartRows decodePartRows(std::string_view bytes)
+static PartRows decodeRawPartRows(std::string_view bytes, size_t decoded_limit, QueryStatus * process)
 {
     ProfileEventTimeIncrement<Microseconds> timer(ProfileEvents::UpsertLineageDecodeMicroseconds);
     const bool large = bytes.starts_with("UMPROW02");
-    if (bytes.size() < PART_ROWS_ENVELOPE_BYTES || bytes.size() > (large ? MAX_PART_LINEAGE_BYTES : MAX_RECORD_BYTES)
+    if (bytes.size() < PART_ROWS_ENVELOPE_BYTES || bytes.size() > std::min(decoded_limit, large ? MAX_PART_LINEAGE_BYTES : MAX_RECORD_BYTES)
         || (!large && !bytes.starts_with("UMPROW01")))
         throw Exception(ErrorCodes::CORRUPTED_DATA, "Invalid UpsertMergeTree row metadata header");
     BinaryReader checksum{bytes.substr(bytes.size() - 4)};
@@ -167,7 +199,11 @@ PartRows decodePartRows(std::string_view bytes)
     for (size_t i = 0; i < count; ++i)
     {
         if (i % 65536 == 0)
+        {
+            if (process)
+                process->checkTimeLimit();
             CurrentMemoryTracker::check();
+        }
         auto key = in.string(MAX_UNIT_BYTES);
         auto value = decodeIndexValue(in.string(50));
         if (value.row_offset != i)
@@ -176,6 +212,281 @@ PartRows decodePartRows(std::string_view bytes)
     }
     in.end();
     return rows;
+}
+
+static PartRows decodeCompactPartRows(std::string_view bytes, QueryStatus * process)
+{
+    ProfileEventTimeIncrement<Microseconds> timer(ProfileEvents::UpsertLineageDecodeMicroseconds);
+    if (bytes.size() < PART_ROWS_ENVELOPE_BYTES || !bytes.starts_with("UMPCOL01"))
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "Invalid UpsertMergeTree compact lineage header");
+    BinaryReader checksum{bytes.substr(bytes.size() - 4)};
+    if (checksum.number(4) != crc(bytes.substr(0, bytes.size() - 4)))
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree compact lineage checksum mismatch");
+    BinaryReader in{bytes.substr(8, bytes.size() - 12)};
+    const auto count = in.count(MAX_PART_ROWS, 37);
+    if (!count)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "Empty UpsertMergeTree compact lineage");
+    PartRows rows;
+    rows.reserve(count);
+    CurrentMemoryTracker::check();
+    const auto check = [process](size_t row)
+    {
+        if (row % 65536 == 0)
+        {
+            if (process)
+                process->checkTimeLimit();
+            CurrentMemoryTracker::check();
+        }
+    };
+    for (size_t i = 0; i < count; ++i)
+    {
+        check(i);
+        rows.push_back({in.string(MAX_UNIT_BYTES), {.row_offset = static_cast<UInt32>(i), .row = {}}});
+    }
+    for (size_t i = 0; i < count; ++i)
+    {
+        check(i);
+        const auto flags = in.number(1);
+        if (flags & ~UInt64{3})
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "Unknown UpsertMergeTree compact lineage flags");
+        rows[i].value.row.self_binding = flags & 2;
+        if (flags & 1)
+            rows[i].value.row.version = 0;
+    }
+    for (size_t i = 0; i < count; ++i)
+    {
+        check(i);
+        rows[i].value.row.operation_id = in.id();
+    }
+    for (size_t i = 0; i < count; ++i)
+    {
+        check(i);
+        rows[i].value.row.block_ordinal = in.number();
+    }
+    for (size_t i = 0; i < count; ++i)
+    {
+        check(i);
+        rows[i].value.row.write_csn = in.number();
+    }
+    String validation_scratch;
+    for (size_t i = 0; i < count; ++i)
+    {
+        check(i);
+        if (rows[i].value.row.version)
+            rows[i].value.row.version = in.number();
+        /// Reuse the legacy validator for identity and `SELF`/resolved `CSN` semantics.
+        encodeIndexValue(rows[i].value, validation_scratch);
+    }
+    in.end();
+    return rows;
+}
+
+namespace
+{
+constexpr size_t LINEAGE_COMPRESSED_HEADER_SIZE = 32;
+constexpr size_t LINEAGE_BLOCK_SIZE = 1U << 20;
+constexpr size_t FRAME_CHECKSUM_SIZE = 16;
+
+struct LineageHeader
+{
+    size_t rows;
+    size_t decoded_size;
+    size_t logical_size;
+    UInt8 codec;
+    UInt8 inner_format;
+};
+
+LineageHeader compressedLineageHeader(std::string_view bytes, size_t decoded_limit)
+{
+    if (bytes.size() < LINEAGE_COMPRESSED_HEADER_SIZE || !bytes.starts_with("UMPROW03"))
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "Invalid UpsertMergeTree compressed lineage header");
+    BinaryReader in{bytes.substr(8, LINEAGE_COMPRESSED_HEADER_SIZE - 8)};
+    const auto version = in.number(1);
+    const auto codec = in.number(1);
+    const auto inner_format = in.number(1);
+    const auto flags = in.number(1);
+    const auto rows = in.number(4);
+    const auto decoded_size = in.number();
+    const auto reserved = in.number(4);
+    const auto checksum = in.number(4);
+    if (version != 1 || inner_format > 1 || flags || reserved
+        || (codec != static_cast<UInt8>(CompressionMethodByte::ZSTD)
+            && codec != static_cast<UInt8>(CompressionMethodByte::LZ4)
+            && codec != static_cast<UInt8>(CompressionMethodByte::NONE))
+        || checksum != crc(bytes.substr(0, LINEAGE_COMPRESSED_HEADER_SIZE - 4))
+        || !rows || rows > MAX_PART_ROWS || decoded_size > decoded_limit
+        || decoded_size < PART_ROWS_ENVELOPE_BYTES + rows * (inner_format == 0 ? UInt64{50} : UInt64{37}))
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "Invalid UpsertMergeTree compressed lineage bounds or checksum");
+    /// Only inner format 1 elides exactly 13 bytes per row from the legacy logical representation.
+    const UInt64 elided = inner_format == 1 ? rows * COMPACT_ELIDED_BYTES_PER_ROW : 0;
+    if (elided > decoded_limit - decoded_size)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree compact lineage exceeds its logical byte limit");
+    return {static_cast<size_t>(rows), static_cast<size_t>(decoded_size), static_cast<size_t>(decoded_size + elided),
+        static_cast<UInt8>(codec), static_cast<UInt8>(inner_format)};
+}
+
+String decompressPartRows(std::string_view bytes, size_t decoded_limit, size_t & expected_rows, UInt8 & inner_format, QueryStatus * process)
+{
+    const auto header = compressedLineageHeader(bytes, decoded_limit);
+    const auto codec = CompressionCodecFactory::instance().get(header.codec);
+    const auto frames = bytes.substr(LINEAGE_COMPRESSED_HEADER_SIZE);
+    size_t decoded_total = 0;
+    /// Validate every frame before allocating the decoded payload; no declared size is trusted.
+    for (size_t offset = 0; offset < frames.size();)
+    {
+        if (frames.size() - offset < FRAME_CHECKSUM_SIZE + COMPRESSED_BLOCK_HEADER_SIZE)
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "Truncated UpsertMergeTree lineage compression frame");
+        const auto * block = frames.data() + offset + FRAME_CHECKSUM_SIZE;
+        BinaryReader sizes{std::string_view(block + 1, 8)};
+        const auto compressed = static_cast<UInt32>(sizes.number(4));
+        const auto decoded = static_cast<UInt32>(sizes.number(4));
+        if (ICompressionCodec::readMethod(block) != header.codec || !decoded || decoded > LINEAGE_BLOCK_SIZE
+            || compressed < COMPRESSED_BLOCK_HEADER_SIZE || compressed > codec->getCompressedReserveSize(decoded)
+            || compressed > frames.size() - offset - FRAME_CHECKSUM_SIZE
+            || decoded > header.decoded_size - decoded_total)
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "Invalid UpsertMergeTree lineage compression frame bounds");
+        decoded_total += decoded;
+        offset += FRAME_CHECKSUM_SIZE + compressed;
+    }
+    if (decoded_total != header.decoded_size)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree lineage decoded size mismatch");
+    String decoded(decoded_total + codec->getAdditionalSizeAtTheEndOfBuffer(), '\0');
+    CurrentMemoryTracker::check();
+    size_t output_offset = 0;
+    size_t frame_count = 0;
+    for (size_t offset = 0; offset < frames.size();)
+    {
+        if (process && frame_count++ % 64 == 0)
+            process->checkTimeLimit();
+        const auto * block = frames.data() + offset + FRAME_CHECKSUM_SIZE;
+        const auto compressed = codec->readCompressedBlockSize(block);
+        BinaryReader checksum{frames.substr(offset, FRAME_CHECKSUM_SIZE)};
+        const auto low = checksum.number();
+        const auto high = checksum.number();
+        const auto actual = CityHash_v1_0_2::CityHash128(block, compressed);
+        if (low != actual.low64 || high != actual.high64)
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree lineage compression frame checksum mismatch");
+        const auto produced = codec->decompress(block, compressed, decoded.data() + output_offset);
+        if (produced != codec->readDecompressedBlockSize(block))
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree lineage frame decoded length mismatch");
+        output_offset += produced;
+        offset += FRAME_CHECKSUM_SIZE + compressed;
+        CurrentMemoryTracker::check();
+    }
+    decoded.resize(decoded_total);
+    if (header.inner_format == 1 ? !decoded.starts_with("UMPCOL01")
+        : (!decoded.starts_with("UMPROW01") && !decoded.starts_with("UMPROW02")))
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "Invalid UpsertMergeTree compressed lineage inner format");
+    expected_rows = header.rows;
+    inner_format = header.inner_format;
+    return decoded;
+}
+}
+
+size_t partRowsStoredSizeLimit(size_t decoded_limit)
+{
+    if (decoded_limit > MAX_PART_LINEAGE_BYTES)
+        throw Exception(ErrorCodes::LIMIT_EXCEEDED, "Invalid UpsertMergeTree decoded lineage limit");
+    static const size_t overhead = []
+    {
+        size_t result = 0;
+        for (const auto method : {CompressionMethodByte::ZSTD, CompressionMethodByte::LZ4, CompressionMethodByte::NONE})
+        {
+            const auto codec = CompressionCodecFactory::instance().get(static_cast<UInt8>(method));
+            result = std::max(result, FRAME_CHECKSUM_SIZE + codec->getCompressedReserveSize(LINEAGE_BLOCK_SIZE) - LINEAGE_BLOCK_SIZE);
+        }
+        return result;
+    }();
+    return LINEAGE_COMPRESSED_HEADER_SIZE + decoded_limit + ((decoded_limit + LINEAGE_BLOCK_SIZE - 1) / LINEAGE_BLOCK_SIZE) * overhead;
+}
+
+String compressPartRows(std::string_view bytes, int level)
+{
+    const bool compact = bytes.starts_with("UMPCOL01");
+    const bool large = bytes.starts_with("UMPROW02");
+    if ((!compact && !large && !bytes.starts_with("UMPROW01")) || bytes.size() < PART_ROWS_ENVELOPE_BYTES
+        || bytes.size() > (large || compact ? MAX_PART_LINEAGE_BYTES : MAX_RECORD_BYTES))
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid UpsertMergeTree lineage compression input");
+    BinaryReader row_count{bytes.substr(8, 4)};
+    BinaryWriter header;
+    header.bytes = "UMPROW03";
+    header.number(1, 1);
+    header.number(static_cast<UInt8>(CompressionMethodByte::ZSTD), 1);
+    header.number(compact ? 1 : 0, 1);
+    header.number(0, 1);
+    const auto count = row_count.number(4);
+    if (!count || count > MAX_PART_ROWS || (compact && count > (MAX_PART_LINEAGE_BYTES - bytes.size()) / COMPACT_ELIDED_BYTES_PER_ROW))
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid UpsertMergeTree lineage compression logical size or rows");
+    header.number(count, 4);
+    header.number(bytes.size());
+    header.number(0, 4);
+    header.number(crc(header.bytes), 4);
+    WriteBufferFromOwnString out;
+    out.write(header.bytes.data(), header.bytes.size());
+    CompressedWriteBuffer compressed(out, CompressionCodecFactory::instance().get("ZSTD", level), LINEAGE_BLOCK_SIZE);
+    compressed.write(bytes.data(), bytes.size());
+    compressed.finalize();
+    out.finalize();
+    return out.str();
+}
+
+PartRows decodePartRows(std::string_view bytes, size_t decoded_limit, QueryStatus * process)
+{
+    if (!bytes.starts_with("UMPROW03"))
+        return decodeRawPartRows(bytes, decoded_limit, process);
+    if (bytes.size() > partRowsStoredSizeLimit(decoded_limit))
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree compressed lineage exceeds its stored byte limit");
+    try
+    {
+        size_t expected_rows = 0;
+        UInt8 inner_format = 0;
+        const auto decoded = decompressPartRows(bytes, decoded_limit, expected_rows, inner_format, process);
+        auto rows = inner_format == 1 ? decodeCompactPartRows(decoded, process) : decodeRawPartRows(decoded, decoded_limit, process);
+        if (rows.size() != expected_rows)
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree compressed lineage row count mismatch");
+        return rows;
+    }
+    catch (const Exception & exception)
+    {
+        if (exception.code() == ErrorCodes::MEMORY_LIMIT_EXCEEDED || exception.code() == ErrorCodes::CANNOT_ALLOCATE_MEMORY
+            || exception.code() == ErrorCodes::QUERY_WAS_CANCELLED || exception.code() == ErrorCodes::TIMEOUT_EXCEEDED
+            || exception.code() == ErrorCodes::ABORTED || exception.code() == ErrorCodes::CORRUPTED_DATA)
+            throw;
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "Cannot decode UpsertMergeTree compressed lineage: {}", exception.message());
+    }
+
+}
+
+size_t readPartRowsDecodedSize(const String & path, size_t stored_size, size_t rows)
+{
+    char header[LINEAGE_COMPRESSED_HEADER_SIZE];
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0)
+        throw ErrnoException(ErrorCodes::CANNOT_OPEN_FILE, "Cannot open UpsertMergeTree lineage planner header {}", path);
+    SCOPE_EXIT({ ::close(fd); });
+    ssize_t read_size;
+    do
+    {
+        read_size = ::pread(fd, header, sizeof(header), 0);
+    }
+    while (read_size < 0 && errno == EINTR);
+    if (read_size < 0)
+        throw ErrnoException(ErrorCodes::CANNOT_READ_FROM_FILE_DESCRIPTOR, "Cannot read UpsertMergeTree lineage planner header {}", path);
+    const std::string_view prefix(header, static_cast<size_t>(read_size));
+    size_t decoded_size = stored_size;
+    if (prefix.starts_with("UMPROW03"))
+    {
+        const auto parsed = compressedLineageHeader(prefix, MAX_PART_LINEAGE_BYTES);
+        if (parsed.rows != rows || stored_size > partRowsStoredSizeLimit(MAX_PART_LINEAGE_BYTES))
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "Invalid UpsertMergeTree lineage planner size or row count");
+        decoded_size = parsed.logical_size;
+    }
+    else if ((!prefix.starts_with("UMPROW01") && !prefix.starts_with("UMPROW02"))
+        || stored_size > (prefix.starts_with("UMPROW02") ? MAX_PART_LINEAGE_BYTES : MAX_RECORD_BYTES))
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "Invalid UpsertMergeTree lineage planner magic or size");
+    if (decoded_size < PART_ROWS_ENVELOPE_BYTES + rows * UInt64{50})
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree lineage planner size is too small");
+    return decoded_size;
 }
 
 ValidatedPartRows::ValidatedPartRows(PartRows rows_, ObjectID part_) : rows(std::move(rows_)), part(part_)
@@ -323,10 +634,10 @@ MergeTreeDataPartChecksum ttlPolicyChecksum(const StorageInMemoryMetadata & meta
     return {policy.size(), hashing.getHash()};
 }
 
-void writePartIndex(
+size_t writePartIndex(
     IDataPartStorage & storage, const Block & block, const StorageInMemoryMetadata & metadata,
     const String & version_column, ObjectID operation_id, const IColumn::Permutation * permutation,
-    size_t max_key_bytes, ContextPtr context, MergeTreeDataPartChecksums & checksums)
+    size_t max_key_bytes, ContextPtr context, MergeTreeDataPartChecksums & checksums, bool compress_lineage, int compression_level, bool compact_lineage)
 {
     ProfileEventTimeIncrement<Microseconds> timer(ProfileEvents::UpsertPartIndexMicroseconds);
     const auto keys = encodeKeys(block, metadata, max_key_bytes);
@@ -355,7 +666,12 @@ void writePartIndex(
         }
         rows.push_back({keys[source], {static_cast<UInt32>(offset), row}});
     }
-    const auto bytes = encodePartRows(rows);
+    if (compact_lineage && !compress_lineage)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Compact UpsertMergeTree lineage requires compression");
+    auto bytes = encodePartRows(rows, compact_lineage);
+    const auto decoded_size = bytes.size() + (compact_lineage ? rows.size() * COMPACT_ELIDED_BYTES_PER_ROW : 0);
+    if (compress_lineage)
+        bytes = compressPartRows(bytes, compression_level);
     auto out = storage.writeFile(ROWS_FILE, DBMS_DEFAULT_BUFFER_SIZE, context->getWriteSettings());
     HashingWriteBuffer hashing(*out);
     hashing.write(bytes.data(), bytes.size());
@@ -379,6 +695,7 @@ void writePartIndex(
 
     /// `UpsertMergeTree` winner lookups use the state database, so new parts need no duplicate `SST`.
     /// Old parts retain their authenticated `SST`; any future reader must authenticate its inventory entry.
+    return decoded_size;
 }
 
 namespace

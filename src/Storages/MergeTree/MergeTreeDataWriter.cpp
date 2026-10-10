@@ -96,6 +96,9 @@ namespace Setting
 namespace MergeTreeSetting
 {
     extern const MergeTreeSettingsBool assign_part_uuids;
+    extern const MergeTreeSettingsBool upsert_lineage_compression;
+    extern const MergeTreeSettingsBool upsert_lineage_compact;
+    extern const MergeTreeSettingsUInt64 upsert_lineage_compression_level;
     extern const MergeTreeSettingsBool fsync_after_insert;
     extern const MergeTreeSettingsBool fsync_part_directory;
     extern const MergeTreeSettingsBool materialize_skip_indexes_on_merge;
@@ -1123,10 +1126,13 @@ MergeTreeTemporaryPartPtr MergeTreeDataWriter::writeTempPartImpl(
     }
 
     if (data.merging_params.upsert)
-        Upsert::writePartIndex(
+        new_data_part->upsert_lineage_decoded_size = Upsert::writePartIndex(
             *data_part_storage, block, *metadata_snapshot, data.merging_params.upsert_version_column,
             {UUIDHelpers::getHighBytes(new_data_part->uuid), UUIDHelpers::getLowBytes(new_data_part->uuid)},
-            perm_ptr, context->getSettingsRef()[Setting::unique_key_max_encoded_size], context, gathered_data.checksums);
+            perm_ptr, context->getSettingsRef()[Setting::unique_key_max_encoded_size], context, gathered_data.checksums,
+            (*data_settings)[MergeTreeSetting::upsert_lineage_compression],
+            static_cast<int>((*data_settings)[MergeTreeSetting::upsert_lineage_compression_level]),
+            (*data_settings)[MergeTreeSetting::upsert_lineage_compact]);
     else if (metadata_snapshot->hasUniqueKey())
     {
         SSTIndexWriter::writeDenseIndexOnInsert(

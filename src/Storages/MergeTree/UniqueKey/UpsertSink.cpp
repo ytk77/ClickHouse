@@ -396,7 +396,7 @@ std::unique_ptr<Upsert::PreparedInsert> StorageMergeTree::prepareUpsertBlock(
     Upsert::PartRows rows;
     {
         ProfileEventTimeIncrement<Microseconds> read_timer(ProfileEvents::UpsertLineageReadbackMicroseconds);
-        rows = Upsert::decodePartRows(Upsert::readBoundedFile(std::filesystem::path(path) / Upsert::ROWS_FILE, Upsert::MAX_RECORD_BYTES));
+        rows = Upsert::decodePartRows(Upsert::readBoundedFile(std::filesystem::path(path) / Upsert::ROWS_FILE, Upsert::partRowsStoredSizeLimit(Upsert::MAX_RECORD_BYTES)), Upsert::MAX_RECORD_BYTES, query_context->getProcessListElement().get());
     }
     Upsert::PartCommit authorization;
     authorization.part = {UUIDHelpers::getHighBytes(part->uuid), UUIDHelpers::getLowBytes(part->uuid)};

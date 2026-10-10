@@ -473,7 +473,7 @@ void StateStore::recoverPartition(const String & partition, Partition & entry)
             const auto path = final_exists ? final : temporary;
             if (hashPartDirectory(path, false) != record.files_hash)
                 throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree authenticated files mismatch for {}", record.final_name);
-            rows = decodePartRows(readBoundedFile(path / ROWS_FILE, MAX_RECORD_BYTES));
+            rows = decodePartRows(readBoundedFile(path / ROWS_FILE, partRowsStoredSizeLimit(MAX_RECORD_BYTES)), MAX_RECORD_BYTES);
             if (!final_exists)
             {
                 fs::rename(temporary, final);

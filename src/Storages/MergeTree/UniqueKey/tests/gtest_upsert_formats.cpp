@@ -12,6 +12,11 @@
 #include <DataTypes/DataTypesNumber.h>
 #include <Parsers/ASTIdentifier.h>
 #include <Common/Exception.h>
+#include <Compression/CompressionFactory.h>
+#include <Compression/CompressedWriteBuffer.h>
+#include <IO/WriteBufferFromString.h>
+#include <zlib.h>
+#include <city.h>
 #include <Common/scope_guard_safe.h>
 #include <gtest/gtest.h>
 #include <limits>
@@ -607,4 +612,329 @@ TEST(UpsertPartInventory, SidecarReadMatchesCommittedBytesAndRequiresInventoryEn
         EXPECT_EQ(error.code(), ErrorCodes::CORRUPTED_DATA);
         EXPECT_NE(error.message().find("authenticated sidecar mismatch"), String::npos);
     }
+}
+
+namespace
+{
+void expectLineageCorruption(const String & bytes, std::string_view message, size_t limit = MAX_PART_LINEAGE_BYTES)
+{
+    try
+    {
+        static_cast<void>(decodePartRows(bytes, limit));
+        FAIL() << "Expected lineage corruption";
+    }
+    catch (const Exception & exception)
+    {
+        EXPECT_EQ(exception.code(), ErrorCodes::CORRUPTED_DATA);
+        EXPECT_NE(exception.message().find(message), String::npos) << exception.message();
+    }
+}
+
+void setLineageNumber(String & bytes, size_t offset, UInt64 value, size_t width)
+{
+    for (size_t i = 0; i < width; ++i)
+        bytes[offset + i] = static_cast<char>(value >> (8 * i));
+}
+
+void refreshLineageHeaderCRC(String & bytes)
+{
+    setLineageNumber(bytes, 28, crc32(0, reinterpret_cast<const Bytef *>(bytes.data()), 28), 4);
+}
+
+String framedLineage(const String & raw, CompressionMethodByte method)
+{
+    auto header = compressPartRows(raw).substr(0, 32);
+    header[9] = static_cast<char>(method);
+    refreshLineageHeaderCRC(header);
+    WriteBufferFromOwnString out;
+    out.write(header.data(), header.size());
+    CompressedWriteBuffer frames(out, CompressionCodecFactory::instance().get(static_cast<UInt8>(method)), 1U << 20);
+    frames.write(raw.data(), raw.size());
+    frames.finalize();
+    out.finalize();
+    return out.str();
+}
+
+PartRows smallCompressionRows()
+{
+    return {{"key", {.row_offset = 0,
+        .row = {.operation_id = {1, 2}, .block_ordinal = 1, .self_binding = true}}}};
+}
+}
+
+TEST(UpsertPartRowsCompression, PreservesLegacyBytesAndBoundedDecode)
+{
+    PartRows rows;
+    for (UInt32 i = 0; i < 40000; ++i)
+        rows.push_back({"site/event/" + std::to_string(i),
+            {.row_offset = i, .row = {.operation_id = {1, 2}, .block_ordinal = i, .version = 123, .self_binding = true}}});
+    const auto raw = encodePartRows(rows);
+    const auto compressed = compressPartRows(raw);
+    EXPECT_TRUE(compressed.starts_with("UMPROW03"));
+    EXPECT_LT(compressed.size(), raw.size() / 2);
+    EXPECT_EQ(decodePartRows(compressed, raw.size()), rows);
+    EXPECT_EQ(decodePartRows(raw, raw.size()), rows);
+    expectLineageCorruption(compressed, "bounds or checksum", raw.size() - 1);
+    expectLineageCorruption(raw, "metadata header", raw.size() - 1);
+    EXPECT_LE(compressed.size(), partRowsStoredSizeLimit(raw.size()));
+    auto corrupt = compressed;
+    corrupt[16] ^= 1;
+    expectLineageCorruption(corrupt, "bounds or checksum");
+    corrupt = compressed;
+    corrupt[32] ^= 1;
+    expectLineageCorruption(corrupt, "frame checksum mismatch");
+    corrupt = compressed;
+    corrupt[48] = static_cast<char>(0x91);
+    expectLineageCorruption(corrupt, "frame bounds");
+    expectLineageCorruption(compressed.substr(0, compressed.size() - 1), "frame bounds");
+    expectLineageCorruption(compressed + "trailing", "Truncated");
+}
+
+TEST(UpsertPartRowsCompression, RejectsDeclaredExpansionBeforeAllocation)
+{
+    const auto compressed = compressPartRows(encodePartRows(smallCompressionRows()));
+    for (const auto size : {UInt32{0}, UInt32{2U << 20}})
+    {
+        auto corrupt = compressed;
+        setLineageNumber(corrupt, 53, size, 4);
+        expectLineageCorruption(corrupt, "frame bounds");
+    }
+    auto corrupt = compressed;
+    setLineageNumber(corrupt, 49, 3U << 20, 4);
+    expectLineageCorruption(corrupt, "frame bounds");
+    expectLineageCorruption(compressed.substr(0, 32), "decoded size mismatch");
+    corrupt = compressed;
+    setLineageNumber(corrupt, 16, 70, 8);
+    refreshLineageHeaderCRC(corrupt);
+    expectLineageCorruption(corrupt, "decoded size mismatch");
+    corrupt = compressed;
+    setLineageNumber(corrupt, 16, 68, 8);
+    refreshLineageHeaderCRC(corrupt);
+    expectLineageCorruption(corrupt, "frame bounds");
+}
+
+TEST(UpsertPartRowsCompression, RejectsUnsupportedHeaderFields)
+{
+    const auto compressed = compressPartRows(encodePartRows(smallCompressionRows()));
+    for (const size_t offset : {size_t{8}, size_t{9}, size_t{10}, size_t{11}, size_t{24}})
+    {
+        auto corrupt = compressed;
+        corrupt[offset] = static_cast<char>(0xff);
+        refreshLineageHeaderCRC(corrupt);
+        expectLineageCorruption(corrupt, "bounds or checksum");
+    }
+}
+
+TEST(UpsertPartRowsCompression, AllowsAllDeclaredGenericCodecsAndChecksInnerPayload)
+{
+    const auto rows = smallCompressionRows();
+    const auto raw = encodePartRows(rows);
+    for (const auto method : {CompressionMethodByte::ZSTD, CompressionMethodByte::LZ4, CompressionMethodByte::NONE})
+        EXPECT_EQ(decodePartRows(framedLineage(raw, method)), rows);
+    auto malformed = raw;
+    malformed[0] = 'X';
+    auto frames = framedLineage(raw, CompressionMethodByte::NONE);
+    // Rebuild standard frames while preserving the valid outer header.
+    WriteBufferFromOwnString out;
+    out.write(frames.data(), 32);
+    CompressedWriteBuffer compressed(out, CompressionCodecFactory::instance().get(static_cast<UInt8>(CompressionMethodByte::NONE)), 1U << 20);
+    compressed.write(malformed.data(), malformed.size());
+    compressed.finalize();
+    out.finalize();
+    expectLineageCorruption(out.str(), "inner format");
+    auto count_mismatch = compressPartRows(raw);
+    setLineageNumber(count_mismatch, 12, 2, 4);
+    refreshLineageHeaderCRC(count_mismatch);
+    /// Two rows cannot fit the declared 69 bytes: reject before allocation.
+    expectLineageCorruption(count_mismatch, "bounds or checksum");
+}
+
+TEST(UpsertPartRowsCompression, PlannerHeadersKeepStoredAndDecodedSizesSeparate)
+{
+    const auto root = std::filesystem::current_path() / "tmp" / ("lineage_fixture_" + objectName(newObjectID()));
+    std::filesystem::create_directories(root);
+    SCOPE_EXIT({ std::filesystem::remove_all(root); });
+    const auto rows = smallCompressionRows();
+    const auto raw = encodePartRows(rows);
+    for (const auto & bytes : {raw, compressPartRows(raw)})
+    {
+        const auto file = root / "rows.bin";
+        createDurableFile(file.string(), bytes);
+        EXPECT_EQ(readPartRowsDecodedSize(file.string(), bytes.size(), rows.size()), raw.size());
+        std::filesystem::remove(file);
+    }
+    const auto file = root / "rows.bin";
+    const auto compressed = compressPartRows(raw);
+    createDurableFile(file.string(), compressed);
+    EXPECT_THROW(readPartRowsDecodedSize(file.string(), compressed.size(), 2), Exception);
+}
+
+TEST(UpsertPartRowsCompression, CallerLimitAppliesToLargeInnerFormat)
+{
+    PartRows rows;
+    for (UInt32 i = 0; i < 2; ++i)
+        rows.push_back({String(MAX_UNIT_BYTES, static_cast<char>('a' + i)),
+            {.row_offset = i, .row = {.operation_id = {1, 2}, .block_ordinal = i, .self_binding = true}}});
+    const auto raw = encodePartRows(rows);
+    ASSERT_TRUE(raw.starts_with("UMPROW02"));
+    ASSERT_GT(raw.size(), MAX_RECORD_BYTES);
+    const auto compressed = compressPartRows(raw);
+    expectLineageCorruption(compressed, "bounds or checksum", MAX_RECORD_BYTES);
+    EXPECT_EQ(decodePartRows(compressed), rows);
+}
+
+TEST(UpsertPartRowsCompression, ChecksInnerCountAfterFrameValidation)
+{
+    auto rows = smallCompressionRows();
+    rows.front().key = String(100, 'k');
+    auto compressed = compressPartRows(encodePartRows(rows));
+    setLineageNumber(compressed, 12, 2, 4);
+    refreshLineageHeaderCRC(compressed);
+    expectLineageCorruption(compressed, "row count mismatch");
+}
+
+TEST(UpsertPartRowsCompression, PlannerRejectsMalformedAndTruncatedHeaders)
+{
+    const auto root = std::filesystem::current_path() / "tmp" / ("lineage_planner_" + objectName(newObjectID()));
+    std::filesystem::create_directories(root);
+    SCOPE_EXIT({ std::filesystem::remove_all(root); });
+    const auto raw = encodePartRows(smallCompressionRows());
+    const auto compressed = compressPartRows(raw);
+    const auto check = [&](const String & bytes, size_t rows, std::string_view message)
+    {
+        const auto file = root / "rows.bin";
+        createDurableFile(file.string(), bytes);
+        SCOPE_EXIT({ std::filesystem::remove(file); });
+        try
+        {
+            static_cast<void>(readPartRowsDecodedSize(file.string(), bytes.size(), rows));
+            FAIL() << "Expected planner corruption";
+        }
+        catch (const Exception & exception)
+        {
+            EXPECT_EQ(exception.code(), ErrorCodes::CORRUPTED_DATA);
+            EXPECT_NE(exception.message().find(message), String::npos) << exception.message();
+        }
+    };
+    check(compressed, 2, "planner size or row count");
+    check(compressed.substr(0, 20), 1, "compressed lineage header");
+    check("BADMAGIC", 1, "planner magic or size");
+    check("UMPROW01", 1, "planner size is too small");
+    auto large = raw;
+    large.replace(0, 8, "UMPROW02");
+    const auto file = root / "large.bin";
+    createDurableFile(file.string(), large);
+    EXPECT_EQ(readPartRowsDecodedSize(file.string(), large.size(), 1), raw.size());
+}
+
+
+TEST(UpsertPartRowsCompression, GoldenEnvelopeAndAuthenticatedUndecodableFrame)
+{
+    const auto fixture = fromHex("554d50524f57303301900000010000004500000000000000000000008c5104580b67a5238ce382e93c91dd267b62c47190470000004500000028b52ffd2045ad0100b402554d50524f57303101000000030000006b65792a000000554d5256010200000000010002000100da57ee660310001263bce109");
+    const auto rows = smallCompressionRows();
+    EXPECT_EQ(decodePartRows(fixture), rows);
+    EXPECT_EQ(compressPartRows(encodePartRows(rows)).substr(0, 32), fixture.substr(0, 32));
+    auto corrupt = fixture;
+    corrupt[57] = 0;
+    const auto hash = CityHash_v1_0_2::CityHash128(corrupt.data() + 48, corrupt.size() - 48);
+    setLineageNumber(corrupt, 32, hash.low64, 8);
+    setLineageNumber(corrupt, 40, hash.high64, 8);
+    expectLineageCorruption(corrupt, "Cannot decode UpsertMergeTree compressed lineage");
+}
+
+
+TEST(UpsertPartRowsCompact, GoldenInnerAndLogicalPlannerSize)
+{
+    const auto rows = smallCompressionRows();
+    const auto golden = fromHex("554d50434f4c303101000000030000006b65790201000000000000000200000000000000010000000000000000000000000000008745d9cb");
+    EXPECT_EQ(encodePartRows(rows, true), golden);
+    const auto compressed = compressPartRows(golden);
+    EXPECT_EQ(compressed.substr(0, 32), fromHex("554d50524f57303301900100010000003800000000000000000000007767b30d"));
+    EXPECT_EQ(decodePartRows(compressed), rows);
+    const auto logical_size = encodePartRows(rows).size();
+    EXPECT_EQ(golden.size() + 13 * rows.size(), logical_size);
+    EXPECT_EQ(decodePartRows(compressed, logical_size), rows);
+    expectLineageCorruption(compressed, "logical byte limit", logical_size - 1);
+    const auto root = std::filesystem::current_path() / "tmp" / ("compact_planner_" + objectName(newObjectID()));
+    std::filesystem::create_directories(root);
+    SCOPE_EXIT({ std::filesystem::remove_all(root); });
+    const auto file = root / "rows.bin";
+    createDurableFile(file.string(), compressed);
+    EXPECT_EQ(readPartRowsDecodedSize(file.string(), compressed.size(), rows.size()), logical_size);
+}
+
+TEST(UpsertPartRowsCompact, DifferentialMixedFlagsAndBinaryKeys)
+{
+    UInt64 random = 1;
+    const auto next = [&]
+    {
+        random ^= random << 13;
+        random ^= random >> 7;
+        random ^= random << 17;
+        return random;
+    };
+    PartRows rows;
+    for (UInt32 i = 0; i < 20000; ++i)
+    {
+        String key(i % 37, static_cast<char>(next()));
+        key += String("a\0b", 3);
+        const bool self = i % 3 == 0;
+        RowMetadata value{.operation_id = {next() | 1, next()}, .block_ordinal = next(),
+            .write_csn = self ? 0 : next() | 1, .self_binding = self};
+        if (i % 2)
+            value.version = next();
+        rows.push_back({std::move(key), {.row_offset = i, .row = value}});
+    }
+    rows[0].key.clear();
+    rows[1].key = String(32768, 'k');
+    const auto legacy = encodePartRows(rows);
+    const auto compact = encodePartRows(rows, true);
+    EXPECT_EQ(compact.size() + 13 * rows.size(), legacy.size());
+    EXPECT_EQ(decodePartRows(legacy), rows);
+    for (const auto method : {CompressionMethodByte::ZSTD, CompressionMethodByte::LZ4, CompressionMethodByte::NONE})
+        EXPECT_EQ(decodePartRows(framedLineage(compact, method), legacy.size()), rows);
+    expectLineageCorruption(compressPartRows(compact), "logical byte limit", legacy.size() - 1);
+}
+
+TEST(UpsertPartRowsCompact, RejectsMalformedSectionsAndBindings)
+{
+    const auto raw = encodePartRows(smallCompressionRows(), true);
+    const auto refresh = [](String & bytes)
+    {
+        setLineageNumber(bytes, bytes.size() - 4, crc32(0, reinterpret_cast<const Bytef *>(bytes.data()), bytes.size() - 4), 4);
+    };
+    auto corrupt = raw;
+    setLineageNumber(corrupt, 12, MAX_UNIT_BYTES + 1, 4);
+    refresh(corrupt);
+    expectLineageCorruption(framedLineage(corrupt, CompressionMethodByte::NONE), "payload string length");
+    corrupt = raw;
+    corrupt[19] = 4;
+    refresh(corrupt);
+    expectLineageCorruption(framedLineage(corrupt, CompressionMethodByte::NONE), "compact lineage flags");
+    corrupt = raw;
+    setLineageNumber(corrupt, 20, 0, 8);
+    setLineageNumber(corrupt, 28, 0, 8);
+    refresh(corrupt);
+    expectLineageCorruption(framedLineage(corrupt, CompressionMethodByte::NONE), "identity or write CSN binding");
+    corrupt = raw;
+    setLineageNumber(corrupt, 44, 1, 8);
+    refresh(corrupt);
+    expectLineageCorruption(framedLineage(corrupt, CompressionMethodByte::NONE), "identity or write CSN binding");
+    corrupt = raw;
+    corrupt[19] = 3;
+    refresh(corrupt);
+    expectLineageCorruption(framedLineage(corrupt, CompressionMethodByte::NONE), "Truncated");
+    corrupt = raw;
+    corrupt.insert(corrupt.size() - 4, 1, 'x');
+    refresh(corrupt);
+    expectLineageCorruption(framedLineage(corrupt, CompressionMethodByte::NONE), "Trailing bytes");
+    corrupt = raw;
+    corrupt.back() ^= 1;
+    expectLineageCorruption(framedLineage(corrupt, CompressionMethodByte::NONE), "compact lineage checksum mismatch");
+    auto rows = smallCompressionRows();
+    rows[0].key = String(100, 'k');
+    corrupt = compressPartRows(encodePartRows(rows, true));
+    setLineageNumber(corrupt, 12, 2, 4);
+    refreshLineageHeaderCRC(corrupt);
+    expectLineageCorruption(corrupt, "row count mismatch");
 }
