@@ -783,6 +783,14 @@ DiskState::DiskState(const String & table_path, ObjectID incarnation, bool attac
     /// Rotate the diagnostic `LOG`; limiting retained files alone does not limit one growing log.
     options.max_log_file_size = 64U << 20;
     options.keep_log_file_num = 2;
+    if (resources.state_compression)
+    {
+        options.compression = rocksdb::kZSTD;
+        options.compression_opts.level = 1;
+        options.bottommost_compression = rocksdb::kZSTD;
+        options.bottommost_compression_opts.level = 3;
+        options.bottommost_compression_opts.enabled = true;
+    }
     options.max_background_jobs = static_cast<int>(resources.background_jobs);
     rocksdb::BlockBasedTableOptions table_options;
     impl->database->index_cache = rocksdb::NewLRUCache(resources.index_cache_bytes);

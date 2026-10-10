@@ -16,6 +16,7 @@ struct Resources
     UInt64 recovery_threads = 4;
     UInt64 mask_cache_bytes = 32ULL << 20;
     bool partitioned_filters = true;
+    bool state_compression = false;
     void validate() const;
 };
 }

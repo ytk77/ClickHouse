@@ -150,6 +150,7 @@ namespace MergeTreeSetting
     extern const MergeTreeSettingsUInt64 upsert_max_open_files;
     extern const MergeTreeSettingsUInt64 upsert_recovery_threads;
     extern const MergeTreeSettingsBool upsert_partitioned_filters;
+    extern const MergeTreeSettingsBool upsert_state_compression;
     extern const MergeTreeSettingsUInt64 upsert_mask_cache_bytes;
     extern const MergeTreeSettingsBool allow_experimental_replacing_merge_with_cleanup;
     extern const MergeTreeSettingsMergeTreePatchPartsVersion patch_parts_version;
@@ -274,6 +275,7 @@ StorageMergeTree::StorageMergeTree(
         resources.recovery_threads = (*upsert_settings)[MergeTreeSetting::upsert_recovery_threads];
         resources.mask_cache_bytes = (*upsert_settings)[MergeTreeSetting::upsert_mask_cache_bytes];
         resources.partitioned_filters = (*upsert_settings)[MergeTreeSetting::upsert_partitioned_filters];
+        resources.state_compression = (*upsert_settings)[MergeTreeSetting::upsert_state_compression];
         resources.validate();
         initializeDirectoriesAndFormatVersion(relative_data_path_, LoadingStrictnessLevel::ATTACH <= mode, date_column_name);
         bool use_disk_state = false;

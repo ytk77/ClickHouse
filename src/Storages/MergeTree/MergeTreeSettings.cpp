@@ -55,6 +55,13 @@ namespace ErrorCodes
   * and should not be changed by the user without a reason.
   */
 #define MERGE_TREE_SETTINGS(DECLARE, DECLARE_WITH_ALIAS) \
+    DECLARE(Bool, upsert_state_compression, false, R"(
+Use `ZSTD(1)` for upper `RocksDB` levels and `ZSTD(3)` for bottommost state blocks in `UpsertMergeTree`.
+Default: false. Applied when the table opens; `ALTER` is not supported.
+Existing blocks keep their codec until normal compaction rewrites them. Compaction requires temporary disk space.
+This does not change state records, durability or the 64 MiB index-cache default.
+)", 0, \
+        {"26.10", false, false, "New opt-in state compression setting for `UpsertMergeTree`."}) \
     DECLARE(UInt64, upsert_insert_target_bytes, 512ULL << 20, R"(
 Maximum uncompressed input column bytes per `UpsertMergeTree` insert unit.
 Default: 512 MiB. Allowed range: 32 MiB to 1 GiB.
