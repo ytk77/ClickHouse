@@ -24,6 +24,7 @@
 #include <Interpreters/ExpressionActions.h>
 #include <Interpreters/ClusterProxy/executeQuery.h>
 #include <Interpreters/Context.h>
+#include <Interpreters/AsynchronousInsertQueue.h>
 #include <Interpreters/InsertDependenciesBuilder.h>
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTInsertQuery.h>
@@ -1560,6 +1561,8 @@ BlockIO InterpreterInsertQuery::execute()
                 }
                 reason = "query runs inside a transaction";
             }
+            else if (AsynchronousInsertQueue::requiresSynchronousInsert(table, context))
+                reason = "destination dependency chain requires synchronous insert (UpsertMergeTree)";
             /// `StorageAlias::isMergeTree` delegates to its target, so the alias needs no unwrapping.
             else if (!table->isMergeTree())
                 reason = "destination table is not a MergeTree-family table";

@@ -577,8 +577,18 @@ bool AsynchronousInsertQueue::preprocessInsertQuery(const ASTPtr & query, const 
         table->checkInsertIsAllowed(query_context);
     }
 
-    /// Select synchronous execution before consuming input or acknowledging data, including cascading views.
-    /// `UpsertMergeTree` cannot consume the asynchronous flush protocol in its sink.
+    /// Select synchronous execution before consuming input or acknowledging data.
+    if (requiresSynchronousInsert(table, query_context))
+        return false;
+
+    insert_query.columns = make_intrusive<ASTExpressionList>();
+    for (const auto & column : sample_block)
+        insert_query.columns->children.push_back(make_intrusive<ASTIdentifier>(column.name));
+    return true;
+}
+
+bool AsynchronousInsertQueue::requiresSynchronousInsert(const StoragePtr & table, ContextPtr query_context)
+{
     std::vector<StoragePtr> destinations{table};
     std::unordered_set<StorageID, StorageID::DatabaseAndTableNameAndUUIDHash, StorageID::DatabaseAndTableNameAndUUIDEqual> visited;
     for (size_t i = 0; i < destinations.size(); ++i)
@@ -588,7 +598,7 @@ bool AsynchronousInsertQueue::preprocessInsertQuery(const ASTPtr & query, const 
         if (!visited.insert(id).second)
             continue;
         if (destination->getName() == "UpsertMergeTree")
-            return false;
+            return true;
         if (const auto * view = dynamic_cast<const StorageMaterializedView *>(destination.get()))
         {
             /// Missing destinations retain the flush-time materialized-view error policy.
@@ -607,11 +617,7 @@ bool AsynchronousInsertQueue::preprocessInsertQuery(const ASTPtr & query, const 
             }
         }
     }
-
-    insert_query.columns = make_intrusive<ASTExpressionList>();
-    for (const auto & column : sample_block)
-        insert_query.columns->children.push_back(make_intrusive<ASTIdentifier>(column.name));
-    return true;
+    return false;
 }
 
 AsynchronousInsertQueue::PushResult

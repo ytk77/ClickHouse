@@ -13,6 +13,7 @@
 #include <Interpreters/AsynchronousInsertQueueDataKind.h>
 #include <Interpreters/StorageID.h>
 #include <Interpreters/Context_fwd.h>
+#include <Storages/IStorage_fwd.h>
 #include <base/defines.h>
 
 #include <future>
@@ -46,6 +47,9 @@ public:
 
     AsynchronousInsertQueue(ContextPtr context_, size_t pool_size_, bool flush_on_shutdown_);
     ~AsynchronousInsertQueue();
+
+    /// The same destination walk governs both inline and `INSERT SELECT` queue admission.
+    static bool requiresSynchronousInsert(const StoragePtr & table, ContextPtr query_context);
 
     struct PushResult
     {

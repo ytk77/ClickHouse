@@ -28,6 +28,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int TIMEOUT_EXCEEDED;
+    extern const int NOT_IMPLEMENTED;
 }
 
 namespace
@@ -292,6 +293,9 @@ AsyncInsertQueueTransform::GenerateResult AsyncInsertQueueTransform::getRemainin
         for (const auto & name : insert_column_names)
             async_insert_query.columns->children.push_back(make_intrusive<ASTIdentifier>(name));
         auto result = queue->pushQueryWithBlock(async_query, std::move(block), context);
+        if (result.status != AsynchronousInsertQueue::PushResult::OK)
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+                "Asynchronous INSERT SELECT destination requires synchronous execution; retry the query");
 
         /// The queue owns the block, and the flush relocks the table under a fresh query id, so it
         /// cannot join the reader group of this query: a share lock kept across the wait below lets an
