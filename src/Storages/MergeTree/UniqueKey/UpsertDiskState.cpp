@@ -780,6 +780,8 @@ DiskState::DiskState(const String & table_path, ObjectID incarnation, bool attac
     options.max_write_buffer_number = static_cast<int>(resources.write_buffer_count);
     options.max_total_wal_size = resources.wal_bytes;
     options.max_manifest_file_size = 16U << 20;
+    /// Rotate the diagnostic `LOG`; limiting retained files alone does not limit one growing log.
+    options.max_log_file_size = 64U << 20;
     options.keep_log_file_num = 2;
     options.max_background_jobs = static_cast<int>(resources.background_jobs);
     rocksdb::BlockBasedTableOptions table_options;
