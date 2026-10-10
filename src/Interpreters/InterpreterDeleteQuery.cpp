@@ -28,6 +28,7 @@
 #include <Storages/MutationCommands.h>
 #include <Storages/StorageProxy.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
+#include <Storages/MergeTree/MergeTreeData.h>
 
 
 namespace DB
@@ -125,11 +126,13 @@ BlockIO InterpreterDeleteQuery::execute()
 
     if (table->supportsDelete())
     {
-        /// This pipeline serializes only the predicate into the mutation command, and the storages
-        /// that take it (`KeeperMap`, `EmbeddedRocksDB`, Iceberg, `system.wasm_modules`, ...) have
-        /// no notion of MergeTree-style partitions anyway. Reject the clause instead of silently
-        /// mutating a wider scope than the query requested.
-        if (delete_query.partition || delete_query.partitions)
+        /// `UpsertMergeTree` retains a single partition in its synchronous mutation command.
+        /// Other direct-delete storages have no `MergeTree` partitions; plural partitions
+        /// are not serialized by this route. Reject unsupported scopes rather than widening them.
+        const auto * merge_tree_data = castStorage<MergeTreeData>(resolved_table, DeferredTable::Load).get();
+        const bool upsert_partition = resolved_table.get() == table.get()
+            && merge_tree_data && merge_tree_data->merging_params.upsert;
+        if (delete_query.partitions || (delete_query.partition && !upsert_partition))
             throw Exception(ErrorCodes::NOT_IMPLEMENTED,
                 "DELETE ... IN PARTITION is not supported for table {}", table->getStorageID().getFullTableName());
 
