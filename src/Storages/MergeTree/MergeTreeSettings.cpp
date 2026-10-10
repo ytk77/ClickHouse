@@ -62,6 +62,12 @@ Existing blocks keep their codec until normal compaction rewrites them. Compacti
 This does not change state records, durability or the 64 MiB index-cache default.
 )", 0, \
         {"26.10", false, false, "New opt-in state compression setting for `UpsertMergeTree`."}) \
+    DECLARE(UInt64, upsert_rewrite_state_reserve_bytes, 1ULL << 30, R"(
+Additional disk allowance for state growth and compaction during `UpsertMergeTree` rewrites.
+Default: 1 GiB. Allowed range: 256 MiB to 64 GiB. Admission also reserves estimated physical output and a 1 GiB floor.
+This is a planning allowance, not a hard bound on compaction or retained files.
+)", 0, \
+        {"26.10", UInt64(1ULL << 30), UInt64(1ULL << 30), "New rewrite disk allowance for `UpsertMergeTree`."}) \
     DECLARE(UInt64, upsert_lineage_compression_level, 1, R"(
 `ZSTD` compression level for new `UpsertMergeTree` lineage sidecars when compression is enabled.
 Default: 1. Allowed range: 1 to 9. Higher levels trade preparation CPU and memory for smaller sidecars.

@@ -1,3 +1,4 @@
+#include <Storages/MergeTree/UniqueKey/UpsertDiskSpace.h>
 #include <Storages/MergeTree/UniqueKey/UpsertLogRecord.h>
 #include <Storages/MergeTree/UniqueKey/UpsertRowMetadata.h>
 #include <Storages/MergeTree/UniqueKey/UpsertPartData.h>
@@ -827,6 +828,24 @@ TEST(UpsertPartRowsCompression, PlannerRejectsMalformedAndTruncatedHeaders)
     EXPECT_EQ(readPartRowsDecodedSize(file.string(), large.size(), 1), raw.size());
 }
 
+
+TEST(UpsertDiskSpace, ReservesOutputAndStateWithOneExternalFloor)
+{
+    const UInt64 allowance = 1ULL << 30;
+    EXPECT_EQ(rewriteDiskBytes(100, allowance), 125 + allowance);
+    EXPECT_EQ(rewriteDiskBytes(101, allowance), 127 + allowance);
+    const auto reserved = rewriteDiskBytes(1ULL << 20, allowance);
+    const auto before = reserved + DISK_SPACE_FLOOR;
+    const auto after = before - reserved;
+    EXPECT_TRUE(writeDiskSpaceFits(after, MAX_PENDING_STATE_BYTES, allowance));
+    EXPECT_FALSE(writeDiskSpaceFits(DISK_SPACE_FLOOR - 1, 1));
+    EXPECT_TRUE(writeDiskSpaceFits(DISK_SPACE_FLOOR + 200, 100));
+    EXPECT_FALSE(writeDiskSpaceFits(DISK_SPACE_FLOOR + 199, 100));
+    EXPECT_TRUE(writeDiskSpaceFits(REMOVAL_DISK_SPACE_FLOOR + 200, 100, 0, REMOVAL_DISK_SPACE_FLOOR));
+    EXPECT_FALSE(writeDiskSpaceFits(REMOVAL_DISK_SPACE_FLOOR + 199, 100, 0, REMOVAL_DISK_SPACE_FLOOR));
+    EXPECT_EQ(rewriteDiskBytes(std::numeric_limits<UInt64>::max(), allowance), std::numeric_limits<UInt64>::max());
+    EXPECT_FALSE(writeDiskSpaceFits(std::numeric_limits<UInt64>::max(), std::numeric_limits<UInt64>::max()));
+}
 
 TEST(UpsertPartRowsCompression, GoldenEnvelopeAndAuthenticatedUndecodableFrame)
 {

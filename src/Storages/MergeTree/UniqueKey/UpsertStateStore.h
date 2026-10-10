@@ -123,6 +123,7 @@ public:
     /// Scan winners outside the parts lock after sources are fully masked, with retirement excluded.
     void validateRetirement(const String & partition, const std::vector<String> & sources, const MergeInput & input) const;
     void pruneRetired();
+    void checkWriteSpace(const Prepared & prepared, UInt64 unreserved_bytes, UInt64 credited_bytes = 0, UInt64 floor_bytes = 1ULL << 30) const;
     void append(const Prepared & prepared);
     void publish(Prepared & prepared) noexcept;
     /// A non-throwing mismatch probe only selects a compatible input boundary; commits always check strictly.

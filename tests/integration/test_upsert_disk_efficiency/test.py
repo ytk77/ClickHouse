@@ -93,6 +93,50 @@ def test_v3_ambiguous_insert_recovers_and_retry_keeps_winners(compact):
         query(f"DROP TABLE IF EXISTS {name} SYNC")
 
 
+def test_disk_backoff_preflight_and_removal_below_insert_floor():
+    names = ["space_merge", "space_remove", "space_preflight"]
+    filler = "/upsert_disk_efficiency/space_gate_owned_filler"
+
+    def fill_to(desired):
+        node.exec_in_container(["python3", "-c",
+            "import os; p=" + repr(filler) + "; "
+            "os.path.exists(p) and os.unlink(p); "
+            "s=os.statvfs('/upsert_disk_efficiency'); n=s.f_bavail*s.f_frsize-" + str(desired) + "; "
+            "assert n>0; f=os.open(p,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600); "
+            "os.posix_fallocate(f,0,n); os.fsync(f); os.close(f)"])
+
+    try:
+        for name in names:
+            create(name, ", storage_policy='limited'")
+            for i in range(2):
+                query(f"INSERT INTO {name} SELECT 1,number+{i*1000},1 FROM numbers(1000)")
+        before = int(query("SELECT value FROM system.events WHERE event='UpsertMaintenanceDiskBackoffs'") or 0)
+        fill_to(900 << 20)
+        assert "NOT_ENOUGH_SPACE" in node.query_and_get_error("INSERT INTO space_preflight VALUES (1,99999,2)", settings=SETTINGS)
+        query("SYSTEM START MERGES space_merge")
+        poll(lambda: int(query("SELECT value FROM system.events WHERE event='UpsertMaintenanceDiskBackoffs'") or 0) > before)
+        assert query("SELECT count(),uniqExact(id),sum(v) FROM space_merge") == "2000\t2000\t2000\n"
+        query("ALTER TABLE space_remove DROP PARTITION 1")
+        query("TRUNCATE TABLE space_preflight")
+        assert query("SELECT count() FROM space_remove") == "0\n"
+        assert query("SELECT count() FROM space_preflight") == "0\n"
+        # This narrow schema passes the advisory floor and native column reservation;
+        # the 20,000-row state batch then exceeds the remaining preflight slack.
+        fill_to((1 << 30) + (128 << 10))
+        error = node.query_and_get_error("INSERT INTO space_preflight SELECT 1,number,2 FROM numbers(20000)", settings=SETTINGS)
+        assert "NOT_ENOUGH_SPACE" in error and "state write needs space" in error
+        assert query("SELECT count() FROM space_preflight") == "0\n"
+        node.exec_in_container(["rm", "-f", filler])
+        poll(lambda: query("SELECT count() FROM system.parts WHERE database=currentDatabase() AND table='space_merge' AND active") == "1\n")
+        query("INSERT INTO space_preflight VALUES (1,1,2)")
+        assert query("SELECT count(),sum(v) FROM space_preflight") == "1\t2\n"
+    finally:
+        node.exec_in_container(["rm", "-f", filler])
+        for name in names:
+            query(f"DROP TABLE IF EXISTS {name} SYNC")
+
+
+
 def test_rewrite_codec_matches_native_size_policy_and_explicit_override():
     names = ["codec_upsert", "codec_native", "codec_import", "codec_explicit"]
 

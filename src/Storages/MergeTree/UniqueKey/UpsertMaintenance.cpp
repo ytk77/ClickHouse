@@ -1,3 +1,5 @@
+#include <Storages/MergeTree/UniqueKey/UpsertDiskSpace.h>
+#include <Disks/IDisk.h>
 #include <Storages/MergeTree/UniqueKey/UpsertMetrics.h>
 #include <Storages/StorageMergeTree.h>
 #include <Storages/MergeTree/UniqueKey/UpsertStateStore.h>
@@ -48,6 +50,7 @@
 
 namespace DB::ErrorCodes
 {
+extern const int NOT_ENOUGH_SPACE;
 extern const int ABORTED;
 extern const int CORRUPTED_DATA;
 extern const int BAD_ARGUMENTS;
@@ -87,6 +90,7 @@ namespace DB::MergeTreeSetting
 {
 extern const MergeTreeSettingsBool share_nested_offsets;
 extern const MergeTreeSettingsUInt64 upsert_maintenance_target_bytes;
+extern const MergeTreeSettingsUInt64 upsert_rewrite_state_reserve_bytes;
 }
 
 namespace DB::Setting
@@ -621,6 +625,9 @@ void StorageMergeTree::runUpsertMaintenance()
                     (std::filesystem::path(candidate->getDataPartStorage().getFullPath()) / Upsert::ROWS_FILE).string(),
                     checksum->second.file_size, candidate->rows_count), std::memory_order_relaxed);
         }
+        const auto total_disk = getDisks().front()->getTotalSpace();
+        if (!total_disk)
+            throw Exception(ErrorCodes::NOT_ENOUGH_SPACE, "Cannot determine UpsertMergeTree disk capacity");
         {
             auto lock = lockParts();
             if (upsert_fenced)
@@ -628,6 +635,7 @@ void StorageMergeTree::runUpsertMaintenance()
             size_t bytes = 0;
             size_t rows = 0;
             size_t lineage_bytes = 0;
+            UInt64 physical_selected = 0;
             bool needs_rewrite = false;
             auto worthy = [&] { return sources.size() >= 2 || needs_rewrite; };
             const auto advance_cursor = [&](const DataPartPtr & candidate)
@@ -651,6 +659,7 @@ void StorageMergeTree::runUpsertMaintenance()
                     bytes = 0;
                     rows = 0;
                     lineage_bytes = 0;
+                    physical_selected = 0;
                     needs_rewrite = false;
                     partition = id;
                 }
@@ -697,6 +706,23 @@ void StorageMergeTree::runUpsertMaintenance()
                     advance_cursor(candidate);
                     continue;
                 }
+                const UInt64 alive = candidate->rows_count - mask->cardinality();
+                const UInt64 physical = candidate->getBytesOnDisk();
+                const UInt64 physical_candidate = (physical / candidate->rows_count) * alive + (physical % candidate->rows_count) * alive / candidate->rows_count;
+                const UInt64 disk_estimate = Upsert::rewriteDiskBytes(
+                    physical_candidate,
+                    (*getSettings())[MergeTreeSetting::upsert_rewrite_state_reserve_bytes]);
+                if (Upsert::saturatingDiskBytes(disk_estimate, Upsert::DISK_SPACE_FLOOR) > *total_disk)
+                {
+                    if (worthy())
+                        break;
+                    ProfileEvents::increment(ProfileEvents::UpsertMaintenanceDiskUnadmittableParts);
+                    const auto denials = ++upsert_maintenance_unadmittable;
+                    if ((denials & (denials - 1)) == 0)
+                        LOG_WARNING(log, "UpsertMergeTree source {} disk estimate {} exceeds capacity {}; skipping it", candidate->name, disk_estimate, *total_disk);
+                    advance_cursor(candidate);
+                    continue;
+                }
                 const auto single_estimate = estimateRewriteMemory({candidate}, max_source_bytes);
                 if (single_estimate > memory_ceiling)
                 {
@@ -723,6 +749,7 @@ void StorageMergeTree::runUpsertMaintenance()
                     bytes = 0;
                     rows = 0;
                     lineage_bytes = 0;
+                    physical_selected = 0;
                 }
                 if (size > max_source_bytes - bytes || candidate->rows_count > Upsert::MAX_PART_ROWS - rows
                     || candidate_lineage_bytes > max_lineage_bytes - lineage_bytes)
@@ -744,7 +771,10 @@ void StorageMergeTree::runUpsertMaintenance()
                 }
                 auto prospective = sources;
                 prospective.push_back(candidate);
-                if (estimateRewriteMemory(prospective, max_source_bytes) > memory_ceiling)
+                if (estimateRewriteMemory(prospective, max_source_bytes) > memory_ceiling
+                    || Upsert::saturatingDiskBytes(Upsert::rewriteDiskBytes(
+                        Upsert::saturatingDiskBytes(physical_selected, physical_candidate),
+                        (*getSettings())[MergeTreeSetting::upsert_rewrite_state_reserve_bytes]), Upsert::DISK_SPACE_FLOOR) > *total_disk)
                 {
                     if (worthy())
                         break;
@@ -754,6 +784,7 @@ void StorageMergeTree::runUpsertMaintenance()
                     bytes = 0;
                     rows = 0;
                     lineage_bytes = 0;
+                    physical_selected = 0;
                     needs_rewrite = false;
                 }
                 advance_cursor(candidate);
@@ -762,6 +793,7 @@ void StorageMergeTree::runUpsertMaintenance()
                 bytes += size;
                 rows += candidate->rows_count;
                 lineage_bytes += candidate_lineage_bytes;
+                physical_selected = Upsert::saturatingDiskBytes(physical_selected, physical_candidate);
                 if (sources.size() == max_sources)
                     break;
             }
@@ -824,6 +856,14 @@ void StorageMergeTree::runUpsertMaintenance()
         if (getCurrentExceptionCode() == ErrorCodes::ABORTED && (shutdown_called || flush_called))
             return;
         ProfileEvents::increment(ProfileEvents::UpsertMaintenanceFailures);
+        if (getCurrentExceptionCode() == ErrorCodes::NOT_ENOUGH_SPACE)
+        {
+            upsert_maintenance_cursor = previous_cursor;
+            upsert_maintenance_pending = previous_pending;
+            ProfileEvents::increment(ProfileEvents::UpsertMaintenanceDiskBackoffs);
+            postpone_admission();
+            return;
+        }
         if (isMaintenanceMemoryFailure())
         {
             ProfileEvents::increment(ProfileEvents::UpsertMaintenanceMemoryBackoffs);
@@ -876,15 +916,30 @@ bool StorageMergeTree::rewriteUpsertParts(const DataPartsVector & sources, const
     const auto policy_checksum = Upsert::ttlPolicyChecksum(*metadata);
     const auto partition = sources.front()->info.getPartitionId();
     Upsert::SnapshotPtr snapshot = getUpsertReadSnapshotForQuery()->visibility;
+    const auto disk = getDisks().front();
+    const UInt64 state_allowance = (*getSettings())[MergeTreeSetting::upsert_rewrite_state_reserve_bytes];
+    UInt64 physical_output = 0;
     UInt64 source_compressed_bytes = 0;
     for (const auto & source : sources)
     {
+        const auto mask = snapshot->getMask(source->getDeleteBitmapCacheIdentity());
+        if (!mask || mask->cardinality() > source->rows_count || !source->rows_count)
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "Invalid UpsertMergeTree source mask for disk admission");
+        const UInt64 alive = source->rows_count - mask->cardinality();
         const UInt64 bytes = source->getBytesOnDisk();
-        if (bytes > std::numeric_limits<UInt64>::max() - source_compressed_bytes)
-            source_compressed_bytes = std::numeric_limits<UInt64>::max();
-        else
-            source_compressed_bytes += bytes;
+        const UInt64 estimate = (bytes / source->rows_count) * alive + (bytes % source->rows_count) * alive / source->rows_count;
+        physical_output = Upsert::saturatingDiskBytes(physical_output, estimate);
+        source_compressed_bytes = Upsert::saturatingDiskBytes(source_compressed_bytes, bytes);
     }
+    const auto required = Upsert::rewriteDiskBytes(physical_output, state_allowance);
+    /// Hold through every relocation and retirement batch; native output writes also reserve their block independently.
+    const auto available_before_reservation = disk->getUnreservedSpace();
+    if (!available_before_reservation
+        || *available_before_reservation < Upsert::saturatingDiskBytes(required, Upsert::DISK_SPACE_FLOOR))
+        throw Exception(ErrorCodes::NOT_ENOUGH_SPACE, "UpsertMergeTree rewrite postponed: needs {} reserved bytes plus the 1 GiB floor", required);
+    auto rewrite_reservation = disk->reserve(required);
+    if (!rewrite_reservation)
+        throw Exception(ErrorCodes::NOT_ENOUGH_SPACE, "UpsertMergeTree rewrite postponed: cannot reserve {} physical output/state bytes", required);
     for (const auto & source : sources)
         snapshot->verifyPart(source->name, source->getDeleteBitmapCacheIdentity());
     std::vector<Upsert::PartRows> lineage;
@@ -1032,6 +1087,10 @@ bool StorageMergeTree::rewriteUpsertParts(const DataPartsVector & sources, const
                 const auto & retired_sources = retire ? sources : DataPartsVector{};
                 auto read_snapshot = prepareUpsertReadSnapshot(
                     prepared.snapshot, prepared.produces_part ? temporary->part : nullptr, retired_sources, lock);
+                const auto available = disk->getUnreservedSpace();
+                if (!available)
+                    throw Exception(ErrorCodes::NOT_ENOUGH_SPACE, "Cannot determine UpsertMergeTree rewrite-write disk space");
+                upsert_store->checkWriteSpace(prepared, *available, state_allowance);
                 bool persist_started = false;
                 auto persist = [&]
                 {
@@ -1403,6 +1462,10 @@ void StorageMergeTree::truncateUpsert(ContextPtr query_context)
         auto read_snapshot = std::make_shared<UpsertReadSnapshot>();
         read_snapshot->visibility = prepared.snapshot;
         read_snapshot->parts_info = getPartsSnapshotInfo({});
+        const auto available = getDisks().front()->getUnreservedSpace();
+        if (!available)
+            throw Exception(ErrorCodes::NOT_ENOUGH_SPACE, "Cannot determine UpsertMergeTree truncate-write disk space");
+        upsert_store->checkWriteSpace(prepared, *available, 0, Upsert::REMOVAL_DISK_SPACE_FLOOR);
         try
         {
             upsert_store->append(prepared);

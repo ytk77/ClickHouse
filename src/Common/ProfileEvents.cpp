@@ -168,6 +168,8 @@
     M(UpsertMaintenanceOversizedAdmissions, "Isolated background `UpsertMergeTree` rewrites admitted above the soft reservation budget, with available background and server headroom.", ValueType::Number) \
     M(UpsertMaintenanceAdmissionPrecheckDeferrals, "Background `UpsertMergeTree` scans postponed by the cheap admission precheck, before determining whether rewriting is needed.", ValueType::Number) \
     M(UpsertMaintenanceAdmissionDenied, "Background `UpsertMergeTree` rewrites postponed by concurrency or estimated memory admission.", ValueType::Number) \
+    M(UpsertMaintenanceDiskBackoffs, "Background `UpsertMergeTree` rewrites postponed because disk admission or preflight refused space.", ValueType::Number) \
+    M(UpsertMaintenanceDiskUnadmittableParts, "Background `UpsertMergeTree` eligible sources skipped because their physical rewrite estimate exceeds total disk capacity.", ValueType::Number) \
     M(UpsertMaintenanceUnadmittableParts, "Background `UpsertMergeTree` sources skipped because their fixed rewrite estimate exceeds the configured memory ceiling.", ValueType::Number) \
     M(UpsertMaintenanceYields, "Background `UpsertMergeTree` tasks deferred or rewrites yielded before payload publication for pending foreground operations.", ValueType::Number) \
     M(UpsertMaintenanceSizeRatioSkips, "Healthy `UpsertMergeTree` merge prefixes deferred because source sizes are too unequal.", ValueType::Number) \

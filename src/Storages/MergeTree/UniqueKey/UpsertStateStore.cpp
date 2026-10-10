@@ -1,3 +1,4 @@
+#include <Storages/MergeTree/UniqueKey/UpsertDiskSpace.h>
 #include <Storages/MergeTree/UniqueKey/UpsertStateStore.h>
 #include <Storages/MergeTree/UniqueKey/UpsertDiskState.h>
 #include <Storages/MergeTree/UniqueKey/UpsertBinary.h>
@@ -8,6 +9,7 @@
 
 namespace DB::ErrorCodes
 {
+extern const int NOT_ENOUGH_SPACE;
 extern const int BAD_ARGUMENTS;
 extern const int LOGICAL_ERROR;
 }
@@ -356,6 +358,15 @@ StateStore::Prepared StateStore::prepare(const String & partition, PartCommit pa
     auto prepared = decide(partition, std::move(part), rows, entry.log->nextCSN());
     operation_ids.insert(prepared.operation_id);
     return prepared;
+}
+
+void StateStore::checkWriteSpace(const Prepared & prepared, UInt64 unreserved_bytes, UInt64 credited_bytes, UInt64 floor_bytes) const
+{
+    const auto bytes = disk ? disk->preparedWriteBytes(prepared) : prepared.payload.size();
+    if (!writeDiskSpaceFits(unreserved_bytes, bytes, credited_bytes, floor_bytes))
+        throw Exception(ErrorCodes::NOT_ENOUGH_SPACE,
+            "UpsertMergeTree state write needs space for {} batch bytes plus WAL slack and {} floor bytes (unreserved {}, own credit {})",
+            bytes, floor_bytes, unreserved_bytes, credited_bytes);
 }
 
 void StateStore::append(const Prepared & prepared)

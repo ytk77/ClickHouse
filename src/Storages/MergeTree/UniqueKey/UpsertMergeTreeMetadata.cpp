@@ -17,6 +17,7 @@ namespace MergeTreeSetting
     extern const MergeTreeSettingsUInt64 upsert_lineage_compression_level;
     extern const MergeTreeSettingsBool upsert_lineage_compression;
     extern const MergeTreeSettingsBool upsert_lineage_compact;
+    extern const MergeTreeSettingsUInt64 upsert_rewrite_state_reserve_bytes;
 }
 
 namespace ErrorCodes
@@ -49,6 +50,9 @@ void validateUpsertMergeTreeMetadata(
 {
     if (settings[MergeTreeSetting::upsert_lineage_compact] && !settings[MergeTreeSetting::upsert_lineage_compression])
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Setting upsert_lineage_compact requires upsert_lineage_compression");
+    const UInt64 state_reserve = settings[MergeTreeSetting::upsert_rewrite_state_reserve_bytes];
+    if (state_reserve < (256ULL << 20) || state_reserve > (64ULL << 30))
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Setting upsert_rewrite_state_reserve_bytes={} must be between 256 MiB and 64 GiB", state_reserve);
     const UInt64 lineage_level = settings[MergeTreeSetting::upsert_lineage_compression_level];
     if (lineage_level < 1 || lineage_level > 9)
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Setting upsert_lineage_compression_level={} must be between 1 and 9", lineage_level);

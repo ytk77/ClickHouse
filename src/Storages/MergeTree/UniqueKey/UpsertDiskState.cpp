@@ -1759,6 +1759,13 @@ StateStore::Prepared DiskState::preparePartition(
     return result;
 }
 
+size_t DiskState::preparedWriteBytes(const StateStore::Prepared & prepared) const
+{
+    if (!prepared.disk || prepared.disk->durable)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Invalid UpsertMergeTree disk preparation for space admission");
+    return prepared.disk->batch.GetDataSize();
+}
+
 void DiskState::append(const StateStore::Prepared & prepared)
 {
     impl->database->checkVerification();
@@ -1903,6 +1910,11 @@ StateStore::Prepared DiskState::preparePartition(std::vector<PartCommit>, const 
 {
     std::unreachable();
 }
+size_t DiskState::preparedWriteBytes(const StateStore::Prepared &) const
+{
+    throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree requires RocksDB support");
+}
+
 void DiskState::append(const StateStore::Prepared &)
 {
     std::unreachable();

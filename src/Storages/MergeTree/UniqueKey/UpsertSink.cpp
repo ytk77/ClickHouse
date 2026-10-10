@@ -1,3 +1,4 @@
+#include <Storages/MergeTree/UniqueKey/UpsertDiskSpace.h>
 #include <Storages/MergeTree/UniqueKey/UpsertSink.h>
 #include <Storages/MergeTree/UniqueKey/UpsertInsertQueue.h>
 #include <Storages/MergeTree/UniqueKey/UpsertMetrics.h>
@@ -47,6 +48,7 @@ extern const SettingsUInt64 max_insert_threads_min_free_memory_per_thread;
 }
 namespace DB::ErrorCodes
 {
+extern const int NOT_ENOUGH_SPACE;
 extern const int SUPPORT_IS_DISABLED;
 extern const int FAULT_INJECTED;
 extern const int LOGICAL_ERROR;
@@ -378,6 +380,9 @@ std::unique_ptr<Upsert::PreparedInsert> StorageMergeTree::prepareUpsertBlock(
             throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "UpsertMergeTree is fenced pending restart and recovery");
         if (upsert_store->tokenAlreadyCommitted(partition_id, token))
             return nullptr;
+        const auto available = getDisks().front()->getUnreservedSpace();
+        if (!available || *available < Upsert::DISK_SPACE_FLOOR)
+            throw Exception(ErrorCodes::NOT_ENOUGH_SPACE, "UpsertMergeTree insert requires 1 GiB of unreserved disk space");
         upsert_store->checkAdmission();
     }
     if (token.unit == 0)
@@ -466,6 +471,10 @@ bool StorageMergeTree::commitUpsertBlock(Upsert::PreparedInsert & input)
         produces_part = prepared.produces_part;
         /// Allocate the complete next read version before any ambiguous durable operation.
         auto read_snapshot = prepareUpsertReadSnapshot(prepared.snapshot, prepared.produces_part ? part : nullptr, {}, lock);
+        const auto available = getDisks().front()->getUnreservedSpace();
+        if (!available)
+            throw Exception(ErrorCodes::NOT_ENOUGH_SPACE, "Cannot determine UpsertMergeTree unreserved disk space");
+        upsert_store->checkWriteSpace(prepared, *available);
         bool persist_started = false;
         auto persist = [&]
         {

@@ -37,6 +37,7 @@ public:
     PartRows loadPartRows(const String & name, PartCommit * authorization = nullptr) const;
     void validateRetirement(const String & partition, const std::vector<String> & sources, const StateStore::MergeInput & input) const;
     void pruneRetired();
+    size_t preparedWriteBytes(const StateStore::Prepared & prepared) const;
     void append(const StateStore::Prepared & prepared);
     void publish(StateStore::Prepared & prepared) noexcept;
 

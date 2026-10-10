@@ -5620,6 +5620,7 @@ void MergeTreeData::checkAlterIsPossible(const AlterCommands & commands, Context
                         && change.name != "upsert_lineage_compact"
                         && change.name != "upsert_lineage_compression"
                         && change.name != "upsert_lineage_compression_level"
+                        && change.name != "upsert_rewrite_state_reserve_bytes"
                         && change.name != "prewarm_mark_cache"
                         && change.name != "prewarm_primary_key_cache" && change.name != "columns_to_prewarm_mark_cache"
                         && change.name != "min_bytes_to_prewarm_caches")

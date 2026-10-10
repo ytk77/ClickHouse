@@ -1,3 +1,4 @@
+#include <Storages/MergeTree/UniqueKey/UpsertDiskSpace.h>
 #include <Storages/StorageMergeTree.h>
 #include <Storages/MergeTree/UniqueKey/UpsertStateStore.h>
 #include <Storages/MergeTree/UniqueKey/UpsertOperationWait.h>
@@ -28,6 +29,7 @@ namespace DB
 {
 namespace ErrorCodes
 {
+    extern const int NOT_ENOUGH_SPACE;
 extern const int BAD_ARGUMENTS;
 extern const int CORRUPTED_DATA;
 extern const int LIMIT_EXCEEDED;
@@ -291,6 +293,11 @@ Pipe StorageMergeTree::alterPartition(
                 if (accepted.contains(temporary->part->name))
                     added.push_back(temporary->part);
             auto read_snapshot = target.prepareUpsertReadSnapshot(prepared.snapshot, nullptr, removed, lock, added);
+            const auto available = target.getDisks().front()->getUnreservedSpace();
+            if (!available)
+                throw Exception(ErrorCodes::NOT_ENOUGH_SPACE, "Cannot determine UpsertMergeTree partition-write disk space");
+            target.upsert_store->checkWriteSpace(prepared, *available, 0,
+                added.empty() ? Upsert::REMOVAL_DISK_SPACE_FLOOR : Upsert::DISK_SPACE_FLOOR);
             bool persist_started = false;
             try
             {
