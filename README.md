@@ -72,6 +72,13 @@ winner without `FINAL`, including before background parts finish merging.
   input blocks, partitioning, duplicate folding, and row/lineage/state limits can make parts smaller.
   Background maintenance reduces its effective target when server or background memory limits
   require it. Larger insert units require additional preparation memory.
+- New `CREATE TABLE` definitions enable compressed and compact lineage plus `ZSTD` compression
+  for the RocksDB SST state by default. The effective `upsert_lineage_compression`,
+  `upsert_lineage_compact`, and `upsert_state_compression` values are saved in the table metadata.
+  Explicit table settings and server defaults take precedence; older table definitions are not
+  automatically opted in. Native column codecs retain their existing policy, and the `WAL` codec
+  is unchanged. New compressed parts cannot be read by older binaries; see the
+  [disk-efficiency guide](docs/development/upsert-merge-tree-disk-efficiency.mdx).
 
 New tables require local disk storage. For supported operations, retry and upgrade procedures,
 and the current `BACKUP`, `RESTORE`, and `CHECK TABLE` restrictions, see the

@@ -34,10 +34,11 @@ def poll(predicate, timeout=90):
     raise AssertionError("Condition did not become true before deadline")
 
 
-def create(name, extra=""):
+def create(name, extra="", compact=False):
     query(f"CREATE TABLE {name} (p UInt8,id UInt64,v UInt64) "
           "ENGINE=UpsertMergeTree(v) PARTITION BY p ORDER BY id UNIQUE KEY id "
-          "SETTINGS upsert_lineage_compression=1, upsert_state_compression=1" + extra)
+          "SETTINGS upsert_lineage_compression=1, upsert_state_compression=1, "
+          f"upsert_lineage_compact={int(compact)}" + extra)
     query(f"SYSTEM STOP MERGES {name}")
 
 
@@ -79,7 +80,7 @@ def test_mixed_lineage_chunked_output_mutation_and_partition_transfer():
 def test_v3_ambiguous_insert_recovers_and_retry_keeps_winners(compact):
     name = "disk_recovery"
     try:
-        create(name, f", upsert_lineage_compression_level=6, upsert_lineage_compact={int(compact)}")
+        create(name, ", upsert_lineage_compression_level=6", compact=compact)
         query(f"INSERT INTO {name} VALUES (1,1,1)")
         query("SYSTEM ENABLE FAILPOINT upsert_log_throw_after_sync")
         retry = f"INSERT INTO {name} SETTINGS insert_deduplication_token='disk-v3-retry' VALUES (1,1,2),(1,2,2)"
@@ -262,7 +263,7 @@ def test_compact_mixed_formats_restart_sweep_and_large_rewrite():
         query("ALTER TABLE compact_import MODIFY SETTING upsert_lineage_compact=1")
         query("ALTER TABLE compact_import REPLACE PARTITION 1 FROM compact_mixed")
         assert query("SELECT count(),sum(v) FROM compact_import") == "1199999\t1199999\n"
-        create(names[2], ", upsert_lineage_compact=1")
+        create(names[2], compact=True)
         with ThreadPoolExecutor(max_workers=16) as pool:
             list(pool.map(lambda i: query(f"INSERT INTO compact_parallel SELECT 1,number+{i*4096},1 FROM numbers(4096)"), range(16)))
         node.restart_clickhouse(kill=True)
