@@ -228,7 +228,7 @@ Pipe StorageMergeTree::alterPartition(
                     BlockWithPartition output;
                     output.block = std::make_shared<Block>(std::move(slice));
                     output.partition = part->partition;
-                    auto temporary = target.writer.writeTempPart(output, target_metadata, import_context, false, true);
+                    auto temporary = target.writer.writeTempPart(output, target_metadata, import_context, false, true, part->getBytesOnDisk());
                     temporary->finalize();
                     temporary->part->getDataPartStorage().commitTransaction();
                     const auto path = temporary->part->getDataPartStorage().getFullPath();

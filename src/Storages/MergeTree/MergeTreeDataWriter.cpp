@@ -769,10 +769,11 @@ MergeTreeTemporaryPartPtr MergeTreeDataWriter::writeTempPart(
     StorageMetadataPtr metadata_snapshot,
     ContextPtr context,
     bool may_have_leftover,
-    bool force_projections)
+    bool force_projections,
+    size_t source_compressed_bytes)
 {
     auto partition_id = block.partition.getID(metadata_snapshot->getPartitionKey().sample_block);
-    return writeTempPartImpl(block, std::move(metadata_snapshot), std::move(partition_id), /*patch_part_index=*/ {}, std::move(context), data.insert_increment.get(), may_have_leftover, force_projections);
+    return writeTempPartImpl(block, std::move(metadata_snapshot), std::move(partition_id), /*patch_part_index=*/ {}, std::move(context), data.insert_increment.get(), may_have_leftover, force_projections, source_compressed_bytes);
 }
 
 MergeTreeTemporaryPartPtr MergeTreeDataWriter::writeTempPatchPart(
@@ -794,7 +795,8 @@ MergeTreeTemporaryPartPtr MergeTreeDataWriter::writeTempPartImpl(
     ContextPtr context,
     UInt64 block_number,
     bool may_have_leftover,
-    bool force_projections)
+    bool force_projections,
+    size_t source_compressed_bytes)
 {
     auto temp_part = std::make_unique<MergeTreeTemporaryPart>();
     Block & block = *block_with_partition.block;
@@ -1085,7 +1087,7 @@ MergeTreeTemporaryPartPtr MergeTreeDataWriter::writeTempPartImpl(
 
     /// Pass empty TTL infos so that `RECOMPRESS` codecs are not selected at insert time;
     /// recompression should happen during merges, not on the initial write path.
-    auto compression_codec = data.getCompressionCodecForPart(metadata_snapshot, 0, {}, time(nullptr)).codec;
+    auto compression_codec = data.getCompressionCodecForPart(metadata_snapshot, source_compressed_bytes, {}, time(nullptr)).codec;
 
     auto index_granularity_ptr = createMergeTreeIndexGranularity(
         block,

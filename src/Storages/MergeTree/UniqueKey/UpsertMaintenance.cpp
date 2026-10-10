@@ -854,6 +854,15 @@ bool StorageMergeTree::rewriteUpsertParts(const DataPartsVector & sources, const
     const auto policy_checksum = Upsert::ttlPolicyChecksum(*metadata);
     const auto partition = sources.front()->info.getPartitionId();
     Upsert::SnapshotPtr snapshot = getUpsertReadSnapshotForQuery()->visibility;
+    UInt64 source_compressed_bytes = 0;
+    for (const auto & source : sources)
+    {
+        const UInt64 bytes = source->getBytesOnDisk();
+        if (bytes > std::numeric_limits<UInt64>::max() - source_compressed_bytes)
+            source_compressed_bytes = std::numeric_limits<UInt64>::max();
+        else
+            source_compressed_bytes += bytes;
+    }
     for (const auto & source : sources)
         snapshot->verifyPart(source->name, source->getDeleteBitmapCacheIdentity());
     std::vector<Upsert::PartRows> lineage;
@@ -921,7 +930,8 @@ bool StorageMergeTree::rewriteUpsertParts(const DataPartsVector & sources, const
             BlockWithPartition block;
             block.block = std::make_shared<Block>(std::move(output));
             block.partition = sources.front()->partition;
-            temporary = writer.writeTempPart(block, metadata, context, false, /*force_projections=*/true);
+            /// Match native rewrite codec selection from the whole source set for every output chunk.
+            temporary = writer.writeTempPart(block, metadata, context, false, /*force_projections=*/true, source_compressed_bytes);
             temporary->finalize();
             auto & part = temporary->part;
             part->getDataPartStorage().commitTransaction();

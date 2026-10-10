@@ -93,7 +93,8 @@ public:
         StorageMetadataPtr metadata_snapshot,
         ContextPtr context,
         bool may_have_leftover = true,
-        bool force_projections = false);
+        bool force_projections = false,
+        size_t source_compressed_bytes = 0);
 
     MergeTreeTemporaryPartPtr writeTempPatchPart(
         BlockWithPartition & block,
@@ -149,7 +150,8 @@ private:
         ContextPtr context,
         UInt64 block_number,
         bool may_have_leftover,
-        bool force_projections = false);
+        bool force_projections = false,
+        size_t source_compressed_bytes = 0);
 
     static MergeTreeTemporaryPartPtr writeProjectionPartImpl(
         const String & part_name,
