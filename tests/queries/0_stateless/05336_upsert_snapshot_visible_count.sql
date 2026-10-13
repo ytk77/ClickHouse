@@ -111,6 +111,7 @@ SELECT 'constant empty scan rows', count() FROM
 TRUNCATE TABLE upsert_snapshot_visible_count;
 SELECT 'truncate', count() FROM upsert_snapshot_visible_count;
 SELECT 'truncate scan', count() FROM upsert_snapshot_visible_count SETTINGS optimize_use_projections=0;
+-- Zero physical parts use the normal empty-storage plan.
 SELECT 'truncate plan', countIf(position(explain, '_upsert_visible_count') > 0) > 0 FROM
 (EXPLAIN SELECT count() FROM upsert_snapshot_visible_count);
 DROP TABLE upsert_snapshot_visible_count SYNC;

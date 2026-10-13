@@ -44,4 +44,4 @@ constant empty rows	0
 constant empty scan rows	0
 truncate	0
 truncate scan	0
-truncate plan	1
+truncate plan	0
