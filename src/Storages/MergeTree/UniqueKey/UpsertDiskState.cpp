@@ -1,7 +1,6 @@
 #include <Storages/MergeTree/UniqueKey/UpsertDiskState.h>
 #include <Storages/MergeTree/UniqueKey/UpsertMetrics.h>
 #include <Storages/MergeTree/UniqueKey/UpsertMaskVersions.h>
-#include <Storages/MergeTree/UniqueKey/DeleteBitmapCache.h>
 #include <Storages/MergeTree/UniqueKey/UpsertBinary.h>
 #include <Storages/MergeTree/UniqueKey/UpsertDurableFile.h>
 #include <Storages/MergeTree/MergeTreePartInfo.h>
@@ -34,8 +33,9 @@
 
 namespace CurrentMetrics
 {
-extern const Metric UpsertMaskCacheBytes;
-extern const Metric UpsertMaskCacheEntries;
+extern const Metric UpsertResidentMaskBytes;
+extern const Metric UpsertResidentMaskEntries;
+extern const Metric UpsertActiveMaskEntries;
 extern const Metric LocalThread;
 extern const Metric LocalThreadActive;
 extern const Metric LocalThreadScheduled;
@@ -155,6 +155,37 @@ String encodeMask(const DeleteBitmap & mask)
     return out.str();
 }
 
+/// An immutable mask is owned by the current index and any older pinned snapshots.
+/// Both allocation and final release are charged globally, rather than to the publishing query.
+struct ResidentMask
+{
+    std::unique_ptr<const DeleteBitmap> bitmap;
+    CurrentMetrics::Increment bytes;
+    CurrentMetrics::Increment entries{CurrentMetrics::UpsertResidentMaskEntries};
+
+    explicit ResidentMask(std::unique_ptr<DeleteBitmap> bitmap_)
+        : bitmap(std::move(bitmap_))
+        , bytes(CurrentMetrics::UpsertResidentMaskBytes, bitmap->memoryUsage() + sizeof(ResidentMask))
+    {
+    }
+};
+
+ConstDeleteBitmapPtr decodeResidentMask(const String & encoded)
+{
+    CurrentMemoryTracker::check();
+    MemoryTrackerBlockerInThread blocker(VariableContext::User);
+    ReadBufferFromString input(encoded);
+    auto owner = std::shared_ptr<const ResidentMask>(new ResidentMask(DeleteBitmap::deserialize(input)), [](const ResidentMask * mask)
+    {
+        MemoryTrackerBlockerInThread release_blocker(VariableContext::User);
+        delete mask;
+    }, GlobalAllocator<ResidentMask>{});
+    CurrentMemoryTracker::check();
+    return ConstDeleteBitmapPtr(owner, owner->bitmap.get());
+}
+
+using ResidentMasks = MaskIndex<ConstDeleteBitmapPtr>;
+
 struct RecoveredPayload
 {
     ObjectID identity{};
@@ -179,9 +210,9 @@ struct Database
 {
     std::unique_ptr<rocksdb::DB> db;
     std::shared_ptr<rocksdb::Cache> index_cache;
-    std::unique_ptr<DeleteBitmapCache> mask_cache;
-    MaskVersions mask_versions;
+    ResidentMasks resident_masks;
     UInt64 mask_generation = 0;
+    CurrentMetrics::Increment active_masks{CurrentMetrics::UpsertActiveMaskEntries, 0};
     String table_path;
     /// Immutable after recovery; bounded by the number of parts present at open, including pinned old versions.
     std::map<String, std::shared_ptr<RecoveredPayload>> recovered_payloads;
@@ -366,11 +397,16 @@ public:
         if (cut)
             database->db->ReleaseSnapshot(cut);
     }
+    void prepare(ResidentMasks masks_)
+    {
+        if (cut)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree cannot replace masks in a bound snapshot");
+        masks = std::move(masks_);
+    }
     void bind()
     {
         if (cut)
             throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree disk snapshot was bound twice");
-        versions = database->mask_versions;
         cut = database->db->GetSnapshot();
         if (!cut)
             throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree could not pin its disk snapshot");
@@ -401,30 +437,16 @@ public:
     {
         if (!cut)
             throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree disk snapshot was read before commit");
-        const auto * version = versions.find(part);
-        if (!version)
-            return nullptr;
-        auto load = [&]() -> std::shared_ptr<DeleteBitmap>
-        {
-            ProfileEventTimeIncrement<Microseconds> timer(ProfileEvents::UpsertMaskReadMicroseconds);
-            auto value = database->get("M" + part, cut);
-            if (!value)
-                throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree versioned mask is missing");
-            ProfileEvents::increment(ProfileEvents::UpsertMaskReadBytes, value->size());
-            ReadBufferFromString in(*value);
-            return DeleteBitmap::deserialize(in);
-        };
-        if (!database->mask_cache)
-            return load();
-        auto [mask, loaded] = database->mask_cache->getOrSet(DeleteBitmapCache::makeKey(part, *version), load);
-        ProfileEvents::increment(loaded ? ProfileEvents::UpsertMaskCacheMisses : ProfileEvents::UpsertMaskCacheHits);
-        return mask;
+        const auto * mask = masks.find(part);
+        if (mask)
+            ProfileEvents::increment(ProfileEvents::UpsertResidentMaskHits);
+        return mask ? *mask : nullptr;
     }
 
 private:
     std::shared_ptr<Database> database;
     const rocksdb::Snapshot * cut = nullptr;
-    MaskVersions versions;
+    ResidentMasks masks;
 };
 }
 
@@ -440,38 +462,39 @@ struct MaskChange
     };
     Kind kind;
     String part;
-#ifndef NDEBUG
-    bool operator==(const MaskChange &) const = default;
-#endif
+    ConstDeleteBitmapPtr mask;
+    ObjectID fingerprint{};
+    bool operator==(const MaskChange & other) const
+    {
+        return kind == other.kind && part == other.part && fingerprint == other.fingerprint;
+    }
 };
 
-#ifndef NDEBUG
 class MaskVersionUpdates final : public rocksdb::WriteBatch::Handler
 {
 public:
     std::vector<MaskChange> changes;
-    void Put(const rocksdb::Slice & key, const rocksdb::Slice &) override
+    void Put(const rocksdb::Slice & key, const rocksdb::Slice & value) override
     {
         if (key.starts_with("M"))
-            changes.push_back({MaskChange::Kind::Put, key.ToString().substr(1)});
+            changes.push_back({MaskChange::Kind::Put, key.ToString().substr(1), {}, hashLogRecord(value.ToStringView())});
     }
     void Delete(const rocksdb::Slice & key) override
     {
         if (key.starts_with("M"))
-            changes.push_back({MaskChange::Kind::Delete, key.ToString().substr(1)});
+            changes.push_back({MaskChange::Kind::Delete, key.ToString().substr(1), {}, {}});
     }
     rocksdb::Status DeleteRangeCF(uint32_t column_family, const rocksdb::Slice & begin, const rocksdb::Slice & end) override
     {
         if (column_family != 0)
             return rocksdb::Status::InvalidArgument("Unexpected UpsertMergeTree column family");
         if (begin.ToString() == "M" && end.ToString() == "N")
-            changes.push_back({MaskChange::Kind::Clear, {}});
+            changes.push_back({MaskChange::Kind::Clear, {}, {}, {}});
         else if (begin.ToString() < "N" && end.ToString() > "M")
             return rocksdb::Status::InvalidArgument("Unsupported UpsertMergeTree mask range deletion");
         return rocksdb::Status::OK();
     }
 };
-#endif
 }
 
 struct DiskPrepared
@@ -483,21 +506,25 @@ struct DiskPrepared
     bool durable = false;
     bool catalog_change = false;
     UInt64 previous_part_count = 0;
+    ResidentMasks resident_masks;
+    UInt64 previous_mask_generation = 0;
 
     void putMask(const String & part, const DeleteBitmap & mask)
     {
-        check(batch.Put("M" + part, encodeMask(mask)));
-        mask_changes.push_back({MaskChange::Kind::Put, part});
+        const auto encoded = encodeMask(mask);
+        auto resident = decodeResidentMask(encoded);
+        check(batch.Put("M" + part, encoded));
+        mask_changes.push_back({MaskChange::Kind::Put, part, std::move(resident), hashLogRecord(encoded)});
     }
     void deleteMask(const String & part)
     {
         check(batch.Delete("M" + part));
-        mask_changes.push_back({MaskChange::Kind::Delete, part});
+        mask_changes.push_back({MaskChange::Kind::Delete, part, {}, {}});
     }
     void clearMasks()
     {
         check(batch.DeleteRange("M", "N"));
-        mask_changes.push_back({MaskChange::Kind::Clear, {}});
+        mask_changes.push_back({MaskChange::Kind::Clear, {}, {}, {}});
     }
 };
 
@@ -511,10 +538,38 @@ struct DiskState::Impl
     StateClock clock;
     Resources resources;
 
-    std::shared_ptr<SnapshotState> newSnapshot(std::shared_ptr<DiskMaskSnapshot> masks)
+    std::shared_ptr<SnapshotState> newSnapshot(DiskPrepared & prepared)
     {
+        /// Copy only the changed search paths, and allocate before the caller begins persistence.
+        CurrentMemoryTracker::check();
+        MaskVersionUpdates mask_updates;
+        check(prepared.batch.Iterate(&mask_updates));
+        if (mask_updates.changes != prepared.mask_changes)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree mask changes differ from the state batch");
+        auto masks = database->resident_masks;
+        for (const auto & change : prepared.mask_changes)
+        {
+            switch (change.kind)
+            {
+                case MaskChange::Kind::Put:
+                    if (!change.mask)
+                        throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree prepared mask is not resident");
+                    masks.set(change.part, change.mask);
+                    break;
+                case MaskChange::Kind::Delete:
+                    masks.erase(change.part);
+                    break;
+                case MaskChange::Kind::Clear:
+                    masks.clear();
+                    break;
+            }
+        }
+        CurrentMemoryTracker::check();
+        prepared.resident_masks = std::move(masks);
+        prepared.previous_mask_generation = database->mask_generation;
+        prepared.masks->prepare(prepared.resident_masks);
         auto result = std::make_shared<SnapshotState>();
-        result->disk_masks = std::move(masks);
+        result->disk_masks = prepared.masks;
         return result;
     }
 
@@ -527,13 +582,14 @@ struct DiskState::Impl
         options.fill_cache = false;
         std::unique_ptr<rocksdb::Iterator> iterator(database->db->NewIterator(options));
         UInt64 found = 0;
-        /// Bound outstanding payloads, decoded masks and file descriptors independently of the catalog size.
+        /// Bound outstanding recovery work; every validated active mask is retained before publication.
         ThreadPool pool(CurrentMetrics::LocalThread, CurrentMetrics::LocalThreadActive,
             CurrentMetrics::LocalThreadScheduled, resources.recovery_threads, resources.recovery_threads, resources.recovery_threads);
-        std::deque<std::future<void>> pending;
+        std::deque<std::future<std::pair<String, ConstDeleteBitmapPtr>>> pending;
+        std::vector<std::pair<String, ConstDeleteBitmapPtr>> recovered_masks;
         auto finish_front = [&]
         {
-            pending.front().get();
+            recovered_masks.push_back(pending.front().get());
             pending.pop_front();
         };
         auto verify = [this](const PartCommit & record, const std::shared_ptr<RecoveredPayload> & payload)
@@ -573,8 +629,7 @@ struct DiskState::Impl
             const auto encoded_mask = database->get("M" + objectName(record.part));
             if (!encoded_mask)
                 throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree authorized part is missing its visibility mask");
-            ReadBufferFromString mask_input(*encoded_mask);
-            const auto mask = DeleteBitmap::deserialize(mask_input);
+            const auto mask = decodeResidentMask(*encoded_mask);
             if (mask->rangeCardinality(0, record.rows) != mask->cardinality())
                 throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree recovered mask exceeds its part");
             if (const auto progress = database->get("B" + objectName(record.part)))
@@ -592,21 +647,21 @@ struct DiskState::Impl
                 fs::rename(temporary, final);
                 syncDirectory(table_path);
             }
+            return std::pair{objectName(record.part), mask};
         };
         for (iterator->Seek("A"); iterator->Valid() && iterator->key().starts_with("A"); iterator->Next())
         {
             auto record = decodePartCommit(iterator->value().ToStringView());
             if (!record.rows || iterator->key().ToString() != "A" + record.final_name)
                 throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree catalog part identity mismatch");
-            database->mask_versions.set(objectName(record.part), 0);
             if (pending.size() == resources.recovery_threads)
                 finish_front();
             auto verification = std::make_shared<RecoveredPayload>();
             verification->identity = record.part;
             database->recovered_payloads.emplace(record.final_name, verification);
             pending.emplace_back();
-            pending.back() = scheduleFromThreadPoolUnsafe<void>(
-                [verify, authorization = std::move(record), verification] { verify(authorization, verification); }, pool, ThreadName::DEFAULT_THREAD_POOL);
+            pending.back() = scheduleFromThreadPoolUnsafe<std::pair<String, ConstDeleteBitmapPtr>>(
+                [verify, authorization = std::move(record), verification] { return verify(authorization, verification); }, pool, ThreadName::DEFAULT_THREAD_POOL);
             ++found;
         }
         while (!pending.empty())
@@ -614,6 +669,23 @@ struct DiskState::Impl
         check(iterator->status());
         if (found != part_count)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree durable part count differs from its catalog");
+        std::sort(recovered_masks.begin(), recovered_masks.end(), [](const auto & left, const auto & right)
+        {
+            return left.first < right.first;
+        });
+        for (size_t i = 1; i < recovered_masks.size(); ++i)
+        {
+            if (recovered_masks[i - 1].first == recovered_masks[i].first)
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree recovery found duplicate mask identities");
+        }
+        UInt64 mask_count = 0;
+        for (iterator->Seek("M"); iterator->Valid() && iterator->key().starts_with("M"); iterator->Next())
+            ++mask_count;
+        check(iterator->status());
+        if (mask_count != found)
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree durable masks differ from the active catalog");
+        database->resident_masks.assignSorted(recovered_masks);
+        database->active_masks.changeTo(database->resident_masks.size());
         bool had_retired_parts = false;
         /// Keep superseded payloads outside native loading until the recovered root is fully verified.
         const auto retained_root = fs::path(table_path) / recovery_retired_directory;
@@ -742,8 +814,11 @@ struct DiskState::Impl
             syncDirectory(detached_path);
         }
         auto masks = std::make_shared<DiskMaskSnapshot>(database);
+        masks->prepare(database->resident_masks);
         masks->bind();
-        current = newSnapshot(std::move(masks));
+        auto snapshot = std::make_shared<SnapshotState>();
+        snapshot->disk_masks = std::move(masks);
+        current = std::move(snapshot);
     }
 };
 
@@ -754,9 +829,6 @@ DiskState::DiskState(const String & table_path, ObjectID incarnation, bool attac
     impl->table_path = table_path;
     impl->database->table_path = table_path;
     impl->resources = resources;
-    if (resources.mask_cache_bytes)
-        impl->database->mask_cache = std::make_unique<DeleteBitmapCache>("LRU", CurrentMetrics::UpsertMaskCacheBytes,
-            CurrentMetrics::UpsertMaskCacheEntries, resources.mask_cache_bytes, 0.5);
     impl->clock = clock ? std::move(clock) : StateClock([]
     {
         return static_cast<UInt64>(std::chrono::duration_cast<std::chrono::seconds>(
@@ -1186,7 +1258,7 @@ StateStore::Prepared DiskState::prepare(const String & partition, PartCommit par
     result.record = std::move(part);
     checkBatchBudget(batch);
     result.disk->masks = std::make_shared<DiskMaskSnapshot>(impl->database);
-    result.snapshot = impl->newSnapshot(result.disk->masks);
+    result.snapshot = impl->newSnapshot(*result.disk);
     return result;
 }
 
@@ -1410,7 +1482,7 @@ StateStore::Prepared DiskState::prepareMerge(
         result.record = std::move(part);
         checkBatchBudget(batch);
         result.disk->masks = std::make_shared<DiskMaskSnapshot>(impl->database);
-        result.snapshot = impl->newSnapshot(result.disk->masks);
+        result.snapshot = impl->newSnapshot(*result.disk);
         return result;
     }
     for (const auto offset : dead->toVector())
@@ -1446,7 +1518,7 @@ StateStore::Prepared DiskState::prepareMerge(
     result.record = std::move(part);
     checkBatchBudget(batch);
     result.disk->masks = std::make_shared<DiskMaskSnapshot>(impl->database);
-    result.snapshot = impl->newSnapshot(result.disk->masks);
+    result.snapshot = impl->newSnapshot(*result.disk);
     return result;
 }
 
@@ -1493,7 +1565,7 @@ StateStore::Prepared DiskState::prepareTruncate()
     batch.Put(truncate_compaction_key, number(1));
     checkBatchBudget(batch);
     result.disk->masks = std::make_shared<DiskMaskSnapshot>(impl->database);
-    result.snapshot = impl->newSnapshot(result.disk->masks);
+    result.snapshot = impl->newSnapshot(*result.disk);
     return result;
 }
 
@@ -1755,7 +1827,7 @@ StateStore::Prepared DiskState::preparePartition(
     batch.Put("part_count", number(impl->part_count - result.retired_parts.size() + result.added_parts.size()));
     checkBatchBudget(batch);
     result.disk->masks = std::make_shared<DiskMaskSnapshot>(impl->database);
-    result.snapshot = impl->newSnapshot(result.disk->masks);
+    result.snapshot = impl->newSnapshot(*result.disk);
     return result;
 }
 
@@ -1786,28 +1858,8 @@ void DiskState::append(const StateStore::Prepared & prepared)
     const auto generation = impl->database->mask_generation + 1;
     if (!generation)
         throw Exception(ErrorCodes::LIMIT_EXCEEDED, "UpsertMergeTree mask generation exhausted");
-    auto versions = impl->database->mask_versions;
-    for (const auto & change : prepared.disk->mask_changes)
-    {
-        switch (change.kind)
-        {
-            case MaskChange::Kind::Put:
-                versions.set(change.part, generation);
-                break;
-            case MaskChange::Kind::Delete:
-                versions.erase(change.part);
-                break;
-            case MaskChange::Kind::Clear:
-                versions.clear();
-                break;
-        }
-    }
-#ifndef NDEBUG
-    MaskVersionUpdates mask_updates;
-    check(prepared.disk->batch.Iterate(&mask_updates));
-    if (mask_updates.changes != prepared.disk->mask_changes)
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree mask changes differ from the state batch");
-#endif
+    if (prepared.disk->previous_mask_generation != impl->database->mask_generation)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree mask index changed under the commit lock");
     FailPointInjection::pauseFailPoint(FailPoints::upsert_pause_before_state_write);
     {
         ProfileEventTimeIncrement<Microseconds> timer(ProfileEvents::UpsertStateWriteMicroseconds);
@@ -1816,6 +1868,10 @@ void DiskState::append(const StateStore::Prepared & prepared)
         ProfileEvents::increment(ProfileEvents::UpsertStateWriteBytes, prepared.disk->batch.GetDataSize());
     }
     prepared.disk->durable = true;
+    /// Installing the preallocated root cannot allocate or fail after durability.
+    impl->database->resident_masks = std::move(prepared.disk->resident_masks);
+    ++impl->database->mask_generation;
+    impl->database->active_masks.changeTo(impl->database->resident_masks.size());
     for (const auto & name : prepared.retired_parts)
     {
         const auto it = impl->database->recovered_payloads.find(name);
@@ -1831,8 +1887,6 @@ void DiskState::append(const StateStore::Prepared & prepared)
     {
         throw Exception(ErrorCodes::FAULT_INJECTED, "Injected UpsertMergeTree failure after disk-state sync");
     });
-    impl->database->mask_versions = std::move(versions);
-    ++impl->database->mask_generation;
     prepared.disk->masks->bind();
 }
 

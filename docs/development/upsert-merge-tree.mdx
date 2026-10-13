@@ -99,21 +99,28 @@ also uses normal reading. The count source does not participate in parallel-repl
 Use `optimize_use_projections = 0` to compare with the scan path; disabling
 only trivial count can still leave other existing implicit-projection optimizations available.
 
-Bitmap loading happens during execution, including checksum validation, memory accounting and
-cancellation checks. `EXPLAIN` does not load masks through this count source. Part-selection checks,
+Disk-state visibility bitmaps are decoded and validated before the table opens or a new write is
+persisted, and remain resident in the pinned snapshot. Count execution looks up those immutable
+bitmaps in memory and checks cancellation and memory limits. `EXPLAIN` does not iterate masks
+through this count source. Part-selection checks,
 forced-index requirements, partition limits and table concurrency limits remain enforced. Column-read
 row and byte limits are not charged, as with ordinary metadata counting. Counting does not verify
 column payload checksums because it reads no column payloads; full payload verification remains separate.
 
 An all-hidden or empty table preserves the normal empty-aggregation settings. A missing bitmap or
 an out-of-range hidden row raises an exception rather than producing an estimated count. The work
-depends on the number of parts and bitmap containers, and cold masks can require state-database I/O;
+depends on the number of parts and bitmap containers;
 it is not a constant-time table counter. `EXPLAIN` and query-log projection names identify the path
 as `_upsert_visible_count`.
 
+Small unfiltered, unordered `LIMIT` reads can also prepare tasks on demand rather than creating
+one processor per selected part. See [resident bitmaps and lazy limit preparation](/development/upsert-merge-tree-scalability#lazy-limit-preparation)
+for eligibility, memory costs and the remaining part-selection work.
+
 The prepared source does not populate query-log partition names or the column reader's
-`SelectedParts` and `SelectedMarks` counters. Bitmap I/O remains observable through the existing
-`UpsertMaskReadBytes` and mask-cache events.
+`SelectedParts` and `SelectedMarks` counters. Disk-state bitmap lookups use resident memory and
+are counted by `UpsertResidentMaskHits`. The resident-mask metrics describe retained memory;
+legacy `UpsertMaskReadBytes` and mask-cache events no longer describe these lookups.
 
 ## Configurable insert units {#configurable-insert-units}
 

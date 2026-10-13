@@ -195,7 +195,8 @@ MergeTreeReadPoolBase::MergeTreeReadPoolBase(
     const Names & column_names_,
     const PoolSettings & pool_settings_,
     const MergeTreeReadTask::BlockSizeParams & block_size_params_,
-    const ContextPtr & context_)
+    const ContextPtr & context_,
+    bool initialize_part_infos)
     : WithContext(context_)
     , storage_snapshot(storage_snapshot_)
     , parts_ranges(std::move(parts_))
@@ -205,26 +206,27 @@ MergeTreeReadPoolBase::MergeTreeReadPoolBase(
     , row_level_filter(row_level_filter_)
     , prewhere_info(prewhere_info_)
     , actions_settings(actions_settings_)
-    , reader_settings(setColumnsCacheSchemaIdentity(
+    , reader_settings(initialize_part_infos ? setColumnsCacheSchemaIdentity(
           adjustReaderSettingsForColumnsCacheWrites(
               reader_settings_,
               context_,
               getColumnsCacheIfEnabled(context_, pool_settings_.use_columns_cache),
               pool_settings_.use_columns_cache),
           storage_snapshot_,
-          getColumnsCacheIfEnabled(context_, pool_settings_.use_columns_cache)))
+          getColumnsCacheIfEnabled(context_, pool_settings_.use_columns_cache)) : disableColumnsCache(reader_settings_))
     , column_names(column_names_)
     , pool_settings(pool_settings_)
     , block_size_params(block_size_params_)
     , owned_mark_cache(context_->getGlobalContext()->getMarkCache())
     , owned_uncompressed_cache(pool_settings_.use_uncompressed_cache ? context_->getGlobalContext()->getUncompressedCache() : nullptr)
-    , owned_columns_cache(getColumnsCacheIfEnabled(context_, pool_settings_.use_columns_cache))
+    , owned_columns_cache(initialize_part_infos ? getColumnsCacheIfEnabled(context_, pool_settings_.use_columns_cache) : nullptr)
     , patch_join_cache(std::make_shared<PatchJoinCache>(context_->getSettingsRef()[Setting::apply_patch_parts_join_cache_buckets]))
     , header(storage_snapshot->getSampleBlockForColumns(column_names))
     , ranges_in_patch_parts(context_->getSettingsRef()[Setting::merge_tree_min_read_task_size])
     , profile_callback([this](ReadBufferFromFileBase::ProfileInfo info_) { profileFeedback(info_); })
 {
-    fillPerPartInfos(context_->getSettingsRef());
+    if (initialize_part_infos)
+        fillPerPartInfos(context_->getSettingsRef());
 }
 
 /// Constructor for `MergeTreeReadPoolProjectionIndex`, which reads projection index parts.

@@ -11,6 +11,24 @@
 namespace DB
 {
 
+/// One reader for an unordered `UpsertMergeTree` limit. Parts remain pinned, but task metadata
+/// and readers are created only when execution reaches that part.
+class MergeTreeReadPoolForUpsertLimit final : public MergeTreeReadPoolBase
+{
+public:
+    using MergeTreeReadPoolBase::MergeTreeReadPoolBase;
+    String getName() const override { return "ReadPoolForUpsertLimit"; }
+    bool preservesOrderOfRanges() const override { return true; }
+    MergeTreeReadTaskPtr getTask(size_t task_idx, MergeTreeReadTask * previous_task) override;
+    void profileFeedback(ReadBufferFromFileBase::ProfileInfo) override {}
+
+private:
+    std::mutex lazy_task_mutex;
+    size_t next_part_index = 0;
+    MarkRanges remaining_ranges;
+    MergeTreeReadTaskInfoPtr current_info;
+};
+
 /** Provides read tasks for MergeTreeThreadSelectAlgorithm in fine-grained batches, allowing for more
  *  uniform distribution of work amongst multiple threads. All parts and their ranges are divided into `threads`
  *  workloads with at most `sum_marks / threads` marks. Then, threads are performing reads from these workloads

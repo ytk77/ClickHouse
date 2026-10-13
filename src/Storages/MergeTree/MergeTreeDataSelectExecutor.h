@@ -251,7 +251,7 @@ public:
     /// Filter parts using column statistics.
     /// Returns filtered parts and updates index_stats with statistics pruning info.
     static RangesInDataParts filterPartsByStatistics(
-        const RangesInDataParts & parts,
+        RangesInDataParts parts,
         const StorageMetadataPtr & metadata_snapshot,
         const SelectQueryInfo & query_info,
         const MergeTreeData::MutationsSnapshotPtr & mutations_snapshot,

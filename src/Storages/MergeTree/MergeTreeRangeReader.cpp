@@ -1281,16 +1281,30 @@ void MergeTreeRangeReader::applyUpsertMask(ReadResult & result, const DeleteBitm
 {
     if (bitmap.empty() || !result.num_rows)
         return;
-    auto mask_column = ColumnUInt8::create(result.total_rows_per_granule, UInt8{1});
-    auto & mask = mask_column->getData();
+    ColumnUInt8::MutablePtr mask_column;
     size_t position = 0;
     for (size_t granule = 0; granule < result.rows_per_granule.size(); ++granule)
     {
         const auto start = result.granule_offsets[granule].starting_offset;
-        for (size_t row = 0; row < result.rows_per_granule[granule]; ++row)
-            mask[position++] = !bitmap.contains(start + row);
+        const auto rows = result.rows_per_granule[granule];
+        const auto hidden = bitmap.rangeCardinality(start, start + rows);
+        if (hidden)
+        {
+            /// Most granules of a partially overwritten part may still be entirely visible.
+            /// Allocate a filter only when a read range actually contains hidden rows.
+            if (!mask_column)
+                mask_column = ColumnUInt8::create(result.total_rows_per_granule, UInt8{1});
+            auto & mask = mask_column->getData();
+            if (hidden == rows)
+                std::fill_n(mask.begin() + position, rows, UInt8{0});
+            else
+                for (size_t row = 0; row < rows; ++row)
+                    mask[position + row] = !bitmap.contains(start + row);
+        }
+        position += rows;
     }
-    result.optimize(FilterWithCachedCount(std::move(mask_column)), can_read_incomplete_granules, true);
+    if (mask_column)
+        result.optimize(FilterWithCachedCount(std::move(mask_column)), can_read_incomplete_granules, true);
 }
 
 void MergeTreeRangeReader::fillVirtualColumns(Columns & columns, ReadResult & result)

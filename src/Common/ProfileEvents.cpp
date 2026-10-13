@@ -105,6 +105,9 @@
     M(DefaultImplementationForNullsRowsWithNulls, "Number of rows which contain null values processed by default implementation for nulls in function execution", ValueType::Number) \
     M(MarkCacheHits, "Number of times an entry has been found in the mark cache, so we didn't have to load a mark file.", ValueType::Number) \
     M(MarkCacheMisses, "Number of times an entry has not been found in the mark cache, so we had to load a mark file in memory, which is a costly operation, adding to query latency.", ValueType::Number) \
+    M(UpsertHiddenPartsSkipped, "Selected `UpsertMergeTree` part ranges skipped before reader preparation because all their rows are hidden in the pinned snapshot.", ValueType::Number) \
+    M(UpsertLazyReadPartsPrepared, "Parts whose read-task metadata was prepared on demand for an unordered `UpsertMergeTree` limit.", ValueType::Number) \
+    M(UpsertResidentMaskHits, "Immutable `UpsertMergeTree` visibility bitmaps obtained from the resident snapshot index without disk reads.", ValueType::Number) \
     M(UpsertMaskCacheHits, "Decoded `UpsertMergeTree` visibility masks reused from the cache.", ValueType::Number) \
     M(UpsertMaskCacheMisses, "Decoded `UpsertMergeTree` visibility masks loaded into the cache.", ValueType::Number) \
     M(UpsertInputFoldMicroseconds, "Time folding duplicate input keys in `UpsertMergeTree`, including key encoding.", ValueType::Microseconds) \

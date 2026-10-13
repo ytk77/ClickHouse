@@ -1236,6 +1236,30 @@ TEST_F(UpsertDiskStateTest, MaskCacheTracksPartialRelocationExpirationAndRetirem
     EXPECT_FALSE(prepare(reopened, {{"a", 1}}).produces_part);
 }
 
+TEST_F(UpsertDiskStateTest, RecoveryRejectsOrphanResidentMask)
+{
+    {
+        StateStore store(directory, incarnation, false, true);
+        auto part = prepare(store, {{"key", 1}});
+        commit(store, part);
+    }
+    std::unique_ptr<rocksdb::DB> database;
+    ASSERT_TRUE(rocksdb::DB::Open(rocksdb::Options{}, (directory / "upsert_state_v2").string(), &database).ok());
+    /// The mask namespace must have exactly one entry for each authorized part.
+    ASSERT_TRUE(database->Put(rocksdb::WriteOptions{}, "Morphan", "unused").ok());
+    database.reset();
+    try
+    {
+        StateStore reopened(directory, incarnation, true, true);
+        FAIL() << "Expected orphan visibility mask rejection";
+    }
+    catch (const Exception & error)
+    {
+        EXPECT_EQ(error.code(), ErrorCodes::CORRUPTED_DATA);
+        EXPECT_NE(error.message().find("mask"), String::npos);
+    }
+}
+
 TEST_F(UpsertDiskStateTest, ParallelRecoveryRejectsCorruptPayload)
 {
     String part;

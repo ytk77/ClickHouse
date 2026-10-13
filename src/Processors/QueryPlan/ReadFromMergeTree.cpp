@@ -78,6 +78,9 @@
 #include <Storages/StorageSnapshot.h>
 #include <Storages/VirtualColumnUtils.h>
 #include <Common/CurrentThread.h>
+#include <Common/CurrentMemoryTracker.h>
+#include <Interpreters/ProcessList.h>
+#include <Storages/MergeTree/UniqueKey/UpsertReadHelpers.h>
 #include <Common/DateLUT.h>
 #include <Common/JSONBuilder.h>
 #include <Common/Logger.h>
@@ -254,6 +257,7 @@ bool restorePrewhereInputs(FilterDAGInfo * row_level_filter, PrewhereInfo * info
 
 namespace ProfileEvents
 {
+    extern const Event UpsertHiddenPartsSkipped;
     extern const Event IndexAnalysisRounds;
     extern const Event SelectedParts;
     extern const Event SelectedPartsTotal;
@@ -730,10 +734,18 @@ Pipe ReadFromMergeTree::readFromPool(
     Names required_columns,
     PoolSettings pool_settings)
 {
-    size_t total_rows = parts_with_range.getRowsCountAllParts();
-
-    if (query_info.trivial_limit > 0 && query_info.trivial_limit < total_rows)
-        total_rows = query_info.trivial_limit;
+    size_t total_rows = 0;
+    if (pool_settings.lazy_upsert_limit)
+    {
+        for (const auto & part : parts_with_range)
+            total_rows += std::min<UInt64>(part.getRowsCount(), query_info.trivial_limit);
+    }
+    else
+    {
+        total_rows = parts_with_range.getRowsCountAllParts();
+        if (query_info.trivial_limit > 0 && query_info.trivial_limit < total_rows)
+            total_rows = query_info.trivial_limit;
+    }
 
     const auto & settings = context->getSettingsRef();
 
@@ -772,7 +784,26 @@ Pipe ReadFromMergeTree::readFromPool(
     bool use_prefetched_read_pool = query_info.trivial_limit == 0 && !query_info.small_limit_above_array_join
         && (allow_prefetched_remote || allow_prefetched_local);
 
-    if (use_prefetched_read_pool)
+    if (pool_settings.lazy_upsert_limit)
+    {
+        auto lazy_pool = std::make_shared<MergeTreeReadPoolForUpsertLimit>(
+            std::move(parts_with_range),
+            mutations_snapshot,
+            shared_virtual_fields,
+            index_read_tasks,
+            storage_snapshot,
+            query_info.row_level_filter,
+            query_info.prewhere_info,
+            actions_settings,
+            reader_settings,
+            required_columns,
+            pool_settings,
+            block_size,
+            context,
+            /*initialize_part_infos=*/false);
+        pool = std::move(lazy_pool);
+    }
+    else if (use_prefetched_read_pool)
     {
         auto prefetched_pool = std::make_shared<MergeTreePrefetchedReadPool>(
             std::move(parts_with_range),
@@ -1122,6 +1153,26 @@ Pipe ReadFromMergeTree::read(
     if (read_type == ReadType::ParallelReplicas)
         return readFromPoolParallelReplicas(
             std::move(parts_with_range), index_build_context, std::move(required_columns), std::move(pool_settings));
+
+    /// A small unordered limit needs only one reader. Do not construct a source or task
+    /// for every selected part before that reader can produce its first visible rows.
+    const bool lazy_upsert_limit = data.merging_params.upsert && read_type == ReadType::Default && max_streams == 1
+        && !is_parallel_reading_from_replicas && !checkAllPartsOnRemoteFS(parts_with_range)
+        && query_info.trivial_limit > 0 && query_info.trivial_limit <= block_size.max_block_size_rows
+        && !query_info.input_order_info && !query_info.isFinal() && !query_info.isStream() && !isQueryWithSampling()
+        && !mutations_snapshot->hasDataMutations() && !mutations_snapshot->hasPatchParts()
+        && !query_info.prewhere_info && !query_info.row_level_filter && !deferred_row_level_filter
+        && !query_info.filter_actions_dag && !getFilterActionsDAG()
+        && query_info.filter_asts.empty() && !query_info.additional_filter_ast
+        && index_read_tasks.empty() && !reader_settings.read_in_order && !lazy_materializing_rows
+        && !vector_search_parameters && !top_k_filter_info
+        && std::ranges::none_of(parts_with_range, [](const auto & part) { return part.data_part->isProjectionPart(); });
+    if (lazy_upsert_limit)
+    {
+        pool_settings.lazy_upsert_limit = true;
+        return readFromPool(
+            std::move(parts_with_range), index_build_context, std::move(required_columns), std::move(pool_settings));
+    }
 
     /// Reading from default thread pool is beneficial for remote storage because of new prefetches.
     if (read_type == ReadType::Default && (max_streams > 1 || checkAllPartsOnRemoteFS(parts_with_range)))
@@ -5234,10 +5285,13 @@ void ReadFromMergeTree::initializePipeline(QueryPipelineBuilder & pipeline, [[ma
     if (context->hasQueryContext() && !query_info.is_internal)
     {
         Names partition_names;
+        std::unordered_set<std::string_view> partition_ids;
+        const auto table_name = data.getStorageID().getFullNameNotQuoted();
         for (const auto & part : result.parts_with_ranges)
         {
-            partition_names.emplace_back(
-                fmt::format("{}.{}", data.getStorageID().getFullNameNotQuoted(), part.data_part->info.getPartitionId()));
+            const auto & partition_id = part.data_part->info.getPartitionId();
+            if (partition_ids.emplace(partition_id).second)
+                partition_names.emplace_back(fmt::format("{}.{}", table_name, partition_id));
         }
         context->getQueryContext()->addQueryAccessInfo(partition_names);
     }
@@ -5250,6 +5304,43 @@ void ReadFromMergeTree::initializePipeline(QueryPipelineBuilder & pipeline, [[ma
     /// incrementing here as well would double-count.
 
     auto query_id_holder = result.checkLimits(*context, data, *data_settings);
+
+    /// Keep selection limits and access accounting based on the original analysis. Prune only
+    /// before index-reader contexts and pools are built, preserving part indexes and offsets.
+    /// Small limits inspect masks on demand in their lazy pool instead of walking every mask here.
+    if (data.merging_params.upsert && query_info.trivial_limit == 0
+        && !query_info.isFinal() && !query_info.isStream() && !lazy_materializing_rows
+        && result.split_parts.layers.empty() && distributed_read_bucket_count == 0
+        && !is_parallel_reading_from_replicas && projection_index_read_desc.read_ranges.empty()
+        && !mutations_snapshot->hasDataMutations() && !mutations_snapshot->hasPatchParts())
+    {
+        const auto & snapshot_data = assert_cast<const MergeTreeData::SnapshotData &>(*storage_snapshot->data);
+        if (!snapshot_data.upsert_snapshot)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree reader requires a pinned visibility snapshot");
+        snapshot_data.upsert_snapshot->checkVerification();
+        const auto process = context->getProcessListElement();
+        size_t visited = 0;
+        bool stopped = false;
+        std::erase_if(result.parts_with_ranges, [&](const auto & part)
+        {
+            if (stopped)
+                return false;
+            if (visited++ % 256 == 0)
+            {
+                CurrentMemoryTracker::check();
+                /// On timeout break mode, leave remaining parts for the reader to stop normally.
+                if (process && !process->checkTimeLimit())
+                {
+                    stopped = true;
+                    return false;
+                }
+            }
+            if (!areUpsertReadRangesFullyHidden(part, snapshot_data.upsert_snapshot))
+                return false;
+            ProfileEvents::increment(ProfileEvents::UpsertHiddenPartsSkipped);
+            return true;
+        });
+    }
 
     /// If we have neither a WHERE nor a PREWHERE condition, the query condition cache doesn't save anything --> disable it.
     bool has_where_or_prewhere = query_info.prewhere_info || query_info.filter_actions_dag;

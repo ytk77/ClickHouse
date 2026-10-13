@@ -1,0 +1,30 @@
+filtered sum	5500
+pruned	1	1	1
+grouped	0	2580	1680
+grouped	1	2920	1900
+prewhere	3760	2560
+mixed granules	1200	750
+ordered	[0,1,2,3,4]
+lazy	3	3
+lazy prepared	1	1
+final	5500
+final gate	1
+physical limit	5500
+policy	3760
+additional filter	3760
+old analyzer	5500
+pruned empty	0	\N	0
+all selected pruned	1
+pruned empty groups	0
+pruned empty result	0
+pruned null empty	\N
+deleted selection	0	\N	0
+hidden groups	0
+deleted all	0	\N	0
+empty result	0
+null empty	\N
+deleted groups	0
+native	3760
+hidden ranges	0
+range pruned	1
+surviving ranges	376

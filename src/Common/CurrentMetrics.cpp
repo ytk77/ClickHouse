@@ -409,6 +409,9 @@
     M(UniqueKeyIndexCacheBytes, "Total size of UNIQUE KEY index cache in bytes") \
     M(UniqueKeyIndexCacheEntries, "Total number of UNIQUE KEY index blocks cached") \
     M(DeleteBitmapCacheBytes, "Total size of the UNIQUE KEY delete-bitmap cache in bytes") \
+    M(UpsertActiveMaskEntries, "Active part visibility bitmaps in published `UpsertMergeTree` state indexes") \
+    M(UpsertResidentMaskBytes, "Estimated bytes of resident visibility bitmaps for `UpsertMergeTree`, including versions pinned by readers; excludes index nodes") \
+    M(UpsertResidentMaskEntries, "Resident visibility bitmaps for `UpsertMergeTree`, including versions pinned by readers") \
     M(UpsertMaskCacheBytes, "Estimated bytes retained in decoded visibility caches for `UpsertMergeTree` tables") \
     M(UpsertMaskCacheEntries, "Decoded visibility masks retained in caches for `UpsertMergeTree` tables") \
     M(DeleteBitmapCacheEntries, "Total number of UNIQUE KEY delete bitmaps cached") \

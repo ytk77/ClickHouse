@@ -4,15 +4,20 @@
 #include <Storages/MergeTree/MergeTreeReadPool.h>
 #include <base/range.h>
 #include <Interpreters/Context.h>
+#include <Interpreters/ProcessList.h>
 #include <Common/Stopwatch.h>
+#include <Common/CurrentMemoryTracker.h>
 #include <Common/formatReadable.h>
 #include <Common/logger_useful.h>
 #include <Core/Settings.h>
 #include <Storages/MergeTree/RequestResponse.h>
+#include <Storages/MergeTree/UniqueKey/UpsertReadHelpers.h>
 
 
 namespace ProfileEvents
 {
+    extern const Event UpsertLazyReadPartsPrepared;
+    extern const Event UpsertHiddenPartsSkipped;
     extern const Event SlowRead;
     extern const Event ReadBackoff;
 }
@@ -33,6 +38,66 @@ namespace ErrorCodes
 extern const int CANNOT_SCHEDULE_TASK;
 extern const int LOGICAL_ERROR;
 extern const int BAD_ARGUMENTS;
+}
+
+MergeTreeReadTaskPtr MergeTreeReadPoolForUpsertLimit::getTask(size_t task_idx, MergeTreeReadTask * previous_task)
+{
+    std::lock_guard lock(lazy_task_mutex);
+    if (task_idx != 0)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree lazy limit pool requires one reader");
+    /// Refiner request maps use task-info addresses as keys; those addresses can be reused
+    /// after moving to another part. This pool must never install a refiner.
+    if (ranges_refiner)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree lazy limit pool does not support a ranges refiner");
+
+    while (true)
+    {
+        if (remaining_ranges.empty())
+        {
+            current_info.reset();
+            if (next_part_index == parts_ranges.size())
+                return nullptr;
+
+            if (next_part_index % 256 == 0)
+            {
+                CurrentMemoryTracker::check();
+                if (auto status = getContext()->getProcessListElement())
+                {
+                    if (!status->checkTimeLimit())
+                        return nullptr;
+                }
+            }
+            const auto & part = parts_ranges[next_part_index++];
+            if (part.ranges.empty())
+                continue;
+            const auto & snapshot_data = assert_cast<const MergeTreeData::SnapshotData &>(*storage_snapshot->data);
+            if (areUpsertReadRangesFullyHidden(part, snapshot_data.upsert_snapshot))
+            {
+                ProfileEvents::increment(ProfileEvents::UpsertHiddenPartsSkipped);
+                continue;
+            }
+            auto info = buildReadTaskInfo(part, getContext()->getSettingsRef());
+            if (!info.patch_parts.empty() || part.data_part->isProjectionPart())
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree lazy limit pool received a patch or projection part");
+            current_info = std::make_shared<MergeTreeReadTaskInfo>(std::move(info));
+            ProfileEvents::increment(ProfileEvents::UpsertLazyReadPartsPrepared);
+            remaining_ranges = part.ranges;
+        }
+
+        /// One mark at a time lets the downstream limit stop without preparing later parts.
+        /// Hidden rows are filtered by the normal reader; an empty result continues with the next task.
+        auto & range = remaining_ranges.front();
+        if (range.begin >= range.end)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree lazy limit pool received an invalid mark range");
+        MarkRanges task_ranges;
+        task_ranges.emplace_back(range.begin, range.begin + 1);
+        if (++range.begin == range.end)
+            remaining_ranges.pop_front();
+        task_ranges = refineReadRanges(*current_info, std::move(task_ranges));
+        if (task_ranges.empty())
+            continue;
+        return createTask(current_info, std::move(task_ranges), previous_task);
+    }
 }
 
 MergeTreeReadPool::MergeTreeReadPool(

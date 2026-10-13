@@ -110,3 +110,36 @@ TEST(UpsertReadMask, OldSnapshotKeepsItsMaskAfterPublication)
     EXPECT_EQ(old->partition_csns.at("p"), 1);
     EXPECT_EQ(state->partition_csns.at("p"), 2);
 }
+
+TEST(UpsertReadMask, AllVisibilityCombinationsPreservePredicates)
+{
+    const std::vector<UInt64> input{10, 11, 12, 13, 80, 81, 82};
+    for (bool incomplete : {false, true})
+    {
+        for (size_t bits = 0; bits < (1U << input.size()); ++bits)
+        {
+            auto result = makeRows();
+            DeleteBitmap dead;
+            /// Keep a non-empty mask even when none of the rows read are hidden.
+            dead.add(500);
+            std::vector<UInt64> expected;
+            for (size_t row = 0; row < input.size(); ++row)
+            {
+                if (bits & (1U << row))
+                    dead.add(input[row]);
+                else
+                    expected.push_back(input[row]);
+            }
+            MergeTreeRangeReader::applyUpsertMask(result, dead, incomplete);
+            ASSERT_EQ(values(result), expected) << bits << ":" << incomplete;
+            if (!result.num_rows)
+                continue;
+            auto predicate = ColumnUInt8::create();
+            for (const auto value : values(result))
+                predicate->insertValue(value % 2 == 0);
+            UpsertReadMaskTestPeer::applyPredicate(result, std::move(predicate));
+            std::erase_if(expected, [](UInt64 value) { return value % 2 != 0; });
+            EXPECT_EQ(values(result), expected) << bits << ":" << incomplete;
+        }
+    }
+}

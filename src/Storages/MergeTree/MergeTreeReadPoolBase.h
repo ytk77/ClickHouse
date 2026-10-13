@@ -31,6 +31,7 @@ public:
         bool use_columns_cache = false;
         bool do_not_steal_tasks = false;
         bool use_const_size_tasks_for_remote_reading = false;
+        bool lazy_upsert_limit = false;
 
         // Not the same as the similar field in `ParallelReadingExtension`. Accounts for `max_parallel_replicas`.
         const size_t total_query_nodes{};
@@ -49,7 +50,8 @@ public:
         const Names & column_names_,
         const PoolSettings & settings_,
         const MergeTreeReadTask::BlockSizeParams & params_,
-        const ContextPtr & context_);
+        const ContextPtr & context_,
+        bool initialize_part_infos = true);
 
     /// Simplified c'tor for MergeTreeReadPoolProjectionIndex
     MergeTreeReadPoolBase(

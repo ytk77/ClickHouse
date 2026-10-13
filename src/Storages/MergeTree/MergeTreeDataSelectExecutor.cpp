@@ -717,7 +717,7 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterParts(
     auto res = filterPartsByPartition(
         parts, indexes.partition_pruner, indexes.minmax_idx_condition, indexes.part_values,
         metadata_snapshot, data, context, max_block_numbers_to_read, log, index_stats);
-    return filterPartsByStatistics(res, metadata_snapshot, query_info, mutations_snapshot, context, log, index_stats);
+    return filterPartsByStatistics(std::move(res), metadata_snapshot, query_info, mutations_snapshot, context, log, index_stats);
 }
 
 RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByPartition(
@@ -837,7 +837,7 @@ std::expected<void, PreformattedMessage> MergeTreeDataSelectExecutor::canUseInde
 
 
 RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByStatistics(
-    const RangesInDataParts & parts,
+    RangesInDataParts parts,
     const StorageMetadataPtr & metadata_snapshot,
     const SelectQueryInfo & query_info,
     const MergeTreeData::MutationsSnapshotPtr & mutations_snapshot,
@@ -880,7 +880,7 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByStatistics(
     RangesInDataParts res_parts;
     size_t total_parts_before = parts.size();
 
-    for (const auto & part : parts)
+    for (auto & part : parts)
     {
         auto estimates = part.data_part->getEstimates();
         try
@@ -897,7 +897,7 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByStatistics(
                 "Failed to apply statistics pruning for part {}, skipping statistics pruning for this part",
                 part.data_part->name), LogsLevel::debug);
         }
-        res_parts.push_back(part);
+        res_parts.push_back(std::move(part));
     }
 
     if (res_parts.size() < total_parts_before)

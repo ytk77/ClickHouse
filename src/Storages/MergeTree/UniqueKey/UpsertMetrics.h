@@ -24,6 +24,7 @@ extern const Event UpsertTokenPrepareMicroseconds;
 extern const Event UpsertPayloadSyncFiles;
 extern const Event UpsertPayloadSyncParallelGroups;
 extern const Event UpsertPayloadSyncSequentialGroups;
+extern const Event UpsertResidentMaskHits;
 extern const Event UpsertMaskCacheHits;
 extern const Event UpsertMaskCacheMisses;
 extern const Event UpsertWinnerLookupMicroseconds;

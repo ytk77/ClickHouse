@@ -160,9 +160,10 @@ No query or database setting is required. `ALTER` of this setting is not support
 )", 0, \
         {"26.8", 4, 4, "New resource setting for `UpsertMergeTree`."}) \
     DECLARE(UInt64, upsert_mask_cache_bytes, 32ULL << 20, R"(
-Maximum retained decoded visibility mask cache bytes per `UpsertMergeTree` table.
-Zero disables the cache. Readers can retain evicted immutable masks until their query finishes.
-Applied when the table opens.
+Legacy decoded visibility mask cache budget for `UpsertMergeTree`.
+Disk-state tables keep every active visibility bitmap resident in memory, independently of this value,
+including when it is zero. Older snapshots retain their own immutable bitmap versions until released.
+The setting remains accepted for existing metadata; it does not cap resident bitmap memory.
 )", 0, \
         {"26.8", 32ULL << 20, 32ULL << 20, "New resource setting for `UpsertMergeTree`."}) \
     DECLARE(Bool, upsert_partitioned_filters, true, R"(
