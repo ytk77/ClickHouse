@@ -1,0 +1,47 @@
+unmasked	6
+unmasked scan	6
+unmasked plan	1
+masked	6
+masked scan	6
+masked plan	1
+nullable	3
+nullable plan	0
+where	4
+where plan	0
+prewhere	2
+prewhere plan	0
+additional filter	4
+additional filter plan	0
+final	6
+final plan	0
+row policy	4
+row policy plan	0
+trivial disabled	6
+trivial disabled plan	0
+projections disabled	6
+projections disabled plan	0
+implicit disabled	6
+implicit disabled plan	0
+forced projection	6
+logged	6
+query log	1
+old analyzer	6
+old analyzer plan	1
+delete	5
+delete scan	5
+delete plan	1
+subqueries	10
+hidden part	3
+hidden part scan	3
+hidden part plan	1
+empty	0
+empty scan	0
+empty plan	1
+empty result plan	1
+empty result rows	0
+empty result scan rows	0
+constant empty rows	0
+constant empty scan rows	0
+truncate	0
+truncate scan	0
+truncate plan	1
