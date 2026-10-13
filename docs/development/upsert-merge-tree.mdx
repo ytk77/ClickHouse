@@ -84,6 +84,37 @@ The `_upsert_` prefix is reserved; the input-only delete flag is not connected y
 Partial-column updates remain unsupported; replace a row by inserting a new version.
 
 
+## Exact visible-row count {#exact-visible-row-count}
+
+An unfiltered `SELECT count()` can use `_upsert_visible_count` to count visible rows without reading
+column files. It sums each selected part's physical row count minus the cardinality of that part's
+visibility bitmap. Both the parts and the bitmaps come from the same pinned query snapshot, including
+when inserts, deletes, partition operations or maintenance publish a newer version concurrently.
+
+The query-plan optimization requires `optimize_trivial_count_query`, `optimize_use_projections` and
+`optimize_use_implicit_projections`. It supports a single zero-argument `count()` aggregate without
+grouping or filters. Queries with `WHERE`, `PREWHERE`, row policies, additional table filters, `FINAL`,
+sampling, streaming or pending data mutations use the normal read path. `count(nullable_column)`
+also uses normal reading. The count source does not participate in parallel-replica reading.
+Use `optimize_use_projections = 0` to compare with the scan path; disabling
+only trivial count can still leave other existing implicit-projection optimizations available.
+
+Bitmap loading happens during execution, including checksum validation, memory accounting and
+cancellation checks. `EXPLAIN` does not load masks through this count source. Part-selection checks,
+forced-index requirements, partition limits and table concurrency limits remain enforced. Column-read
+row and byte limits are not charged, as with ordinary metadata counting. Counting does not verify
+column payload checksums because it reads no column payloads; full payload verification remains separate.
+
+An all-hidden or empty table preserves the normal empty-aggregation settings. A missing bitmap or
+an out-of-range hidden row raises an exception rather than producing an estimated count. The work
+depends on the number of parts and bitmap containers, and cold masks can require state-database I/O;
+it is not a constant-time table counter. `EXPLAIN` and query-log projection names identify the path
+as `_upsert_visible_count`.
+
+The prepared source does not populate query-log partition names or the column reader's
+`SelectedParts` and `SelectedMarks` counters. Bitmap I/O remains observable through the existing
+`UpsertMaskReadBytes` and mask-cache events.
+
 ## Configurable insert units {#configurable-insert-units}
 
 `upsert_insert_target_bytes` sets the maximum uncompressed input column bytes per insert unit.

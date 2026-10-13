@@ -22,6 +22,7 @@
 
 #include <Processors/Sources/SourceFromSingleChunk.h>
 #include <Processors/Sources/NullSource.h>
+#include <Processors/Transforms/AggregatingTransform.h>
 
 #include <AggregateFunctions/AggregateFunctionCount.h>
 #include <Analyzer/JoinNode.h>
@@ -29,6 +30,7 @@
 
 #include <Columns/ColumnAggregateFunction.h>
 #include <Common/FailPoint.h>
+#include <Common/CurrentMemoryTracker.h>
 #include <Common/logger_useful.h>
 #include <Common/scope_guard_safe.h>
 #include <Core/Settings.h>
@@ -41,10 +43,13 @@
 #include <Interpreters/InterpreterSelectQuery.h>
 #include <Interpreters/InterpreterSelectQueryAnalyzer.h>
 #include <Interpreters/Context.h>
+#include <Interpreters/ProcessList.h>
 #include <Storages/MergeTree/MergeTreeDataSelectExecutor.h>
+#include <Storages/MergeTree/UniqueKey/UpsertSnapshot.h>
 #include <Storages/ProjectionsDescription.h>
 
 #include <unordered_map>
+#include <limits>
 
 namespace DB
 {
@@ -54,6 +59,13 @@ namespace Setting
     extern const SettingsBool prefer_optimize_projection;
     extern const SettingsString preferred_optimize_projection_name;
     extern const SettingsBool use_statistics_for_min_max_aggregation;
+    extern const SettingsBool optimize_trivial_count_query;
+}
+
+namespace ErrorCodes
+{
+    extern const int CORRUPTED_DATA;
+    extern const int LOGICAL_ERROR;
 }
 
 namespace FailPoints
@@ -1130,6 +1142,151 @@ static Block makeBlockWithMinMaxFromStatistics(
     return block;
 }
 
+static constexpr const char * UPSERT_VISIBLE_COUNT_PROJECTION_NAME = "_upsert_visible_count";
+
+/// Count the parts and masks from one pinned `StorageSnapshot`, without reading column files.
+/// Mask loading belongs to execution rather than plan construction or `EXPLAIN`.
+class UpsertVisibleCountSource final : public ISource
+{
+public:
+    UpsertVisibleCountSource(
+        SharedHeader header, StorageSnapshotPtr snapshot_, MergeTreeData::DataPartsVector parts_,
+        AggregateFunctionPtr count_function_, ContextPtr context_,
+        std::shared_ptr<const ReadFromMergeTree::AnalysisResult> analysis_, MergeTreeSettingsPtr data_settings_)
+        : ISource(std::move(header), false)
+        , snapshot(std::move(snapshot_))
+        , parts(std::move(parts_))
+        , count_function(std::move(count_function_))
+        , context(std::move(context_))
+        , analysis(std::move(analysis_))
+        , data_settings(std::move(data_settings_))
+    {
+    }
+
+    String getName() const override { return "UpsertVisibleCountSource"; }
+
+protected:
+    Chunk generate() override
+    {
+        if (generated || isCancelled())
+            return {};
+        generated = true;
+
+        const auto & snapshot_data = assert_cast<const MergeTreeData::SnapshotData &>(*snapshot->data);
+        snapshot_data.upsert_snapshot->checkVerification();
+        /// These checks normally run when `ReadFromMergeTree` builds its pipeline.
+        /// Keep its concurrency reservation until this source is destroyed.
+        query_id_holder = analysis->checkLimits(*context, assert_cast<const MergeTreeData &>(snapshot->storage), *data_settings);
+        const auto process = context->getProcessListElement();
+        UInt64 count = 0;
+        size_t visited = 0;
+        for (const auto & part : parts)
+        {
+            if (isCancelled())
+                return {};
+            if (visited++ % 256 == 0)
+            {
+                if (process)
+                    process->checkTimeLimit();
+                CurrentMemoryTracker::check();
+            }
+
+            const auto mask = snapshot_data.upsert_snapshot->getMask(part->getDeleteBitmapCacheIdentity());
+            if (!mask)
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "UpsertMergeTree snapshot lacks the mask for part {}", part->name);
+            const UInt64 hidden = mask->cardinality();
+            if (hidden > part->rows_count || mask->rangeCardinality(0, part->rows_count) != hidden)
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree visibility mask exceeds the rows of part {}", part->name);
+            const UInt64 visible = part->rows_count - hidden;
+            if (visible > std::numeric_limits<UInt64>::max() - count)
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "UpsertMergeTree visible row count overflows UInt64");
+            count += visible;
+        }
+        if (process)
+            process->checkTimeLimit();
+        CurrentMemoryTracker::check();
+
+        /// Empty input must remain empty: `AggregatingTransform` implements both empty-result settings.
+        if (!count || isCancelled())
+            return {};
+        Chunk chunk({createSingleCountStateColumn(count_function, count)}, 1);
+        chunk.getChunkInfos().add(std::make_shared<AggregatedChunkInfo>());
+        return chunk;
+    }
+
+private:
+    StorageSnapshotPtr snapshot;
+    MergeTreeData::DataPartsVector parts;
+    AggregateFunctionPtr count_function;
+    ContextPtr context;
+    std::shared_ptr<const ReadFromMergeTree::AnalysisResult> analysis;
+    MergeTreeSettingsPtr data_settings;
+    std::shared_ptr<QueryIdHolder> query_id_holder;
+    bool generated = false;
+};
+
+static bool tryUseUpsertVisibleCount(
+    QueryPlan::Node & node, QueryPlan::Nodes & nodes, AggregatingStep & aggregating,
+    ReadFromMergeTree & reading, const QueryPlanOptimizationSettings & optimization_settings)
+{
+    if (!reading.getMergeTreeData().merging_params.upsert || reading.isParallelReadingEnabled()
+        || !optimization_settings.optimize_use_implicit_projections
+        || !reading.getContext()->getSettingsRef()[Setting::optimize_trivial_count_query])
+        return false;
+
+    const auto & params = aggregating.getParams();
+    if (!params.keys.empty() || params.aggregates.size() != 1)
+        return false;
+    const auto & aggregate = params.aggregates.front();
+    if (!typeid_cast<const AggregateFunctionCount *>(aggregate.function.get())
+        || !aggregate.argument_names.empty() || !aggregate.parameters.empty())
+        return false;
+
+    const auto & query_info = reading.getQueryInfo();
+    if (query_info.prewhere_info || query_info.row_level_filter || query_info.filter_actions_dag
+        || query_info.additional_filter_ast || !query_info.filter_asts.empty() || reading.getRowLevelFilter())
+        return false;
+    QueryDAG dag;
+    if (!dag.build(*node.children.front()) || dag.filter_node)
+        return false;
+
+    /// Preserve part-selection limits and forced-index checks before replacing the read.
+    auto analysis = reading.getAnalyzedResult();
+    if (!analysis)
+        analysis = reading.selectRangesToRead(false);
+    if (!analysis->isUsable())
+        return false;
+    MergeTreeData::DataPartsVector parts;
+    parts.reserve(analysis->parts_with_ranges.size());
+    for (const auto & part : analysis->parts_with_ranges)
+    {
+        if (part.data_part->getParentPart()
+            || !part.ranges.isOneRangeForWholePart(part.data_part->index_granularity->getMarksCountWithoutFinal()))
+            return false;
+        parts.push_back(part.data_part);
+    }
+
+    auto type = std::make_shared<DataTypeAggregateFunction>(aggregate.function, DataTypes{}, Array{});
+    auto header = std::make_shared<const Block>(Block{{type->createColumn(), type, aggregate.column_name}});
+    auto source = std::make_shared<UpsertVisibleCountSource>(
+        header, reading.getStorageSnapshot(), std::move(parts), aggregate.function, reading.getContext(),
+        analysis, reading.getMergeTreeData().getSettings());
+    auto prepared = std::make_unique<ReadFromPreparedSource>(Pipe(std::move(source)));
+    prepared->setStepDescription(UPSERT_VISIBLE_COUNT_PROJECTION_NAME, optimization_settings.max_step_description_length);
+    auto & prepared_node = nodes.emplace_back(QueryPlan::Node{.step = std::move(prepared)});
+    aggregating.requestOnlyMergeForAggregateProjection(prepared_node.step->getOutputHeader());
+    node.children.front() = &prepared_node;
+
+    const auto context = reading.getContext();
+    if (!query_info.is_internal && context->hasQueryContext())
+        context->getQueryContext()->addQueryAccessInfo(Context::QualifiedProjectionName
+        {
+            .storage_id = reading.getMergeTreeData().getStorageID(),
+            .projection_name = UPSERT_VISIBLE_COUNT_PROJECTION_NAME,
+        });
+    return true;
+}
+
 static QueryPlan::Node * findReadingStep(QueryPlan::Node & node)
 {
     IQueryPlanStep * step = node.step.get();
@@ -1198,6 +1355,12 @@ UseProjectionsResult optimizeUseAggregateProjections(
         if (reading->isParallelReplicasLocalPlanForFollower())
             return reject_all("skipped on a parallel replicas follower by a failpoint");
     });
+
+    if (aggregating && tryUseUpsertVisibleCount(node, nodes, *aggregating, *reading, optimization_settings))
+    {
+        result.applied_projection = UPSERT_VISIBLE_COUNT_PROJECTION_NAME;
+        return result;
+    }
 
     PartitionIdToMaxBlockPtr max_added_blocks = getMaxAddedBlocks(reading);
 
