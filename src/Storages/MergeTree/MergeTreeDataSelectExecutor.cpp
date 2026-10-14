@@ -720,6 +720,25 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterParts(
     return filterPartsByStatistics(std::move(res), metadata_snapshot, query_info, mutations_snapshot, context, log, index_stats);
 }
 
+void MergeTreeDataSelectExecutor::checkPartitionIndexUsage(
+    const std::optional<PartitionPruner> & partition_pruner,
+    const ConditionTemplate<KeyCondition>::Ptr & minmax_idx_condition,
+    const StorageMetadataPtr & metadata_snapshot,
+    const ContextPtr & context)
+{
+    const Settings & settings = context->getSettingsRef();
+    if (metadata_snapshot->hasPartitionKey() && settings[Setting::force_index_by_date]
+        && (!minmax_idx_condition || minmax_idx_condition->generateUnsubstituted().alwaysUnknownOrTrue())
+        && (!partition_pruner || partition_pruner->isUseless()))
+    {
+        const auto & partition_key = metadata_snapshot->getPartitionKey();
+        const auto & partition_columns_names = partition_key.expression->getRequiredColumns();
+        throw Exception(ErrorCodes::INDEX_NOT_USED,
+            "Neither MinMax index by columns ({}) nor partition expr is used and setting 'force_index_by_date' is set",
+            fmt::join(partition_columns_names, ", "));
+    }
+}
+
 RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByPartition(
     const RangesInDataParts & parts,
     const std::optional<PartitionPruner> & partition_pruner,
@@ -733,28 +752,17 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByPartition(
     ReadFromMergeTree::IndexStats & index_stats,
     bool check_index_usage)
 {
-    RangesInDataParts res;
-    const Settings & settings = context->getSettingsRef();
     DataTypes minmax_columns_types;
-
     if (minmax_idx_condition)
         minmax_columns_types = MergeTreeData::getMinMaxColumns(metadata_snapshot->getPartitionKey(), data.getSettings()).getTypes();
 
-    if (check_index_usage && metadata_snapshot->hasPartitionKey() && settings[Setting::force_index_by_date]
-        && (!minmax_idx_condition || minmax_idx_condition->generateUnsubstituted().alwaysUnknownOrTrue())
-        && (!partition_pruner || partition_pruner->isUseless()))
-    {
-        const auto & partition_key = metadata_snapshot->getPartitionKey();
-        const auto & partition_columns_names = partition_key.expression->getRequiredColumns();
-        throw Exception(ErrorCodes::INDEX_NOT_USED,
-            "Neither MinMax index by columns ({}) nor partition expr is used and setting 'force_index_by_date' is set",
-            fmt::join(partition_columns_names, ", "));
-    }
+    if (check_index_usage)
+        checkPartitionIndexUsage(partition_pruner, minmax_idx_condition, metadata_snapshot, context);
 
     QueryStatusPtr query_status = context->getProcessListElement();
 
     PartFilterCounters part_filter_counters;
-    res = selectPartsToRead(
+    auto res = selectPartsToRead(
         parts,
         part_values,
         minmax_idx_condition,
@@ -836,14 +844,12 @@ std::expected<void, PreformattedMessage> MergeTreeDataSelectExecutor::canUseInde
 }
 
 
-RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByStatistics(
-    RangesInDataParts parts,
+static std::unique_ptr<StatisticsPartPruner> buildStatisticsPartPruner(
+    const RangesInDataParts & parts,
     const StorageMetadataPtr & metadata_snapshot,
     const SelectQueryInfo & query_info,
     const MergeTreeData::MutationsSnapshotPtr & mutations_snapshot,
-    const ContextPtr & context,
-    LoggerPtr log,
-    ReadFromMergeTree::IndexStats & index_stats)
+    const ContextPtr & context)
 {
     const auto & settings = context->getSettingsRef();
 
@@ -865,18 +871,27 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByStatistics(
         || query_info.row_level_filter
         || (!parts.empty() && getEffectiveRowPolicyFilter(parts.front().data_part->storage, context)))
     {
-        return parts;
+        return nullptr;
     }
 
     if (!query_info.filter_actions_dag)
-        return parts;
+        return nullptr;
 
     const auto & filter_node = *query_info.filter_actions_dag->getOutputs().front();
-    StatisticsPartPruner statistics_pruner(metadata_snapshot, filter_node, context);
+    auto statistics_pruner = std::make_unique<StatisticsPartPruner>(metadata_snapshot, filter_node, context);
 
-    if (statistics_pruner.isUseless())
-        return parts;
+    if (statistics_pruner->isUseless())
+        return nullptr;
 
+    return statistics_pruner;
+}
+
+static RangesInDataParts filterPartsByStatisticsImpl(
+    RangesInDataParts parts,
+    StatisticsPartPruner & statistics_pruner,
+    LoggerPtr log,
+    ReadFromMergeTree::IndexStats & index_stats)
+{
     RangesInDataParts res_parts;
     size_t total_parts_before = parts.size();
 
@@ -920,6 +935,42 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByStatistics(
     return res_parts;
 }
 
+
+RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByStatistics(
+    RangesInDataParts parts,
+    const StorageMetadataPtr & metadata_snapshot,
+    const SelectQueryInfo & query_info,
+    const MergeTreeData::MutationsSnapshotPtr & mutations_snapshot,
+    const ContextPtr & context,
+    LoggerPtr log,
+    ReadFromMergeTree::IndexStats & index_stats)
+{
+    auto statistics_pruner = buildStatisticsPartPruner(parts, metadata_snapshot, query_info, mutations_snapshot, context);
+    if (!statistics_pruner)
+        return parts;
+    return filterPartsByStatisticsImpl(std::move(parts), *statistics_pruner, log, index_stats);
+}
+
+RangesInDataPartsPtr MergeTreeDataSelectExecutor::filterPartsByStatistics(
+    RangesInDataPartsPtr parts,
+    const StorageMetadataPtr & metadata_snapshot,
+    const SelectQueryInfo & query_info,
+    const MergeTreeData::MutationsSnapshotPtr & mutations_snapshot,
+    const ContextPtr & context,
+    LoggerPtr log,
+    ReadFromMergeTree::IndexStats & index_stats)
+{
+    auto statistics_pruner = buildStatisticsPartPruner(*parts, metadata_snapshot, query_info, mutations_snapshot, context);
+    if (!statistics_pruner)
+        return parts;
+
+    auto filtered = filterPartsByStatisticsImpl(*parts, *statistics_pruner, log, index_stats);
+    /// Statistics only remove whole parts in order; unchanged cardinality means the same ranges.
+    chassert(filtered.size() <= parts->size());
+    if (filtered.size() == parts->size())
+        return parts;
+    return std::make_shared<const RangesInDataParts>(std::move(filtered));
+}
 
 /// The minmax skip index reflects the physical rows of a part as they were written, so it goes
 /// stale when a pending or materialized change is not yet merged into the part:

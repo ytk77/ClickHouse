@@ -42,6 +42,16 @@ Within a read block, mask filtering checks each granule's hidden-row count. Enti
 
 Shared selection machinery also moves statistics-filter input and surviving ranges instead of copying them, and deduplicates partition identifiers before formatting query-access strings. Bitmap lookups and selection still scale with selected parts; survivors currently perform another mask lookup during task preparation. These changes do not establish a production latency or throughput result. Binary mask identities, cached cardinalities, lazy parallel scheduling and bounded ordered merges remain separate work requiring profiles of representative filtered aggregations.
 
+### Query preparation and repeated part filtering {#query-preparation-part-filtering}
+
+For `UpsertMergeTree`, the read step can reuse its partition and min/max part shortlist between `PREWHERE` column-size estimation and final index analysis. This memo belongs to one read step and retains the source parts, metadata, query context, table settings, block boundary and index-condition objects that produced it. A different input invalidates it; cloned and remote read steps start without it. Unchanged part sets share their original range collection. The memo is released after final analysis is stored.
+
+Statistics pruning is evaluated against the current query on every use. Primary-key and skip-index analysis, the visibility snapshot, row policies and query limits still follow the normal read path. Forced partition-index usage and time limits are checked again when metadata pruning is reused. Original part counts and the `None`, `MinMax` and `Partition` rows in `EXPLAIN` are retained. `UpsertPartFilterReuse` records reuse of this stage during index analysis; estimation and final analysis can each increment it within one query. It does not count query-result cache hits.
+
+The shared text-index optimizer checks for a useful text index before building a per-part inventory or mutation conversions. Tables with only other skip-index types avoid that preparation. Text-function rewriting for indexes outside direct-read eligibility remains active.
+
+These changes target preparation for filtered limits and aggregates, including `sum` with `WHERE` and `GROUP BY`. They do not change aggregation arithmetic or make part selection constant time. Initial catalog materialization still precedes predicate pushdown through views; reducing it requires a separate deferred-catalog read design. Parallel scheduling for filtered small limits is also separate work. Runtime correctness and latency must be measured on the final binary before deployment.
+
 ## Lazy preparation for small limits {#lazy-limit-preparation}
 
 A small, unfiltered, unordered `SELECT … LIMIT` on local `UpsertMergeTree` parts can use `MergeTreeReadPoolForUpsertLimit`. It replaces the single-thread default path that previously created a processor and read-task metadata for every selected part. One reader now visits selected parts in the same order and creates task metadata only when that part is requested. It reads marks incrementally, applies the normal visibility mask and continues across hidden rows until the downstream limit is satisfied. `UpsertLazyReadPartsPrepared` counts parts reached by that pool.

@@ -258,6 +258,7 @@ bool restorePrewhereInputs(FilterDAGInfo * row_level_filter, PrewhereInfo * info
 namespace ProfileEvents
 {
     extern const Event UpsertHiddenPartsSkipped;
+    extern const Event UpsertPartFilterReuse;
     extern const Event IndexAnalysisRounds;
     extern const Event SelectedParts;
     extern const Event SelectedPartsTotal;
@@ -2767,6 +2768,7 @@ Pipe ReadFromMergeTree::spreadMarkRangesAmongStreamsFinal(
 
 ReadFromMergeTree::AnalysisResultPtr ReadFromMergeTree::selectRangesToRead(bool find_exact_ranges) const
 {
+    const auto metadata_filter_result = getMetadataFilterResult(/*create_if_missing=*/false);
     analyzed_result_ptr = selectRangesToRead(
         getParts(),
         mutations_snapshot,
@@ -2788,8 +2790,10 @@ ReadFromMergeTree::AnalysisResultPtr ReadFromMergeTree::selectRangesToRead(bool 
         allow_top_k_prewhere_query_condition_cache,
         supportsSkipIndexesOnDataRead(),
         /*check_row_limits=*/true,
-        assert_cast<const MergeTreeData::SnapshotData &>(*storage_snapshot->data).upsert_snapshot);
+        assert_cast<const MergeTreeData::SnapshotData &>(*storage_snapshot->data).upsert_snapshot,
+        metadata_filter_result.get());
 
+    clearMetadataFilterMemo();
     return analyzed_result_ptr;
 }
 
@@ -2797,6 +2801,7 @@ ReadFromMergeTree::AnalysisResultPtr ReadFromMergeTree::estimateRangesToReadWith
 {
     /// Deliberately not stored in `analyzed_result_ptr`: the result must not become the analysis of the
     /// executed read, which has to re-analyze once its final shape (and with it the TopK gate) is known.
+    const auto metadata_filter_result = getMetadataFilterResult(/*create_if_missing=*/false);
     return selectRangesToRead(
         getParts(),
         mutations_snapshot,
@@ -2818,11 +2823,13 @@ ReadFromMergeTree::AnalysisResultPtr ReadFromMergeTree::estimateRangesToReadWith
         /*allow_top_k_prewhere_query_condition_cache_=*/false,
         supportsSkipIndexesOnDataRead(),
         /*check_row_limits=*/true,
-        assert_cast<const MergeTreeData::SnapshotData &>(*storage_snapshot->data).upsert_snapshot);
+        assert_cast<const MergeTreeData::SnapshotData &>(*storage_snapshot->data).upsert_snapshot,
+        metadata_filter_result.get());
 }
 
 ReadFromMergeTree::AnalysisResultPtr ReadFromMergeTree::selectRangesToReadForEstimation() const
 {
+    const auto metadata_filter_result = getMetadataFilterResult(/*create_if_missing=*/false);
     return selectRangesToRead(
         getParts(),
         mutations_snapshot,
@@ -2844,7 +2851,8 @@ ReadFromMergeTree::AnalysisResultPtr ReadFromMergeTree::selectRangesToReadForEst
         allow_top_k_prewhere_query_condition_cache,
         supportsSkipIndexesOnDataRead(),
         /*check_row_limits=*/false,
-        assert_cast<const MergeTreeData::SnapshotData &>(*storage_snapshot->data).upsert_snapshot);
+        assert_cast<const MergeTreeData::SnapshotData &>(*storage_snapshot->data).upsert_snapshot,
+        metadata_filter_result.get());
 }
 
 std::optional<size_t> ReadFromMergeTree::estimateCompressedBytesToRead() const
@@ -3527,7 +3535,8 @@ ReadFromMergeTree::AnalysisResultPtr ReadFromMergeTree::selectRangesToRead(
     bool allow_top_k_prewhere_query_condition_cache_,
     bool supports_skip_indexes_on_data_read,
     bool check_row_limits,
-    const Upsert::SnapshotPtr & upsert_snapshot)
+    const Upsert::SnapshotPtr & upsert_snapshot,
+    const MetadataFilterResult * metadata_filter_result)
 {
     ProfileEvents::increment(ProfileEvents::IndexAnalysisRounds);
 
@@ -3622,17 +3631,31 @@ ReadFromMergeTree::AnalysisResultPtr ReadFromMergeTree::selectRangesToRead(
     size_t parts_before_pk = 0;
     bool add_index_stat_row_for_pk_expand = false;
 
-    res_parts = MergeTreeDataSelectExecutor::filterParts(
-        parts,
-        *indexes,
-        metadata_snapshot,
-        data,
-        query_info_,
-        mutations_snapshot,
-        context_,
-        max_block_numbers_to_read.get(),
-        log,
-        result.index_stats);
+    if (metadata_filter_result)
+    {
+        MergeTreeDataSelectExecutor::checkPartitionIndexUsage(
+            indexes->partition_pruner, indexes->minmax_idx_condition, metadata_snapshot, context_);
+        if (const auto process = context_->getProcessListElement())
+            process->checkTimeLimit();
+        ProfileEvents::increment(ProfileEvents::UpsertPartFilterReuse);
+        result.index_stats = metadata_filter_result->index_stats;
+        res_parts = MergeTreeDataSelectExecutor::filterPartsByStatistics(
+            *metadata_filter_result->parts, metadata_snapshot, query_info_, mutations_snapshot, context_, log, result.index_stats);
+    }
+    else
+    {
+        res_parts = MergeTreeDataSelectExecutor::filterParts(
+            parts,
+            *indexes,
+            metadata_snapshot,
+            data,
+            query_info_,
+            mutations_snapshot,
+            context_,
+            max_block_numbers_to_read.get(),
+            log,
+            result.index_stats);
+    }
 
     if (upsert_snapshot)
     {
@@ -6465,18 +6488,99 @@ bool ReadFromMergeTree::isSkipIndexAvailableForTopK(const String & sort_column) 
 }
 
 
-RangesInDataParts ReadFromMergeTree::getPartsForPrewhere() const
+std::shared_ptr<const ReadFromMergeTree::MetadataFilterResult> ReadFromMergeTree::getMetadataFilterResult(bool create_if_missing) const
 {
-    if (analyzed_result_ptr || !indexes)
-        return getParts();
+    if (!data.merging_params.upsert || analyzed_result_ptr || !indexes)
+        return nullptr;
 
-    /// Share all part filters with `selectRangesToRead`, including the snapshot boundary and statistics.
-    /// Keep this snapshot temporary: `PREWHERE` optimization can still change filters,
-    /// so execution must filter again with the final conditions.
+    std::lock_guard lock(metadata_filter_cache.mutex);
+    const auto & metadata = storage_snapshot->metadata;
+    const auto table_settings = data.getSettings();
+    if (metadata_filter_cache.memo
+        && metadata_filter_cache.memo->key_condition == indexes->key_condition
+        && metadata_filter_cache.memo->minmax_condition == indexes->minmax_idx_condition
+        && metadata_filter_cache.memo->source_parts == prepared_parts
+        && metadata_filter_cache.memo->max_blocks == max_block_numbers_to_read
+        && metadata_filter_cache.memo->metadata == metadata
+        && metadata_filter_cache.memo->query_context == context
+        && metadata_filter_cache.memo->table_settings == table_settings)
+    {
+        return metadata_filter_cache.memo->result;
+    }
+
+    metadata_filter_cache.memo.reset();
+    if (!create_if_missing)
+        return nullptr;
+
+    chassert(!analyzed_result_ptr);
+    auto result = std::make_shared<MetadataFilterResult>();
+    auto filtered = MergeTreeDataSelectExecutor::filterPartsByPartition(
+        *prepared_parts, indexes->partition_pruner, indexes->minmax_idx_condition,
+        indexes->part_values, metadata, data, context, max_block_numbers_to_read.get(), log, result->index_stats);
+
+    /// Metadata pruning preserves ranges and order. Keep the existing ownership if no part was removed.
+    chassert(filtered.size() <= prepared_parts->size());
+    if (filtered.size() == prepared_parts->size())
+    {
+        chassert(std::equal(filtered.begin(), filtered.end(), prepared_parts->begin(), [](const auto & lhs, const auto & rhs)
+        {
+            return lhs.data_part == rhs.data_part && lhs.ranges == rhs.ranges
+                && lhs.part_index_in_query == rhs.part_index_in_query
+                && lhs.part_starting_offset_in_query == rhs.part_starting_offset_in_query;
+        }));
+        result->parts = prepared_parts;
+    }
+    else
+    {
+        result->parts = std::make_shared<const RangesInDataParts>(std::move(filtered));
+    }
+
+    /// Do not retain a result across a concurrent table-settings replacement.
+    if (data.getSettings() != table_settings)
+        return result;
+
+    metadata_filter_cache.memo.emplace(MetadataFilterMemo{
+        .key_condition = indexes->key_condition,
+        .minmax_condition = indexes->minmax_idx_condition,
+        .source_parts = prepared_parts,
+        .max_blocks = max_block_numbers_to_read,
+        .metadata = metadata,
+        .query_context = context,
+        .table_settings = table_settings,
+        .result = result});
+    return result;
+}
+
+void ReadFromMergeTree::clearMetadataFilterMemo() const
+{
+    std::lock_guard lock(metadata_filter_cache.mutex);
+    metadata_filter_cache.memo.reset();
+}
+
+RangesInDataPartsPtr ReadFromMergeTree::getPartsForPrewhere() const
+{
+    if (analyzed_result_ptr)
+        return RangesInDataPartsPtr(analyzed_result_ptr, &analyzed_result_ptr->parts_with_ranges);
+    if (!indexes)
+        return prepared_parts;
+
+    if (const auto metadata_filter_result = getMetadataFilterResult(/*create_if_missing=*/true))
+    {
+        /// Recheck the query contract when the per-part metadata walk is reused.
+        MergeTreeDataSelectExecutor::checkPartitionIndexUsage(
+            indexes->partition_pruner, indexes->minmax_idx_condition, getStorageMetadata(), context);
+        if (const auto process = context->getProcessListElement())
+            process->checkTimeLimit();
+        IndexStats unused_stats;
+        return MergeTreeDataSelectExecutor::filterPartsByStatistics(
+            metadata_filter_result->parts, getStorageMetadata(), query_info, mutations_snapshot, context, log, unused_stats);
+    }
+
     IndexStats unused_stats;
-    return MergeTreeDataSelectExecutor::filterParts(
+    auto filtered = MergeTreeDataSelectExecutor::filterParts(
         getParts(), *indexes, getStorageMetadata(), data, query_info, mutations_snapshot, getContext(),
         max_block_numbers_to_read.get(), log, unused_stats);
+    return std::make_shared<const RangesInDataParts>(std::move(filtered));
 }
 
 IStorage::ColumnSizeByName ReadFromMergeTree::getColumnSizesForPrewhere(

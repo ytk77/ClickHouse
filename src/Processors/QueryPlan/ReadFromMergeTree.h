@@ -168,6 +168,13 @@ public:
 
     using IndexStats = std::vector<IndexStat>;
 
+    /// Only metadata pruning; statistics and mark-range analysis still use the final query.
+    struct MetadataFilterResult
+    {
+        RangesInDataPartsPtr parts;
+        IndexStats index_stats;
+    };
+
     /// Information about used projections.
     struct ProjectionStat
     {
@@ -370,7 +377,8 @@ public:
         bool allow_top_k_prewhere_query_condition_cache_,
         bool supports_skip_indexes_on_data_read,
         bool check_row_limits,
-        const Upsert::SnapshotPtr & upsert_snapshot = {});
+        const Upsert::SnapshotPtr & upsert_snapshot = {},
+        const MetadataFilterResult * metadata_filter_result = nullptr);
 
 
     AnalysisResultPtr selectRangesToRead(bool find_exact_ranges = false) const;
@@ -529,7 +537,7 @@ public:
 
     const std::optional<Indexes> & getIndexes() const { return indexes; }
     /// A temporary part snapshot for PREWHERE costs; does not publish range analysis.
-    RangesInDataParts getPartsForPrewhere() const;
+    RangesInDataPartsPtr getPartsForPrewhere() const;
     IStorage::ColumnSizeByName getColumnSizesForPrewhere(const Names & columns, const RangesInDataParts & parts) const;
     ConditionSelectivityEstimatorPtr getConditionSelectivityEstimator(const Names & required_columns, const RangesInDataParts & parts) const;
     ConditionSelectivityEstimatorPtr getConditionSelectivityEstimator(const Names & required_columns) const;
@@ -696,6 +704,40 @@ private:
 
     /// Pre-computed value, needed to trigger sets creating for PK
     mutable std::optional<Indexes> indexes;
+
+    struct MetadataFilterMemo
+    {
+        ConditionTemplate<KeyCondition>::Ptr key_condition;
+        ConditionTemplate<KeyCondition>::Ptr minmax_condition;
+        RangesInDataPartsPtr source_parts;
+        PartitionIdToMaxBlockPtr max_blocks;
+        StorageMetadataPtr metadata;
+        ContextPtr query_context;
+        MergeTreeSettingsPtr table_settings;
+        std::shared_ptr<const MetadataFilterResult> result;
+    };
+
+    struct MetadataFilterCache
+    {
+        std::mutex mutex;
+        std::optional<MetadataFilterMemo> memo TSA_GUARDED_BY(mutex);
+
+        MetadataFilterCache() = default;
+        /// A copied or moved read step starts without another step's memo.
+        MetadataFilterCache(const MetadataFilterCache &)
+        {
+        }
+        MetadataFilterCache(MetadataFilterCache &&) noexcept
+        {
+        }
+        MetadataFilterCache & operator=(const MetadataFilterCache &) = delete;
+        MetadataFilterCache & operator=(MetadataFilterCache &&) = delete;
+    };
+
+    /// Retained keys prevent address reuse; only this holder's memo is synchronized.
+    mutable MetadataFilterCache metadata_filter_cache;
+    std::shared_ptr<const MetadataFilterResult> getMetadataFilterResult(bool create_if_missing) const;
+    void clearMetadataFilterMemo() const;
 
     /// Used for granule pruning in JOINs (enable_join_runtime_filters_index_analysis).
     /// Populated post-construction by addJoinRuntimeFilterIndexAnalysisOnDataRead during query-plan

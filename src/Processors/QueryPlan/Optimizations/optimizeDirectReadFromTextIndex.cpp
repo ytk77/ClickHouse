@@ -199,6 +199,13 @@ void collectTextIndexReadInfos(const ReadFromMergeTree * read_from_merge_tree_st
     if (!indexes || indexes->skip_indexes.useful_indices.empty())
         return;
 
+    /// Other skip indexes need no text-index part inventory or mutation conversions.
+    if (std::ranges::none_of(indexes->skip_indexes.useful_indices, [](const auto & index)
+    {
+        return index.index->isTextIndex();
+    }))
+        return;
+
     const RangesInDataParts & parts_with_ranges = read_from_merge_tree_step->getParts();
     if (parts_with_ranges.empty())
         return;

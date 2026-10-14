@@ -248,10 +248,27 @@ public:
         ReadFromMergeTree::IndexStats & index_stats,
         bool check_index_usage = true);
 
+    /// Validate forced partition-index usage even when reusing a metadata-pruning result.
+    static void checkPartitionIndexUsage(
+        const std::optional<PartitionPruner> & partition_pruner,
+        const ConditionTemplate<KeyCondition>::Ptr & minmax_idx_condition,
+        const StorageMetadataPtr & metadata_snapshot,
+        const ContextPtr & context);
+
     /// Filter parts using column statistics.
     /// Returns filtered parts and updates index_stats with statistics pruning info.
     static RangesInDataParts filterPartsByStatistics(
         RangesInDataParts parts,
+        const StorageMetadataPtr & metadata_snapshot,
+        const SelectQueryInfo & query_info,
+        const MergeTreeData::MutationsSnapshotPtr & mutations_snapshot,
+        const ContextPtr & context,
+        LoggerPtr log,
+        ReadFromMergeTree::IndexStats & index_stats);
+
+    /// Keep an immutable shortlist shared when statistics cannot prune it.
+    static RangesInDataPartsPtr filterPartsByStatistics(
+        RangesInDataPartsPtr parts,
         const StorageMetadataPtr & metadata_snapshot,
         const SelectQueryInfo & query_info,
         const MergeTreeData::MutationsSnapshotPtr & mutations_snapshot,

@@ -168,6 +168,7 @@
     M(UpsertCatalogNodesAllocated, "Immutable catalog nodes allocated while updating `UpsertMergeTree` snapshots, including path copies and rotations.", ValueType::Number) \
     M(UpsertCatalogVersionsMicroseconds, "Time retrieving or initializing cached `UpsertMergeTree` partition data versions.", ValueType::Microseconds) \
     M(UpsertCatalogRangesMicroseconds, "Time selecting or materializing `UpsertMergeTree` catalog ranges.", ValueType::Microseconds) \
+    M(UpsertPartFilterReuse, "Query-local partition and minmax part-filter results reused for the same `UpsertMergeTree` snapshot and index conditions.", ValueType::Number) \
     M(UpsertMaintenanceOversizedAdmissions, "Isolated background `UpsertMergeTree` rewrites admitted above the soft reservation budget, with available background and server headroom.", ValueType::Number) \
     M(UpsertMaintenanceAdmissionPrecheckDeferrals, "Background `UpsertMergeTree` scans postponed by the cheap admission precheck, before determining whether rewriting is needed.", ValueType::Number) \
     M(UpsertMaintenanceAdmissionDenied, "Background `UpsertMergeTree` rewrites postponed by concurrency or estimated memory admission.", ValueType::Number) \
