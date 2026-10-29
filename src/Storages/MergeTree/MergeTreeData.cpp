@@ -14870,6 +14870,8 @@ RangesInDataPartsPtr MergeTreeData::SnapshotData::getParts(
     if (!upsert_catalog)
         return parts;
     upsert_snapshot->checkVerification();
+    /// `UpsertMergeTree` deduplication and `FINAL` are partition-local, so the full query predicate
+    /// can prune this pinned catalog before the generic cross-partition `FINAL` safeguards run.
     if (query_info && query_info->filter_actions_dag && context && metadata->hasPartitionKey()
         && context->getSettingsRef()[Setting::use_partition_pruning])
     {

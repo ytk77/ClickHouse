@@ -6603,7 +6603,11 @@ IStorage::ColumnSizeByName ReadFromMergeTree::getColumnSizesForPrewhere(
     /// Filtering and index analysis only ever remove whole parts from the snapshot, so an equal count means
     /// the same part set. Nothing was pruned: keep the table-wide estimate the storage already caches instead
     /// of measuring every part and column again, exactly as before pruned parts were taken into account.
-    const size_t parts_before_pruning = analyzed_result_ptr ? analyzed_result_ptr->total_parts : getPreparedParts()->size();
+    const auto & snapshot_data = assert_cast<const MergeTreeData::SnapshotData &>(*storage_snapshot->data);
+    /// A projection snapshot inherits the parent catalog; its analyzed part count still belongs to the projection.
+    const bool base_catalog = snapshot_data.upsert_catalog && (!analyzed_result_ptr || !analyzed_result_ptr->readFromProjection());
+    const size_t parts_before_pruning = base_catalog ? snapshot_data.upsert_catalog->size()
+        : analyzed_result_ptr ? analyzed_result_ptr->total_parts : getPreparedParts()->size();
     if (parts.size() == parts_before_pruning)
         return data.getColumnSizes(columns, calculate_subcolumn_sizes);
 

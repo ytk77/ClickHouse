@@ -2116,8 +2116,12 @@ QueryPlanStepPtr MergeTreeDataSelectExecutor::readFromParts(
     }
     else if (!parts)
     {
-        const auto & snapshot_data = assert_cast<const MergeTreeData::SnapshotData &>(*storage_snapshot->data);
-        const bool deferred_catalog = defer_upsert_catalog && snapshot_data.upsert_catalog && snapshot_data.upsert_catalog->size() != 0;
+        bool deferred_catalog = false;
+        if (defer_upsert_catalog)
+        {
+            const auto & snapshot_data = assert_cast<const MergeTreeData::SnapshotData &>(*storage_snapshot->data);
+            deferred_catalog = snapshot_data.upsert_catalog && snapshot_data.upsert_catalog->size() != 0;
+        }
         if (!query_info.isStream() && !deferred_catalog)
             return {};
         if (!deferred_catalog)
