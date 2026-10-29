@@ -4,6 +4,7 @@
 #include <Storages/MergeTree/RangesInDataPart.h>
 #include <functional>
 #include <mutex>
+#include <condition_variable>
 
 namespace DB::Upsert
 {
@@ -32,6 +33,8 @@ class PartCatalog
     struct Materialized
     {
         std::mutex mutex;
+        std::condition_variable ready;
+        size_t builders = 0;
         RangesInDataPartsPtr ranges;
         std::once_flag versions_once;
         std::shared_ptr<const std::unordered_map<String, Int64>> min_data_versions;

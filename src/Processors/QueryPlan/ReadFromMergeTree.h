@@ -488,7 +488,7 @@ public:
     /// selectRangesToRead() will always re-analyze
     AnalysisResultPtr getOrCreateAnalyzedResult() const { return analyzed_result_ptr ? analyzed_result_ptr : selectRangesToRead(); }
 
-    const RangesInDataParts & getParts() const { return analyzed_result_ptr ? analyzed_result_ptr->parts_with_ranges : *prepared_parts; }
+    const RangesInDataParts & getParts() const { return analyzed_result_ptr ? analyzed_result_ptr->parts_with_ranges : *getPreparedParts(); }
     MergeTreeData::MutationsSnapshotPtr getMutationsSnapshot() const { return mutations_snapshot; }
 
     const MergeTreeData & getMergeTreeData() const { return data; }
@@ -682,7 +682,8 @@ private:
     MergeTreeSettingsPtr data_settings;
     MergeTreeReaderSettings reader_settings;
 
-    RangesInDataPartsPtr prepared_parts;
+    RangesInDataPartsPtr getPreparedParts() const;
+    mutable RangesInDataPartsPtr prepared_parts;
     MergeTreeData::MutationsSnapshotPtr mutations_snapshot;
 
     Names all_column_names;

@@ -177,6 +177,26 @@ ConditionTemplate<Cond>::ConditionTemplate(
     , context(std::move(context_))
     , skip_folding(skip_folding_)
 {
+    if (!skip_folding && dag && dag->predicate)
+    {
+        /// Detect possible substitutions once per template. Without a matching partition expression
+        /// or virtual input, every partition would produce the same condition and cloned DAG.
+        const auto predicate = ActionsDAG::cloneSubDAG({dag->predicate}, /*remove_aliases=*/false);
+        const auto partition_key = MergeTreePartition::adjustPartitionKey(metadata_snapshot, context);
+        const auto & key_dag = partition_key.expression->getActionsDAG();
+        const auto key_outputs = key_dag.findInOutputs(partition_key.column_names);
+        const auto matches = matchTrees(key_outputs, predicate, /*check_monotonicity=*/false);
+        has_partition_constants = std::ranges::any_of(matches, [](const auto & entry)
+        {
+            return entry.second.node && !entry.second.monotonicity;
+        });
+        for (const auto * input : predicate.getInputs())
+        {
+            if ((input->result_name == PartitionIdColumn::name || input->result_name == PartitionValueColumn::name)
+                && metadata_snapshot->isVirtualColumn(input->result_name))
+                has_partition_constants = true;
+        }
+    }
     generateUnsubstituted();
 }
 
@@ -208,7 +228,7 @@ template <typename Cond>
 const Cond & ConditionTemplate<Cond>::generateForPartition(
     const MergeTreePartition & partition, const String & partition_id, bool is_projection_part) const
 {
-    if (skip_folding || !dag || !dag->predicate || is_projection_part)
+    if (skip_folding || !has_partition_constants || !dag || !dag->predicate || is_projection_part)
         return generateUnsubstituted();
 
     if (const auto * cond = lookupSubstituted(partition_id))

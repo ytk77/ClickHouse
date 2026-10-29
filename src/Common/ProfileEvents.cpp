@@ -168,6 +168,14 @@
     M(UpsertCatalogNodesAllocated, "Immutable catalog nodes allocated while updating `UpsertMergeTree` snapshots, including path copies and rotations.", ValueType::Number) \
     M(UpsertCatalogVersionsMicroseconds, "Time retrieving or initializing cached `UpsertMergeTree` partition data versions.", ValueType::Microseconds) \
     M(UpsertCatalogRangesMicroseconds, "Time selecting or materializing `UpsertMergeTree` catalog ranges.", ValueType::Microseconds) \
+    M(UpsertCatalogRangesCacheHits, "Reads reusing materialized `UpsertMergeTree` catalog ranges.", ValueType::Number) \
+    M(UpsertCatalogRangesCacheMisses, "Reads building uncached `UpsertMergeTree` catalog ranges.", ValueType::Number) \
+    M(UpsertCatalogRangesLockWaitMicroseconds, "Time waiting to look up or publish `UpsertMergeTree` catalog ranges.", ValueType::Microseconds) \
+    M(UpsertCatalogRangesBuildWaitMicroseconds, "Time waiting for either of the two concurrent `UpsertMergeTree` catalog builders.", ValueType::Microseconds) \
+    M(UpsertCatalogRangesBuildMicroseconds, "Time building `UpsertMergeTree` catalog ranges without a shared construction lock.", ValueType::Microseconds) \
+    M(UpsertCatalogRangesDuplicateBuilds, "Concurrent `UpsertMergeTree` catalog builds discarded after another reader published its result.", ValueType::Number) \
+    M(UpsertCatalogPartsMaterialized, "Parts materialized from an `UpsertMergeTree` catalog.", ValueType::Number) \
+    M(UpsertCatalogPartsPruned, "Parts excluded before materializing `UpsertMergeTree` catalog ranges.", ValueType::Number) \
     M(UpsertPartFilterReuse, "Query-local partition and minmax part-filter results reused for the same `UpsertMergeTree` snapshot and index conditions.", ValueType::Number) \
     M(UpsertMaintenanceOversizedAdmissions, "Isolated background `UpsertMergeTree` rewrites admitted above the soft reservation budget, with available background and server headroom.", ValueType::Number) \
     M(UpsertMaintenanceAdmissionPrecheckDeferrals, "Background `UpsertMergeTree` scans postponed by the cheap admission precheck, before determining whether rewriting is needed.", ValueType::Number) \

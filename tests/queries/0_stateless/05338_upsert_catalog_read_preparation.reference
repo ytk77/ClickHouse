@@ -1,0 +1,20 @@
+partition	4	308
+range	12	924
+unrelated	4	246
+empty	0	0
+prewhere	4	308
+final	4	308
+unoptimized	4	308
+additional	4	308
+disjunction	5	368
+union	8	620
+join	4	308
+view	4	308
+all	64	5216
+new snapshot	4	1205
+new partition	1	99
+removed partition	0
+recovered	4	1205
+expression	8	128
+virtual	8	128
+unrelated native	4	118

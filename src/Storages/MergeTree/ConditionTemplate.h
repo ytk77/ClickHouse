@@ -64,6 +64,7 @@ private:
     const StorageMetadataPtr metadata_snapshot;
     const ContextPtr context;
     const bool skip_folding;
+    bool has_partition_constants = false;
 
     mutable std::mutex mutex;
     mutable std::optional<Cond> unsubstituted;

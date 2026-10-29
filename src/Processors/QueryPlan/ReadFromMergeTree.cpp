@@ -506,6 +506,16 @@ std::shared_ptr<QueryIdHolder> ReadFromMergeTree::AnalysisResult::checkLimits(
     return nullptr;
 }
 
+RangesInDataPartsPtr ReadFromMergeTree::getPreparedParts() const
+{
+    if (!prepared_parts)
+    {
+        const auto & snapshot_data = assert_cast<const MergeTreeData::SnapshotData &>(*storage_snapshot->data);
+        prepared_parts = snapshot_data.getParts(storage_snapshot->metadata, &query_info, context);
+    }
+    return prepared_parts;
+}
+
 ReadFromMergeTree::ReadFromMergeTree(
     RangesInDataPartsPtr parts_,
     MergeTreeData::MutationsSnapshotPtr mutations_,
@@ -6493,6 +6503,7 @@ std::shared_ptr<const ReadFromMergeTree::MetadataFilterResult> ReadFromMergeTree
     if (!data.merging_params.upsert || analyzed_result_ptr || !indexes)
         return nullptr;
 
+    const auto parts = getPreparedParts();
     std::lock_guard lock(metadata_filter_cache.mutex);
     const auto & metadata = storage_snapshot->metadata;
     const auto table_settings = data.getSettings();
@@ -6562,7 +6573,7 @@ RangesInDataPartsPtr ReadFromMergeTree::getPartsForPrewhere() const
     if (analyzed_result_ptr)
         return RangesInDataPartsPtr(analyzed_result_ptr, &analyzed_result_ptr->parts_with_ranges);
     if (!indexes)
-        return prepared_parts;
+        return getPreparedParts();
 
     if (const auto metadata_filter_result = getMetadataFilterResult(/*create_if_missing=*/true))
     {
@@ -6592,7 +6603,7 @@ IStorage::ColumnSizeByName ReadFromMergeTree::getColumnSizesForPrewhere(
     /// Filtering and index analysis only ever remove whole parts from the snapshot, so an equal count means
     /// the same part set. Nothing was pruned: keep the table-wide estimate the storage already caches instead
     /// of measuring every part and column again, exactly as before pruned parts were taken into account.
-    const size_t parts_before_pruning = analyzed_result_ptr ? analyzed_result_ptr->total_parts : prepared_parts->size();
+    const size_t parts_before_pruning = analyzed_result_ptr ? analyzed_result_ptr->total_parts : getPreparedParts()->size();
     if (parts.size() == parts_before_pruning)
         return data.getColumnSizes(columns, calculate_subcolumn_sizes);
 

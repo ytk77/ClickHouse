@@ -60,7 +60,8 @@ public:
         PartitionIdToMaxBlockPtr max_block_numbers_to_read = nullptr,
         ReadFromMergeTree::AnalysisResultPtr merge_tree_select_result_ptr = nullptr,
         bool enable_parallel_reading = false,
-        std::shared_ptr<ParallelReadingExtension> extension_ = nullptr) const;
+        std::shared_ptr<ParallelReadingExtension> extension_ = nullptr,
+        bool defer_upsert_catalog = false) const;
 
     /// Get an estimation for the number of marks we are going to read.
     /// Reads nothing. Secondary indexes are not used.

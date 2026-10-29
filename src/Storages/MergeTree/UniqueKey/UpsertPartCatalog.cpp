@@ -1,6 +1,7 @@
 #include <Storages/MergeTree/UniqueKey/UpsertPartCatalog.h>
 #include <Storages/MergeTree/UniqueKey/UpsertMetrics.h>
 #include <Common/Exception.h>
+#include <base/scope_guard.h>
 
 namespace DB::ErrorCodes
 {
@@ -174,24 +175,74 @@ RangesInDataPartsPtr PartCatalog::ranges(const std::function<bool(const IMergeTr
         /// A usable predicate may still exclude no partitions. Preserve the reusable ranges in that case.
         use_pruning = any_pruned(any_pruned, root);
         if (use_pruning && root->first_partition == root->last_partition)
+        {
+            ProfileEvents::increment(ProfileEvents::UpsertCatalogPartsPruned, size());
             return std::make_shared<const RangesInDataParts>();
+        }
     }
-    std::unique_lock<std::mutex> lock;
+    bool building_shared_ranges = false;
+    SCOPE_EXIT({
+        if (building_shared_ranges)
+        {
+            {
+                std::lock_guard lock(materialized->mutex);
+                --materialized->builders;
+            }
+            materialized->ready.notify_all();
+        }
+    });
     if (!use_pruning)
     {
-        lock = std::unique_lock(materialized->mutex);
+        std::unique_lock<std::mutex> lock;
+        {
+            ProfileEventTimeIncrement<Microseconds> wait_timer(ProfileEvents::UpsertCatalogRangesLockWaitMicroseconds);
+            lock = std::unique_lock(materialized->mutex);
+        }
+        if (!materialized->ranges && materialized->builders >= 2)
+        {
+            /// Two builders allow progress when one is descheduled without multiplying full-table
+            /// allocations by the number of concurrent readers. Waiting releases the publication lock.
+            ProfileEventTimeIncrement<Microseconds> wait_timer(ProfileEvents::UpsertCatalogRangesBuildWaitMicroseconds);
+            materialized->ready.wait(lock, [&] { return materialized->ranges || materialized->builders < 2; });
+        }
         if (materialized->ranges)
+        {
+            ProfileEvents::increment(ProfileEvents::UpsertCatalogRangesCacheHits);
             return materialized->ranges;
+        }
+        ++materialized->builders;
+        building_shared_ranges = true;
+        ProfileEvents::increment(ProfileEvents::UpsertCatalogRangesCacheMisses);
     }
-    auto result = std::make_shared<RangesInDataParts>();
+    /// Build against the immutable root without holding a lock shared by queries. Concurrent
+    /// builders retain only their query-local result; exactly one result is cached per root.
+    std::shared_ptr<RangesInDataParts> result;
+    {
+        ProfileEventTimeIncrement<Microseconds> build_timer(ProfileEvents::UpsertCatalogRangesBuildMicroseconds);
+        result = std::make_shared<RangesInDataParts>();
+        if (!use_pruning)
+            result->reserve(size());
+        size_t index = 0;
+        size_t offset = 0;
+        const std::function<bool(const IMergeTreeDataPart &)> no_pruning;
+        collect(root, *result, index, offset, use_pruning ? prune : no_pruning);
+    }
+    ProfileEvents::increment(ProfileEvents::UpsertCatalogPartsMaterialized, result->size());
+    ProfileEvents::increment(ProfileEvents::UpsertCatalogPartsPruned, size() - result->size());
     if (!use_pruning)
-        result->reserve(size());
-    size_t index = 0;
-    size_t offset = 0;
-    const std::function<bool(const IMergeTreeDataPart &)> no_pruning;
-    collect(root, *result, index, offset, use_pruning ? prune : no_pruning);
-    if (!use_pruning)
+    {
+        std::unique_lock<std::mutex> lock;
+        {
+            ProfileEventTimeIncrement<Microseconds> wait_timer(ProfileEvents::UpsertCatalogRangesLockWaitMicroseconds);
+            lock = std::unique_lock(materialized->mutex);
+        }
+        if (materialized->ranges)
+        {
+            ProfileEvents::increment(ProfileEvents::UpsertCatalogRangesDuplicateBuilds);
+            return materialized->ranges;
+        }
         materialized->ranges = result;
+    }
     return result;
 }
 }

@@ -245,7 +245,7 @@ QueryPlanPtr MergeTreeDataSelectExecutor::read(
     const auto & snapshot_data = assert_cast<const MergeTreeData::SnapshotData &>(*storage_snapshot->data);
 
     auto step = readFromParts(
-        snapshot_data.getParts(storage_snapshot->metadata, &query_info, context),
+        snapshot_data.upsert_catalog ? nullptr : snapshot_data.getParts(storage_snapshot->metadata, &query_info, context),
         snapshot_data.mutations_snapshot,
         column_names_to_return,
         storage_snapshot,
@@ -255,7 +255,9 @@ QueryPlanPtr MergeTreeDataSelectExecutor::read(
         num_streams,
         max_block_numbers_to_read,
         /*merge_tree_select_result_ptr=*/ nullptr,
-        enable_parallel_reading);
+        enable_parallel_reading,
+        /*extension_=*/ nullptr,
+        /*defer_upsert_catalog=*/ snapshot_data.upsert_catalog != nullptr);
 
     auto plan = std::make_unique<QueryPlan>();
     if (step)
@@ -2103,7 +2105,8 @@ QueryPlanStepPtr MergeTreeDataSelectExecutor::readFromParts(
     PartitionIdToMaxBlockPtr max_block_numbers_to_read,
     ReadFromMergeTree::AnalysisResultPtr merge_tree_select_result_ptr,
     bool enable_parallel_reading,
-    std::shared_ptr<ParallelReadingExtension> extension_) const
+    std::shared_ptr<ParallelReadingExtension> extension_,
+    bool defer_upsert_catalog) const
 {
     /// If merge_tree_select_result_ptr != nullptr, we use analyzed result so parts will always be empty.
     if (merge_tree_select_result_ptr)
@@ -2113,10 +2116,12 @@ QueryPlanStepPtr MergeTreeDataSelectExecutor::readFromParts(
     }
     else if (!parts)
     {
-        if (!query_info.isStream())
+        const auto & snapshot_data = assert_cast<const MergeTreeData::SnapshotData &>(*storage_snapshot->data);
+        const bool deferred_catalog = defer_upsert_catalog && snapshot_data.upsert_catalog && snapshot_data.upsert_catalog->size() != 0;
+        if (!query_info.isStream() && !deferred_catalog)
             return {};
-
-        parts = std::make_shared<const RangesInDataParts>();
+        if (!deferred_catalog)
+            parts = std::make_shared<const RangesInDataParts>();
     }
     else if (parts->empty() && !query_info.isStream())
         return {};

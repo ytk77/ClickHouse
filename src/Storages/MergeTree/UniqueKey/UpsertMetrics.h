@@ -89,4 +89,12 @@ extern const Event UpsertRecoveryParts;
 extern const Event UpsertRecoveryMetadataParts;
 extern const Event UpsertPayloadVerificationParts;
 extern const Event UpsertPayloadVerificationMicroseconds;
+extern const Event UpsertCatalogRangesLockWaitMicroseconds;
+extern const Event UpsertCatalogRangesCacheHits;
+extern const Event UpsertCatalogRangesCacheMisses;
+extern const Event UpsertCatalogRangesBuildWaitMicroseconds;
+extern const Event UpsertCatalogRangesBuildMicroseconds;
+extern const Event UpsertCatalogRangesDuplicateBuilds;
+extern const Event UpsertCatalogPartsMaterialized;
+extern const Event UpsertCatalogPartsPruned;
 }
