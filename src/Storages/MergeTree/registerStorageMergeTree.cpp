@@ -1356,7 +1356,30 @@ void registerStorageMergeTree(StorageFactory & factory)
     };
 
     auto upsert_features = features;
-    factory.registerStorage("UpsertMergeTree", create, upsert_features);
+    factory.registerStorage("UpsertMergeTree", create, upsert_features, Documentation
+    {
+        .description = R"(
+A `MergeTree` variant that maintains one visible winning row per partition-local `UNIQUE KEY` during writes.
+Reads use a pinned visibility snapshot, so ordinary `SELECT` queries return the visible winners without `FINAL`.
+An optional stored version column controls winner selection. The table requires both `ORDER BY` and `UNIQUE KEY`
+and uses local storage; replicated variants are not supported. Parts, sorting and indexes follow the `MergeTree` model.
+)",
+        .syntax = "ENGINE = UpsertMergeTree([version_column]) [PARTITION BY expression] ORDER BY expression UNIQUE KEY (key_column, ...) [SETTINGS ...]",
+        .examples =
+        {
+            {
+                .name = "Read the latest version without FINAL",
+                .query = R"(
+CREATE TABLE upsert_latest (id UInt64, version UInt64, value String)
+ENGINE = UpsertMergeTree(version) ORDER BY id UNIQUE KEY id;
+INSERT INTO upsert_latest VALUES (1, 1, 'old'), (1, 2, 'new');
+SELECT value FROM upsert_latest WHERE id = 1;
+)",
+                .result = "new",
+            },
+        },
+        .related = {"MergeTree", "ReplacingMergeTree"},
+    });
 
     factory.registerStorage("MergeTree", create, features, Documentation{
         .description = String(R"DOCS_MD(

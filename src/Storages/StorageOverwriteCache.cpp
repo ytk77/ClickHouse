@@ -3853,8 +3853,7 @@ std::optional<UInt64> StorageOverwriteCache::totalBytes(ContextPtr) const
 
 void registerStorageOverwriteCache(StorageFactory & factory)
 {
-    factory.registerStorage(
-        "OverwriteCache",
+    const StorageFactory::CreatorFn creator =
         [](const StorageFactory::Arguments & args) -> StoragePtr
         {
             if (args.engine_args.size() != 1)
@@ -3969,13 +3968,42 @@ void registerStorageOverwriteCache(StorageFactory & factory)
                 std::move(disk),
                 args.relative_data_path,
                 args.getContext());
-        },
+        };
+
+    const StorageFactory::StorageFeatures features
+    {
+        .supports_settings = true,
+        .supports_keys = true,
+        .supports_lookup_indexes = true,
+        .has_builtin_setting_fn = isOverwriteCacheSetting,
+    };
+    const Documentation documentation
+    {
+        .description = R"(
+Stores one latest row per composite key in memory, with optional disk persistence.
+`KEYS` defines the composite primary lookup. Additional `INDEX` clauses support lookups on subsets of those keys.
+A greater version replaces the stored row; lower versions are ignored. Equal versions use the configured tie-break columns.
+`MemCache` is an alias for `OverwriteCache`, with the same arguments, settings, lookup behavior and persistence format.
+The canonical engine name reported by `system.tables.engine` is `OverwriteCache` for both names.
+)",
+        .syntax = "ENGINE = {OverwriteCache|MemCache}(version_column) KEYS (key_column, ...) [INDEX (...), ...] [SETTINGS ...]",
+        .examples =
         {
-            .supports_settings = true,
-            .supports_keys = true,
-            .supports_lookup_indexes = true,
-            .has_builtin_setting_fn = isOverwriteCacheSetting,
-        });
+            {
+                .name = "Latest row by key through the alias",
+                .query = R"(
+CREATE TABLE latest_cache (id UInt64, version UInt64, value String)
+ENGINE = MemCache(version) KEYS (id) SETTINGS persist_mode = 'none';
+INSERT INTO latest_cache VALUES (1, 1, 'old'), (1, 2, 'new');
+SELECT id, version, value FROM latest_cache WHERE id = 1;
+)",
+                .result = "1\t2\tnew",
+            },
+        },
+        .related = {"OverwriteCache", "MemCache"},
+    };
+    factory.registerStorage("OverwriteCache", creator, features, documentation);
+    factory.registerStorage("MemCache", creator, features, documentation);
 }
 
 }

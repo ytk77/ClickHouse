@@ -1,0 +1,10 @@
+single false	0
+single null	0
+single empty	0
+single or	2	b
+single true	2
+single not empty	2
+composite false	0
+composite empty	0
+composite or	3	c
+composite true	2

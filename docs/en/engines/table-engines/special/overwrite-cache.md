@@ -32,6 +32,10 @@ SETTINGS
     persist_mode = 'async';
 ```
 
+`MemCache` is an alias for `OverwriteCache`. Replace `ENGINE = OverwriteCache(version)` with `ENGINE = MemCache(version)` to use the same engine arguments, `KEYS`, lookup `INDEX` clauses, settings, and persistence behavior. `SHOW CREATE TABLE` preserves the declared name; `system.tables.engine` reports the canonical name `OverwriteCache` for both.
+
+Older servers that register only `OverwriteCache` cannot attach table metadata using `MemCache`. Upgrade all servers that may load that metadata, including replicas and backup restore targets, before using the alias. Use the canonical `OverwriteCache` spelling when metadata must remain readable by those older servers.
+
 `OverwriteCache` requires one engine argument identifying the version column and a nonempty storage-level `KEYS (...)` clause. The version column cannot also be a key column.
 
 ## Winner selection {#winner-selection}

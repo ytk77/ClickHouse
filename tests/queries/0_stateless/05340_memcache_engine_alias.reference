@@ -1,0 +1,13 @@
+MemCache	1
+OverwriteCache	1
+OverwriteCache	1
+1	2	new
+2	1	second
+new
+1	new
+2	other
+1	2	new
+1
+clone
+1
+new

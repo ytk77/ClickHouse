@@ -1,0 +1,17 @@
+empty primary	0
+empty conjunction	0
+empty lookup	0
+empty non-key	0
+false	0
+null	0
+alias	0
+no groups	0
+or survives	3
+not empty	2
+not false	2
+delete no-op	3
+mem empty conjunction	0
+mem false	0
+mem null	0
+mem survives	3	c
+mem delete no-op	3

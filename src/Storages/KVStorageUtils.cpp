@@ -3,6 +3,7 @@
 #include <unordered_map>
 
 #include <Columns/ColumnConst.h>
+#include <Columns/FilterDescription.h>
 #include <Columns/ColumnNullable.h>
 #include <Columns/ColumnSet.h>
 #include <DataTypes/DataTypeLowCardinality.h>
@@ -101,6 +102,11 @@ bool traverseDAGFilterSingleColumn(
 {
     if (elem->type == ActionsDAG::ActionType::ALIAS)
         return traverseDAGFilterSingleColumn(primary_key, primary_key_type, elem->children.at(0), context, res);
+
+    /// A folded false predicate is an exact empty key set, including inside `AND` and `OR`.
+    /// Treating it as an unknown filter would require a scan or reject an otherwise bounded lookup.
+    if (elem->column && ConstantFilterDescription(*elem->column).always_false)
+        return true;
 
     if (elem->type != ActionsDAG::ActionType::FUNCTION)
         return false;
@@ -265,6 +271,11 @@ bool traverseDAGFilter(
 {
     if (elem->type == ActionsDAG::ActionType::ALIAS)
         return traverseDAGFilter(primary_keys, primary_key_types, elem->children.at(0), context, res);
+
+    /// A folded false predicate is an exact empty key set, including inside `AND` and `OR`.
+    /// Treating it as an unknown filter would require a scan or reject an otherwise bounded lookup.
+    if (elem->column && ConstantFilterDescription(*elem->column).always_false)
+        return true;
 
     if (elem->type != ActionsDAG::ActionType::FUNCTION)
         return false;
