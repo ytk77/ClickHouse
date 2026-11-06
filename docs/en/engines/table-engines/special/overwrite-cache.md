@@ -9,6 +9,9 @@ doc_type: 'reference'
 
 The `OverwriteCache` engine stores exactly one winning row for each composite key in RAM. It is intended for bounded latest-state caches that are rebuilt from an upstream source.
 
+For a quick start using either engine name, see the
+[`MemCache` and `OverwriteCache` user guide](../../../../reference/engines/table-engines/special/memcache.mdx).
+
 Rows are held in RAM and are served from RAM, but they are also written to disk, so the cache survives a restart, a `DETACH`, and a `RENAME`. See [Persistence](#persistence). Setting `persist_mode = 'none'` gives a purely in-memory table whose content is lost on restart.
 
 ## Creating a table {#creating-a-table}
@@ -125,6 +128,9 @@ If persisting fails, the error is not swallowed - the table stops accepting publ
 ## Settings {#settings}
 
 - `max_memory_bytes` — Optional hard admission limit for engine-accounted memory. If omitted, allocations remain subject to the normal ClickHouse memory tracker and query limits.
+- `max_pending_insert_bytes` — Shared budget for input column bytes held by active insert preparations. Defaults to the smaller of `max_memory_bytes` and 1 GiB. A single input block exceeding this budget is rejected; other preparations wait for admission when the shared budget is occupied. Additional sorting, index and publication allocations remain subject to memory limits.
+- `max_concurrent_insert_preparations` — Maximum admitted insert preparations, `8` by default. Admission also requires space in `max_pending_insert_bytes`.
+- `max_insert_publication_threads` — Maximum threads used by parallel preparation and publication helpers, `8` by default. This does not make separate table generations publish atomically together.
 - `equal_version_tiebreak_columns` — Optional comma-separated column names used to select a deterministic winner when versions are equal. These columns cannot be key or version columns.
 - `compress_segments` — Optional flag, `0` by default. When set to `1`, payload columns are compressed in memory. This trades a large per-row read cost for lower residency; see [Memory representation](#memory-representation). Segment files are always compressed, so this setting does not change them, and a table can be recreated with a different value for it over the same data.
 - `background_compaction_target_segment_bytes` — Maximum engine-accounted size of the live rows selected for one background small-segment compaction, and the size at which an individual segment stops being a candidate. The default is 64 MiB.
@@ -186,6 +192,21 @@ A deleted key can be inserted again. Winner selection has nothing to compare aga
 A delete publishes a tombstone rather than removing the key from the primary index and the lookup postings, because reclaiming those would require waiting for readers. The row payload is reclaimed: when every row of an immutable segment is gone the segment is released, and a segment that a delete leaves at least half dead is compacted just as a replacement compacts it. What a delete does not return is the key bytes in the primary index and the entry identifier in each lookup posting, so deleting and reinserting the same keys repeatedly leaves those growing. Only `TRUNCATE` and `DROP` release them.
 
 Deleting a key that is absent, or already deleted, is a no-op. `UPDATE` is not supported: a stored row is replaced by inserting a row with a greater version.
+
+## Materialized-view targets {#overwrite-cache-materialized-view-targets}
+
+An incremental materialized view attached to `OverwriteCache` or `MemCache` processes
+submitted insert blocks, including rows that lose cache winner selection. It does
+not propagate `DELETE` or `TRUNCATE` as changes to its target. The source and target
+are not committed as one transaction, and replaying data requires an application
+reconciliation policy.
+
+Equal-version payload changes need particular care when the target uses
+`UpsertMergeTree`: the cache keeps the existing row on a complete tie, while the
+target compares later commit order. Give logical changes strictly increasing
+per-key versions and keep retries identical. Carry logical deletions as versioned
+rows rather than expecting a cache `DELETE` to remove a target row. See the
+[pipeline example](../../../../reference/engines/table-engines/mergetree-family/upsertmergetree.mdx#upsertmergetree-memcache-pipeline).
 
 ## Scalar lookup functions {#scalar-lookup-functions}
 

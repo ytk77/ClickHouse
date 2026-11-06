@@ -1,0 +1,206 @@
+---
+description: 'Create disk-backed latest-state tables with partition-local unique keys and synchronous versioned upserts.'
+sidebarTitle: 'UpsertMergeTree'
+slug: /engines/table-engines/mergetree-family/upsertmergetree
+title: 'UpsertMergeTree table engine'
+doc_type: 'reference'
+---
+
+# `UpsertMergeTree` {#upsertmergetree}
+
+`UpsertMergeTree` is a custom engine in this fork. It stores columnar data on disk and
+maintains one visible winning row per partition-local `UNIQUE KEY` during writes.
+Ordinary `SELECT` queries read those winners without `FINAL` or waiting for background
+merges. Superseded physical rows can remain on disk until maintenance reclaims them.
+
+Use it for versioned latest-state data that also needs analytical queries. It does
+not provide multi-table transactions or conditional read-modify-write operations.
+For implementation, recovery formats and advanced operations, see the
+[development reference](/development/upsert-merge-tree).
+
+## Create and query a table {#upsertmergetree-create-and-query}
+
+```sql
+CREATE TABLE player_state
+(
+    tenant_id UInt64,
+    player_id UInt64,
+    version UInt64,
+    status String
+)
+ENGINE = UpsertMergeTree(version)
+PARTITION BY tenant_id
+ORDER BY (tenant_id, player_id)
+UNIQUE KEY (tenant_id, player_id);
+
+INSERT INTO player_state VALUES (1, 42, 1, 'old');
+INSERT INTO player_state VALUES (1, 42, 2, 'new');
+INSERT INTO player_state VALUES (1, 42, 1, 'late old value');
+
+SELECT tenant_id, player_id, version, status
+FROM player_state
+WHERE tenant_id = 1 AND player_id = 42;
+```
+
+The result is `(1, 42, 2, 'new')`. The lower-version insert does not replace the winner.
+Creating an `UpsertMergeTree` table does not require `allow_experimental_unique_key`.
+
+Both `ORDER BY` and a nonempty `UNIQUE KEY` are required. The unique key identifies
+rows to replace; the sorting key controls physical ordering and query pruning.
+They serve different purposes and need not be identical.
+
+## Versions and replacement {#upsertmergetree-versions}
+
+The optional engine argument names one stored, non-null `UInt64`, `DateTime` or
+`DateTime64` version column. Stored `MATERIALIZED` version columns are supported;
+`Nullable`, `LowCardinality` and `ALIAS` version columns are not.
+
+- A higher version wins.
+- Equal versions use later engine commit order, then the original row position
+  within the input block. Commit order is not an application event timestamp.
+- With no version argument, commit order determines the winner.
+- Each insert supplies a complete replacement row. Omitted columns follow normal
+  insert defaults; they do not retain the previous row's values.
+
+Unique-key columns must have non-null integer, `String`, `FixedString` or nonempty
+tuple types recursively composed from those types. The clause accepts column
+identifiers rather than arbitrary key expressions. Partition and sorting
+expressions must be deterministic.
+
+## Partitions and uniqueness {#upsertmergetree-partition-uniqueness}
+
+Uniqueness is enforced within each partition. The same key in two partitions can
+produce two visible rows, including with `FINAL`. Route all versions of a logical
+key to the same partition. Partitioning by an update timestamp can separate old
+and new versions of the same object and defeat that intention.
+
+`UNIQUE KEY` selects the winning row; it does not reject a repeated key as a
+business uniqueness violation. The engine does not supply cross-table foreign-key
+enforcement.
+
+## Writes, retries and durability {#upsertmergetree-writes-and-durability}
+
+Inserts into this engine execute synchronously, including when session settings
+request `async_insert`. Successful execution acknowledges the engine's durable
+commit. The engine requires one local disk and enforces `assign_part_uuids`,
+`fsync_after_insert` and `fsync_part_directory`.
+
+A large statement can be split into several bounded units and partitions.
+An exception or cancellation can leave earlier units committed. The statement
+and any dependent materialized-view targets are not one atomic transaction.
+Readers use pinned visibility snapshots rather than partially published winner
+and visibility metadata.
+
+Use stable versions and identical payloads for application retries. The engine
+also supports `insert_deduplication_token`, subject to its token and input-boundary
+contract. Source token deduplication does not repair a dependent view that missed
+a previously committed unit; retain a reconciliation or replay source. See
+[incremental materialized views](/development/upsert-merge-tree#upsert-incremental-materialized-views)
+and [insert-unit boundaries](/development/upsert-merge-tree#configurable-insert-units).
+
+## Deletes, expiration and schema changes {#upsertmergetree-data-management}
+
+New tables use the `disk_state_v2` protocol, which supports synchronous deletes:
+
+```sql
+DELETE FROM player_state WHERE tenant_id = 1 AND player_id = 42;
+```
+
+Deletion removes the winner and its version floor. A later insert can recreate the
+key even with a lower version. It does not propagate a deletion to an incremental
+materialized-view target.
+
+Supported operations include `TTL ... DELETE`, selected column and skipping-index
+changes, partition operations and projections. Expiration runs in background
+maintenance, so an expired row can remain visible until maintenance commits.
+Partial-column updates are unsupported. The exact restrictions and differences
+from older `parts_sync_v1` tables are in the
+[data-management reference](/development/upsert-merge-tree#upsert-delete-columns-indexes).
+
+## Forwarding from `MemCache` through a materialized view {#upsertmergetree-memcache-pipeline}
+
+An incremental materialized view processes incoming insert blocks, including rows
+that lose the source engine's version comparison. It does not copy the source's
+deduplicated state or automatically propagate source deletes, expiration or
+partition removal.
+
+The following pattern carries full state and an application-level deletion flag
+to both tables. Give each logical change a higher version, and resend the same
+payload when retrying that version.
+
+```sql
+CREATE TABLE live_state
+(
+    id UInt64,
+    version UInt64,
+    value String,
+    is_deleted UInt8
+)
+ENGINE = MemCache(version)
+KEYS (id)
+SETTINGS max_memory_bytes = 1073741824, persist_mode = 'sync';
+
+CREATE TABLE durable_state
+(
+    id UInt64,
+    version UInt64,
+    value String,
+    is_deleted UInt8
+)
+ENGINE = UpsertMergeTree(version)
+ORDER BY id
+UNIQUE KEY id;
+
+CREATE MATERIALIZED VIEW live_state_to_durable TO durable_state AS
+SELECT id, version, value, is_deleted FROM live_state;
+
+INSERT INTO live_state VALUES (42, 1, 'old', 0);
+INSERT INTO live_state VALUES (42, 2, 'new', 0);
+
+SELECT value FROM live_state WHERE id = 42 AND is_deleted = 0;
+SELECT value FROM durable_state WHERE id = 42 AND is_deleted = 0;
+
+INSERT INTO live_state VALUES (42, 3, '', 1);
+
+SELECT count() FROM live_state WHERE id = 42 AND is_deleted = 0;
+SELECT count() FROM durable_state WHERE id = 42 AND is_deleted = 0;
+```
+
+Both value queries return `'new'`; both counts after the logical deletion return
+`0`. The `is_deleted` column is ordinary application data, not a special engine
+argument. Keep it in the view output and filter it when reading. Filtering deleted
+rows out of the view itself would prevent the target from receiving the deletion.
+Retain tombstones until the application's late-arrival and replay policy permits
+removal; neither engine preserves a version floor after physical deletion.
+
+The default equal-version rules differ: `MemCache` keeps the existing row when
+version and configured tie-break columns tie, whereas `UpsertMergeTree` uses later
+commit order. Submitting `(id=42, version=10, value='A')` followed by the same key
+and version with value `'B'` can therefore leave `'A'` in the cache and `'B'` in the
+target. Cache tie-break settings are not automatically inherited by the target.
+
+The chain has no joint commit or rollback. A failed request can leave one side
+updated; `persist_mode='sync'` only controls cache persistence. Keep view errors
+visible and provide reconciliation. For normal successful execution, the request
+waits for dependent writes, so the target's disk work also affects write latency.
+
+## Operational limits {#upsertmergetree-operational-limits}
+
+- This fork has no replicated `UpsertMergeTree` variant. A replicated database's
+  metadata does not supply replication of these table contents.
+- SQL `BACKUP`, `RESTORE`, `CHECK TABLE`, sampling, streaming and background disk
+  moves are gated. Follow the development reference for supported operations.
+- Preserve a consistent stopped-service backup of data, metadata, configuration
+  and the matching executable before upgrading. Include the engine's state
+  directories; do not copy live state files independently.
+- Queries still use the columnar parts, indexes and maintenance model of
+  `MergeTree`. Part count, cold index I/O and background work can affect latency.
+  No fixed OLTP latency or billion-row performance guarantee follows from the
+  latest-row semantics.
+
+## Related documentation {#upsertmergetree-related-documentation}
+
+- [`MemCache` and `OverwriteCache`](../special/memcache.mdx)
+- [Development and supported operations](/development/upsert-merge-tree)
+- [Disk-state protocol](/development/upsert-merge-tree-disk-state)
+- [Scalability and read preparation](/development/upsert-merge-tree-scalability)

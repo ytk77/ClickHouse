@@ -1,0 +1,136 @@
+---
+description: 'Use MemCache, the OverwriteCache alias, for versioned in-memory latest-state tables with indexed lookups and configurable persistence.'
+sidebarTitle: 'MemCache / OverwriteCache'
+slug: /engines/table-engines/special/memcache
+title: 'MemCache and OverwriteCache table engine'
+doc_type: 'reference'
+---
+
+# `MemCache` and `OverwriteCache` {#memcache-and-overwritecache}
+
+`MemCache` is an alias for the custom `OverwriteCache` table engine in this fork.
+Both names use the same implementation, arguments, `KEYS`, lookup `INDEX` clauses,
+settings and persistence format. The engine keeps one winning row per composite
+key in RAM and serves exact indexed lookups.
+
+Use it for bounded latest-state caches such as user attributes and application
+state that can be rebuilt from an upstream source. Disk persistence is enabled by
+default. Choose `persist_mode='none'` explicitly for memory-only contents.
+
+## Create and query a table {#memcache-create-and-query}
+
+```sql
+CREATE TABLE latest_cache
+(
+    tenant_id UInt64,
+    id UInt64,
+    version UInt64,
+    value String
+)
+ENGINE = MemCache(version)
+KEYS (tenant_id, id)
+INDEX (tenant_id)
+SETTINGS max_memory_bytes = 1073741824, persist_mode = 'sync';
+
+INSERT INTO latest_cache VALUES (1, 42, 1, 'old');
+INSERT INTO latest_cache VALUES (1, 42, 2, 'new');
+INSERT INTO latest_cache VALUES (1, 42, 1, 'late old value');
+
+SELECT value FROM latest_cache WHERE tenant_id = 1 AND id = 42;
+SELECT id, value FROM latest_cache WHERE tenant_id = 1 ORDER BY id;
+```
+
+The first query returns `'new'`; the second returns `(42, 'new')`. The first uses
+the complete primary key; the second uses the declared tenant lookup index.
+
+Replacing `MemCache(version)` with `OverwriteCache(version)` selects the same
+engine. One version-column argument and a nonempty `KEYS` tuple are required;
+the version column cannot also be a key column.
+
+## Winner selection {#memcache-winner-selection}
+
+- A higher version replaces the existing row; a lower version is ignored.
+- Equal versions compare `equal_version_tiebreak_columns` in declaration order.
+- If version and all configured tie-break columns tie, the existing row wins,
+  even when the submitted payload differs.
+
+Each insert supplies a whole replacement row. There is no partial-column `UPDATE`
+or application-facing compare-and-swap operation. Assign versions through a
+consistent application policy. Reading a row and then inserting a newer version
+does not condition the write on that row still being current.
+
+## Lookup indexes and functions {#memcache-lookups}
+
+Queries must constrain every primary-key column with equality or `IN`, or use
+supported predicates on declared lookup indexes. Additional predicates can filter
+the resulting rows. Unrestricted scans and unsupported partial-key scans are
+rejected; arbitrary range predicates are not a replacement for a lookup path.
+
+Every lookup-index column must belong to `KEYS`. A composite index does not
+implicitly create indexes for its individual columns. Add or remove an exact
+lookup family with:
+
+```sql
+ALTER TABLE latest_cache ADD INDEX (id);
+SELECT tenant_id, value FROM latest_cache WHERE id = 42;
+ALTER TABLE latest_cache DROP INDEX (id);
+
+SELECT overwriteCacheGetOrNull(
+    'latest_cache', 'value', toUInt64(1), toUInt64(42));
+```
+
+The scalar function returns `'new'`. `overwriteCacheGet` and
+`overwriteCacheGetOrNull` retain their function names when the table uses
+`MemCache`. The former returns the type's default for a missing key; the latter
+returns `NULL`. Use `SELECT` when row-policy evaluation is required, because these
+scalar functions reject an effective row policy.
+
+## Persistence and memory {#memcache-persistence-and-memory}
+
+| Setting | Behavior |
+| --- | --- |
+| `persist_mode='async'` | Default. Publish in memory and queue persistence. An abnormal termination can lose an unflushed tail. |
+| `persist_mode='sync'` | Wait for that publication's durability before acknowledging the write. Disk throughput and queue pressure affect latency. |
+| `persist_mode='none'` | Keep contents only in RAM; contents are lost on restart. |
+| `max_memory_bytes` | Bound engine-accounted memory. New work can be rejected at the limit; rows are not automatically evicted. This is not a process-RSS limit. |
+| `equal_version_tiebreak_columns` | Comma-separated columns used to resolve equal versions. |
+| `compress_segments` | Default `0`. In-memory compression saves space at the cost of decompressing a column segment for a lookup. |
+
+A clean shutdown drains the persistence queue. Segment files and a manifest are
+replayed on attachment; indexes are rebuilt in memory. Persistence failure blocks
+further publications and surfaces the error. Local persistence does not provide
+replication or automatic failover.
+
+One input block is published as one generation change. A query retains a snapshot
+of that table's generation. A multi-block statement can leave earlier blocks
+committed if a later block fails; the snapshot is not a multi-table transaction.
+Long-running readers can retain replaced versions and increase memory usage.
+
+## Deletes and materialized views {#memcache-deletes-and-materialized-views}
+
+```sql
+DELETE FROM latest_cache WHERE tenant_id = 1 AND id = 42;
+```
+
+The delete is synchronous and uses the same indexed access restrictions as
+`SELECT`. It removes the version floor: inserting the key again can accept a
+lower version. Incremental materialized views do not propagate this deletion to
+their targets.
+
+A view attached to the cache processes incoming insert blocks, not only cache
+winners. For a `MemCache` to `UpsertMergeTree` pipeline, use consistent per-key
+versions and carry logical deletions as versioned data. Equal-version payload
+changes can select different winners in the two engines. See the
+[pipeline example and its consistency limits](../mergetree-family/upsertmergetree.mdx#upsertmergetree-memcache-pipeline).
+
+## Alias compatibility and reference {#memcache-alias-compatibility}
+
+`SHOW CREATE TABLE` preserves the requested `MemCache` spelling.
+`system.tables.engine` reports the canonical `OverwriteCache` name.
+The data format is shared, but older binaries that recognize only `OverwriteCache`
+cannot attach table metadata naming `MemCache`. Upgrade every server that may
+load that metadata before using the alias, or retain `OverwriteCache` in the DDL.
+
+The [detailed `OverwriteCache` reference](../../../../en/engines/table-engines/special/overwrite-cache.md)
+describes all settings, publication, persistence, backup and restore behavior,
+and remaining implementation limits.

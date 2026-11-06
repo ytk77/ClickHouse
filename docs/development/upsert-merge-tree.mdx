@@ -8,6 +8,10 @@ doc_type: 'reference'
 
 # `UpsertMergeTree` development {#upsert-merge-tree-development}
 
+For table creation, version semantics, operations and a `MemCache` pipeline example,
+start with the [table-engine user guide](../reference/engines/table-engines/mergetree-family/upsertmergetree.mdx).
+This page covers implementation details, advanced operations and legacy protocols.
+
 New `UpsertMergeTree` tables use the v8 development-stage [disk-state protocol](/development/upsert-merge-tree-disk-state),
 including a disk-backed winner index and automatic bounded merge and retirement. A successful synchronous
 insert publishes one winner per partition-local unique key; reads do not require `FINAL`.

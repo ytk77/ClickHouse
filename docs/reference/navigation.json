@@ -381,6 +381,7 @@
                 "reference/engines/table-engines/mergetree-family/replication",
                 "reference/engines/table-engines/mergetree-family/summingmergetree",
                 "reference/engines/table-engines/mergetree-family/textindexes",
+                "reference/engines/table-engines/mergetree-family/upsertmergetree",
                 "reference/engines/table-engines/mergetree-family/versionedcollapsingmergetree"
               ]
             },
@@ -400,6 +401,7 @@
                 "reference/engines/table-engines/special/generate",
                 "reference/engines/table-engines/special/join",
                 "reference/engines/table-engines/special/keepermap",
+                "reference/engines/table-engines/special/memcache",
                 "reference/engines/table-engines/special/memory",
                 "reference/engines/table-engines/special/merge",
                 "reference/engines/table-engines/special/null",
